@@ -3,16 +3,20 @@
 PipeLine::PipeLine(int debug_mode)
 {
     //配置屏幕类型
-    if(DISPLAY_MODE==0){
+    if(DISPLAY_MODE == DISPLAY_MODE_LT9611){
         connector_type = LT9611_MIPI_4LAN_1920X1080_30FPS;
     }
-    else if(DISPLAY_MODE==1){
+    else if(DISPLAY_MODE == DISPLAY_MODE_ST7701){
         connector_type = ST7701_V1_MIPI_2LAN_480X800_30FPS;
     }
-    else if(DISPLAY_MODE==2){
+    else if(DISPLAY_MODE == DISPLAY_MODE_HX8377){
         connector_type = HX8377_V2_MIPI_4LAN_1080X1920_30FPS;
     }
+    else if(DISPLAY_MODE == DISPLAY_MODE_NT35516){
+        connector_type = NT35516_MIPI_2LAN_536X960_30FPS;
+    }
     else{
+        // 默认回退为 1080P HDMI 输出
         connector_type = LT9611_MIPI_4LAN_1920X1080_30FPS;
     }
 
@@ -160,10 +164,10 @@ int PipeLine::Create()
     vi_vo_attr.img_size.height = DISPLAY_HEIGHT;
     vi_vo_attr.pixel_format    = PIXEL_FORMAT_YUV_SEMIPLANAR_420; // NV12
     vi_vo_attr.global_alpha   = 0xFF;                            // 不透明
-    // 根据 DISPLAY_MODE 是否需要旋转
-    vi_vo_attr.func            = DISPLAY_MODE? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
+    // 根据显示配置决定是否旋转
+    vi_vo_attr.func            = DISPLAY_ROTATE ? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
     // 若旋转，需要额外的 DMA buffer
-    vi_vo_attr.rot_buf_nr      = DISPLAY_MODE? 1 : 0;
+    vi_vo_attr.rot_buf_nr      = DISPLAY_ROTATE ? 2 : 0;
     vi_vo_attr.rot_buf_bpp     = 0;
 
     ret = kd_mpi_vo_set_layer_attr(vi_vo_id, &vi_vo_attr);
@@ -179,7 +183,7 @@ int PipeLine::Create()
     }
 
     printf("VICAP to VO: layer=%d configured for %ux%u NV12, rotate90=%d\n",
-           vi_vo_id, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MODE ? 1 : 0);
+           vi_vo_id, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_ROTATE ? 1 : 0);
 
     // =============================================================================================
     // 5. 配置 OSD 层（ARGB8888 叠加图层）
@@ -195,8 +199,8 @@ int PipeLine::Create()
         osd_vo_attr.img_size.height = OSD_HEIGHT;
         osd_vo_attr.pixel_format    = PIXEL_FORMAT_ARGB_8888;  // OSD 常用 BGRA/ARGB
         osd_vo_attr.global_alpha    = 0xFF;
-        osd_vo_attr.func            = DISPLAY_MODE? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
-        osd_vo_attr.rot_buf_nr      = DISPLAY_MODE? 2 : 0;
+        osd_vo_attr.func            = DISPLAY_ROTATE ? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
+        osd_vo_attr.rot_buf_nr      = DISPLAY_ROTATE ? 2 : 0;
         osd_vo_attr.rot_buf_bpp     = 0;
 
         ret = kd_mpi_vo_set_layer_attr(osd_vo_id, &osd_vo_attr);

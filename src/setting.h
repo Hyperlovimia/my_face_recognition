@@ -1,10 +1,20 @@
 
- #define DISPLAY_TYPE 'st7701'
+#ifndef MY_FACE_RECOGNITION_SETTING_H
+#define MY_FACE_RECOGNITION_SETTING_H
 
- #if DISPLAY_TYPE == 'st7701' 
+// Display mode selection.
+#define DISPLAY_MODE_LT9611   0
+#define DISPLAY_MODE_ST7701   1
+#define DISPLAY_MODE_HX8377   2
+#define DISPLAY_MODE_NT35516  3
+
+#ifndef DISPLAY_MODE
+#define DISPLAY_MODE DISPLAY_MODE_NT35516
+#endif
+
+#if DISPLAY_MODE == DISPLAY_MODE_ST7701
     #define ISP_WIDTH 1920
     #define ISP_HEIGHT 1080
-    #define DISPLAY_MODE 1   
     #define DISPLAY_WIDTH 800
     #define DISPLAY_HEIGHT 480
     #define DISPLAY_ROTATE 1
@@ -15,10 +25,9 @@
     #define OSD_WIDTH 800
     #define OSD_HEIGHT 480
     #define OSD_CHANNEL 4
-#elif DISPLAY_TYPE == 'lt9611'
+#elif DISPLAY_MODE == DISPLAY_MODE_LT9611
     #define ISP_WIDTH 1920
     #define ISP_HEIGHT 1080
-    #define DISPLAY_MODE 0   
     #define DISPLAY_WIDTH 1920
     #define DISPLAY_HEIGHT 1080
     #define DISPLAY_ROTATE 0
@@ -29,4 +38,34 @@
     #define OSD_WIDTH 1920
     #define OSD_HEIGHT 1080
     #define OSD_CHANNEL 4
- #endif
+#elif DISPLAY_MODE == DISPLAY_MODE_HX8377
+    #define ISP_WIDTH 1920
+    #define ISP_HEIGHT 1080
+    #define DISPLAY_WIDTH 1920
+    #define DISPLAY_HEIGHT 1080
+    #define DISPLAY_ROTATE 1
+    #define AI_FRAME_WIDTH 640
+    #define AI_FRAME_HEIGHT 360
+    #define AI_FRAME_CHANNEL 3
+    #define USE_OSD 1
+    #define OSD_WIDTH 1920
+    #define OSD_HEIGHT 1080
+    #define OSD_CHANNEL 4
+#elif DISPLAY_MODE == DISPLAY_MODE_NT35516
+    #define ISP_WIDTH 1920
+    #define ISP_HEIGHT 1080
+    #define DISPLAY_WIDTH 960
+    #define DISPLAY_HEIGHT 536
+    #define DISPLAY_ROTATE 1
+    #define AI_FRAME_WIDTH 640
+    #define AI_FRAME_HEIGHT 360
+    #define AI_FRAME_CHANNEL 3
+    #define USE_OSD 1
+    #define OSD_WIDTH 960
+    #define OSD_HEIGHT 536
+    #define OSD_CHANNEL 4
+#else
+    #error "Unsupported DISPLAY_MODE"
+#endif
+
+#endif
