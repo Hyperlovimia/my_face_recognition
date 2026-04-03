@@ -84,7 +84,7 @@ public:
 
     // 从 VICAP 的 AI 通道获取一帧图像
     // @param dump_res: 返回该帧的物理地址和虚拟地址
-    void GetFrame(DumpRes &dump_res);
+    int GetFrame(DumpRes &dump_res);
 
     // 释放通过 GetFrame() 获取的帧资源
     // @param dump_res: 需要释放的帧地址信息
@@ -145,6 +145,17 @@ private:
     // 调试控制
     // ============================
     int debug_mode_ = 0;      // 是否启用调试/计时打印
+
+    // ============================
+    // 生命周期状态
+    // ============================
+    bool vb_inited_by_pipeline_ = false;
+    bool osd_block_acquired_ = false;
+    bool vo_video_enabled_ = false;
+    bool vo_osd_enabled_ = false;
+    bool vicap_inited_ = false;
+    bool vicap_stream_started_ = false;
+    bool vicap_vo_bound_ = false;
 };
 
 #endif

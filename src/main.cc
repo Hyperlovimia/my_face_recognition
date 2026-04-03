@@ -92,7 +92,12 @@ void video_proc(char *argv[])
     // 创建一个PipeLine对象，用于处理视频流
     PipeLine pl(debug_mode);
     // 初始化PipeLine对象
-    pl.Create();
+    int ret = pl.Create();
+    if (ret != 0) {
+        std::cout << "PipeLine create failed: " << ret << std::endl;
+        isp_stop = true;
+        return;
+    }
     // 创建一个DumpRes对象，用于存储帧数据
     DumpRes dump_res;
     FaceDetection face_det(argv[1], atof(argv[2]),atof(argv[3]),image_size, debug_mode);
@@ -112,7 +117,12 @@ void video_proc(char *argv[])
         // 创建一个ScopedTiming对象，用于计算总时间
         ScopedTiming st("total time", debug_mode);
         // 从PipeLine中获取一帧数据，并创建tensor
-        pl.GetFrame(dump_res);
+        ret = pl.GetFrame(dump_res);
+        if (ret != 0) {
+            std::cout << "GetFrame failed: " << ret << std::endl;
+            isp_stop = true;
+            break;
+        }
         input_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, { (gsl::byte *)dump_res.virt_addr, compute_size(in_shape) },false, hrt::pool_shared, dump_res.phy_addr).expect("cannot create input tensor");
         hrt::sync(input_tensor, sync_op_t::sync_write_back, true).expect("sync write_back failed");
         //前处理，推理，后处理

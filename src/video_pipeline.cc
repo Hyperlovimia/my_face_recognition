@@ -42,6 +42,8 @@ PipeLine::PipeLine(int debug_mode)
 
     // OSD 所使用的 VB 内存池，初始化为无效
     osd_pool_id = VB_INVALID_POOLID;
+    handle = VB_INVALID_HANDLE;
+    insert_osd_vaddr = nullptr;
 }
 
 PipeLine::~PipeLine()
@@ -65,6 +67,7 @@ int PipeLine::Create()
 {
     ScopedTiming st("PipeLine::Create", debug_mode_);
     k_s32 ret = 0;
+    bool vb_preinitialized = false;
 
     // =============================================================================================
     // 1. 配置 Video Buffer（VB）系统
@@ -74,26 +77,35 @@ int PipeLine::Create()
 
     // 设置 VB 全局配置
     ret = kd_mpi_vb_set_config(&config);
+    if (ret == K_ERR_VB_BUSY) {
+        printf("VB is already initialized by system/another app, reuse existing VB configuration.\n");
+        vb_preinitialized = true;
+        ret = K_SUCCESS;
+    }
     if (ret) {
         printf("vb_set_config failed ret:%d\n", ret);
         return ret;
     }
 
-    // 设置 VB 附加配置（JPEG、ISP 统计等）
-    k_vb_supplement_config supplement_config;
-    memset(&supplement_config, 0, sizeof(supplement_config));
-    supplement_config.supplement_config |= VB_SUPPLEMENT_JPEG_MASK;
-    ret = kd_mpi_vb_set_supplement_config(&supplement_config);
-    if (ret) {
-        printf("vb_set_supplement_config failed ret:%d\n", ret);
-        return ret;
-    }
+    if (!vb_preinitialized) {
+        // 设置 VB 附加配置（JPEG、ISP 统计等）
+        k_vb_supplement_config supplement_config;
+        memset(&supplement_config, 0, sizeof(supplement_config));
+        supplement_config.supplement_config |= VB_SUPPLEMENT_JPEG_MASK;
+        ret = kd_mpi_vb_set_supplement_config(&supplement_config);
+        if (ret) {
+            printf("vb_set_supplement_config failed ret:%d\n", ret);
+            return ret;
+        }
 
-    // 初始化 VB 子系统
-    ret = kd_mpi_vb_init();
-    if (ret) {
-        printf("vb_init failed ret:%d\n", ret);
-        return ret;
+        // 初始化 VB 子系统
+        ret = kd_mpi_vb_init();
+        if (ret) {
+            printf("vb_init failed ret:%d\n", ret);
+            return ret;
+        }
+
+        vb_inited_by_pipeline_ = true;
     }
 
     // =============================================================================================
@@ -126,7 +138,9 @@ int PipeLine::Create()
     // 打开 connector 设备
     k_s32 connector_fd = kd_mpi_connector_open(connector_info.connector_name);
     if (connector_fd < 0) {
-        printf("%s, connector open failed.\n", __func__);
+        printf("%s, connector open failed. connector_type=%d, name=%s.\n",
+               __func__, connector_type, connector_info.connector_name);
+        printf("Check whether the panel driver for this connector is enabled in firmware.\n");
         return K_ERR_VO_NOTREADY;
     }
 
@@ -181,6 +195,7 @@ int PipeLine::Create()
         printf("ERROR: kd_mpi_vo_enable_layer failed, ret=%d\n", ret);
         return ret;
     }
+    vo_video_enabled_ = true;
 
     printf("VICAP to VO: layer=%d configured for %ux%u NV12, rotate90=%d\n",
            vi_vo_id, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_ROTATE ? 1 : 0);
@@ -214,6 +229,7 @@ int PipeLine::Create()
             printf("ERROR: kd_mpi_vo_enable_layer failed, ret=%d\n", ret);
             return ret;
         }
+        vo_osd_enabled_ = true;
 
         printf("OSD to VO: layer=%d configured for %ux%u BGRA8888, rotate90=%d\n",
                osd_vo_id, OSD_WIDTH, OSD_HEIGHT, DISPLAY_ROTATE ? 1 : 0);
@@ -228,6 +244,7 @@ int PipeLine::Create()
             printf("%s get vb block error\n", __func__);
             return -1;
         }
+        osd_block_acquired_ = true;
 
         // 获取该缓存块的物理地址
         k_u64 phys_addr = kd_mpi_vb_handle_to_phyaddr(handle);
@@ -340,6 +357,8 @@ int PipeLine::Create()
     ret = kd_mpi_sys_bind(&vicap_mpp_chn, &vo_mpp_chn);
     if (ret) {
         printf("kd_mpi_sys_bind failed:0x%x\n", ret);
+    } else {
+        vicap_vo_bound_ = true;
     }
 
     // =============================================================================================
@@ -378,21 +397,27 @@ int PipeLine::Create()
     ret = kd_mpi_vicap_init(vicap_dev);
     if (ret) {
         printf("kd_mpi_vicap_init failed.\n");
+        return ret;
     }
+    vicap_inited_ = true;
 
     // 启动数据流
     printf("kd_mpi_vicap_start_stream\n");
     ret = kd_mpi_vicap_start_stream(vicap_dev);
     if (ret) {
-        printf("kd_mpi_vicap_init failed.\n");
+        printf("kd_mpi_vicap_start_stream failed.\n");
+        return ret;
     }
+    vicap_stream_started_ = true;
 
     return ret;
 }
 
-void PipeLine::GetFrame(DumpRes &dump_res){
+int PipeLine::GetFrame(DumpRes &dump_res){
     ScopedTiming st("PipeLine::GetFrame", debug_mode_);
     int ret=0;
+    dump_res.virt_addr = 0;
+    dump_res.phy_addr = 0;
     memset(&dump_info, 0, sizeof(k_video_frame_info));
 
     // 从 VICAP dump 一帧（阻塞最多 1000ms）
@@ -400,13 +425,29 @@ void PipeLine::GetFrame(DumpRes &dump_res){
     if (ret)
     {
         printf("kd_mpi_vicap_dump_frame failed.\n");
+        return ret;
+    }
+
+    if (dump_info.v_frame.phys_addr[0] == 0) {
+        printf("kd_mpi_vicap_dump_frame returned invalid phys addr.\n");
+        kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+        memset(&dump_info, 0, sizeof(k_video_frame_info));
+        return -1;
     }
 
     // 将物理地址映射为虚拟地址，供 CPU 访问
     dump_res.virt_addr = reinterpret_cast<uintptr_t>(
         kd_mpi_sys_mmap(dump_info.v_frame.phys_addr[0],
                         AI_FRAME_CHANNEL*AI_FRAME_HEIGHT*AI_FRAME_WIDTH));
+    if (dump_res.virt_addr == 0) {
+        printf("kd_mpi_sys_mmap failed for dumped frame.\n");
+        kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+        memset(&dump_info, 0, sizeof(k_video_frame_info));
+        return -1;
+    }
+
     dump_res.phy_addr = reinterpret_cast<uintptr_t>(dump_info.v_frame.phys_addr[0]);
+    return 0;
 }
 
 int PipeLine::ReleaseFrame(DumpRes &dump_res){
@@ -414,15 +455,22 @@ int PipeLine::ReleaseFrame(DumpRes &dump_res){
     int ret=0;
 
     // 解除虚拟地址映射
-    kd_mpi_sys_munmap(reinterpret_cast<void*>(dump_res.virt_addr),
-                      AI_FRAME_CHANNEL*AI_FRAME_HEIGHT*AI_FRAME_WIDTH);
+    if (dump_res.virt_addr != 0) {
+        kd_mpi_sys_munmap(reinterpret_cast<void*>(dump_res.virt_addr),
+                          AI_FRAME_CHANNEL*AI_FRAME_HEIGHT*AI_FRAME_WIDTH);
+    }
 
     // 释放 VICAP dump 帧
-    ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
-    if (ret)
-    {
-        printf("kd_mpi_vicap_dump_release failed.\n");
+    if (dump_info.v_frame.phys_addr[0] != 0) {
+        ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+        if (ret)
+        {
+            printf("kd_mpi_vicap_dump_release failed.\n");
+        }
     }
+    dump_res.virt_addr = 0;
+    dump_res.phy_addr = 0;
+    memset(&dump_info, 0, sizeof(k_video_frame_info));
     return ret;
 }
 
@@ -449,49 +497,67 @@ int PipeLine::Destroy()
     // ------------------ 关闭 OSD ------------------
     if(USE_OSD == 1)
     {
-        ret = kd_mpi_vo_disable_layer(osd_vo_id);
-        if (ret) {
-            printf("kd_mpi_vo_disable_layer failed.\n");
-            return ret;
+        if (vo_osd_enabled_) {
+            ret = kd_mpi_vo_disable_layer(osd_vo_id);
+            if (ret) {
+                printf("kd_mpi_vo_disable_layer failed.\n");
+                return ret;
+            }
+            vo_osd_enabled_ = false;
         }
-        ret = kd_mpi_vb_release_block(handle);
-        if (ret) {
-            printf("kd_mpi_vb_release_block failed.\n");
-            return ret;
+        if (osd_block_acquired_) {
+            ret = kd_mpi_vb_release_block(handle);
+            if (ret) {
+                printf("kd_mpi_vb_release_block failed.\n");
+                return ret;
+            }
+            osd_block_acquired_ = false;
         }
     }
     printf("kd_mpi_vb_release_block\n");
 
     // ------------------ 停止 VICAP ------------------
-    ret = kd_mpi_vicap_stop_stream(vicap_dev);
-    if (ret) {
-        printf("kd_mpi_vicap_stop_stream failed.\n");
-        return ret;
+    if (vicap_stream_started_) {
+        ret = kd_mpi_vicap_stop_stream(vicap_dev);
+        if (ret) {
+            printf("kd_mpi_vicap_stop_stream failed.\n");
+            return ret;
+        }
+        vicap_stream_started_ = false;
     }
 
     // 反初始化 VICAP
-    ret = kd_mpi_vicap_deinit(vicap_dev);
-    if (ret) {
-        printf("kd_mpi_vicap_deinit failed.\n");
-        return ret;
+    if (vicap_inited_) {
+        ret = kd_mpi_vicap_deinit(vicap_dev);
+        if (ret) {
+            printf("kd_mpi_vicap_deinit failed.\n");
+            return ret;
+        }
+        vicap_inited_ = false;
     }
 
     // ------------------ 解除 VI → VO 绑定 ------------------
-    ret = kd_mpi_vo_disable_layer(vi_vo_id);
-    if (ret) {
-        printf("kd_mpi_vo_disable_layer failed.\n");
-        return ret;
+    if (vo_video_enabled_) {
+        ret = kd_mpi_vo_disable_layer(vi_vo_id);
+        if (ret) {
+            printf("kd_mpi_vo_disable_layer failed.\n");
+            return ret;
+        }
+        vo_video_enabled_ = false;
     }
 
-    vicap_mpp_chn.mod_id = K_ID_VI;
-    vicap_mpp_chn.dev_id = vicap_dev;
-    vicap_mpp_chn.chn_id = vicap_chn_to_vo;
-    vo_mpp_chn.mod_id    = K_ID_VO;
-    vo_mpp_chn.dev_id    = vo_dev_id;
-    vo_mpp_chn.chn_id    = vi_vo_id;
-    ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
-    if (ret) {
-        printf("kd_mpi_sys_unbind failed:0x%x\n", ret);
+    if (vicap_vo_bound_) {
+        vicap_mpp_chn.mod_id = K_ID_VI;
+        vicap_mpp_chn.dev_id = vicap_dev;
+        vicap_mpp_chn.chn_id = vicap_chn_to_vo;
+        vo_mpp_chn.mod_id    = K_ID_VO;
+        vo_mpp_chn.dev_id    = vo_dev_id;
+        vo_mpp_chn.chn_id    = vi_vo_id;
+        ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
+        if (ret) {
+            printf("kd_mpi_sys_unbind failed:0x%x\n", ret);
+        }
+        vicap_vo_bound_ = false;
     }
 
     /* 等待一帧时间，确保 VO 释放 VB */
@@ -500,11 +566,14 @@ int PipeLine::Destroy()
 
     // ------------------ 销毁 OSD 内存池 ------------------
     if (osd_pool_id != VB_INVALID_POOLID){
-        ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
-                                OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
-        if (ret) {
-            printf("kd_mpi_sys_munmap failed.\n");
-            return ret;
+        if (insert_osd_vaddr != nullptr) {
+            ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
+                                    OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
+            if (ret) {
+                printf("kd_mpi_sys_munmap failed.\n");
+                return ret;
+            }
+            insert_osd_vaddr = nullptr;
         }
         ret = kd_mpi_vb_destory_pool(osd_pool_id);
         if (ret) {
@@ -515,10 +584,15 @@ int PipeLine::Destroy()
     }
 
     // ------------------ 反初始化 VB ------------------
-    ret = kd_mpi_vb_exit();
-    if (ret) {
-        printf("kd_mpi_vb_exit failed.\n");
-        return ret;
+    if (vb_inited_by_pipeline_) {
+        ret = kd_mpi_vb_exit();
+        if (ret) {
+            printf("kd_mpi_vb_exit failed.\n");
+            return ret;
+        }
+        vb_inited_by_pipeline_ = false;
+    } else {
+        printf("Keep pre-initialized VB untouched.\n");
     }
 
     return 0;
