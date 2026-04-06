@@ -76,7 +76,7 @@ AIBase::~AIBase()
 ////////////////////////////////////////////////////////////
 /// 输入初始化
 ////////////////////////////////////////////////////////////
-void AIBase::set_input_init()
+    void AIBase::set_input_init()
 {
     // 性能计时（可选）
     ScopedTiming st(model_name_ + " set_input init", debug_mode_);
