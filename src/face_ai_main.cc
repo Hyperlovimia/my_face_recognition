@@ -1,8 +1,12 @@
 /* RT-Smart: AI process — face detection + recognition server over IPC (rt_channel + lwp_shm). */
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <vector>
+
+#include <nncase/tensor.h>
 
 #include "ipc_shm.h"
 #include "ai_utils.h"
@@ -11,6 +15,15 @@
 #include "setting.h"
 
 using std::vector;
+
+static std::atomic<uint64_t> g_ai_ipc_recv{0};
+static std::atomic<uint64_t> g_ai_reply_err_infer{0};
+
+static bool ai_metrics_enabled(int debug_mode)
+{
+    const char *e = std::getenv("FACE_METRICS");
+    return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
+}
 
 static void notify_stranger(int evt_ch, int id, float score, const char *name)
 {
@@ -34,9 +47,15 @@ static void notify_stranger(int evt_ch, int id, float score, const char *name)
     memset(&nm, 0, sizeof(nm));
     nm.type = RT_CHANNEL_RAW;
     nm.u.d = (void *)(intptr_t)eshm;
-    rt_channel_send(evt_ch, &nm);
+    if (rt_channel_send(evt_ch, &nm) != 0)
+    {
+        ipc_shm_free(eshm);
+        std::cerr << "face_ai: notify_stranger rt_channel_send failed, shm freed\n";
+    }
 }
 
+/* 请求侧 shmid 由 face_video 在 ipc_pack_request 中创建并在 rpc_ai 的 send_recv 返回后 ipc_shm_free。
+ * 本进程仅 lwp_shmat / lwp_shmdt，不对 req_shmid 调用 ipc_shm_free。 */
 static void send_error_reply(int ch_ai, struct rt_channel_msg *orig_msg)
 {
     struct rt_channel_msg err;
@@ -45,6 +64,33 @@ static void send_error_reply(int ch_ai, struct rt_channel_msg *orig_msg)
     err.u.d = (void *)-1;
     rt_channel_reply(ch_ai, &err);
     (void)orig_msg;
+}
+
+/* 返回带 status 的 ipc_ai_reply（应答 shmid 由 face_video 在 rpc_ai 中 ipc_shm_free） */
+static void reply_status_only(int ch_ai, ipc_status_t st)
+{
+    if (st == IPC_STATUS_ERR_INFER)
+        g_ai_reply_err_infer.fetch_add(1);
+
+    ipc_ai_reply_t reply{};
+    reply.magic = IPC_MAGIC;
+    reply.status = (int32_t)st;
+
+    void *rp = nullptr;
+    int rshmid = ipc_shm_alloc(sizeof(ipc_ai_reply_t), &rp);
+    if (rshmid < 0 || !rp)
+    {
+        send_error_reply(ch_ai, nullptr);
+        return;
+    }
+    memcpy(rp, &reply, sizeof(reply));
+    lwp_shmdt(rp);
+
+    struct rt_channel_msg out;
+    memset(&out, 0, sizeof(out));
+    out.type = RT_CHANNEL_RAW;
+    out.u.d = (void *)(intptr_t)rshmid;
+    rt_channel_reply(ch_ai, &out);
 }
 
 int main(int argc, char **argv)
@@ -86,6 +132,13 @@ int main(int argc, char **argv)
     for (;;)
     {
         rt_channel_recv(ch_ai, &msg);
+        uint64_t recv_n = g_ai_ipc_recv.fetch_add(1) + 1;
+        if (ai_metrics_enabled(debug_mode) && (recv_n % 200) == 0)
+        {
+            std::cerr << "[face_ai] metrics ipc_recv=" << recv_n
+                      << " reply_err_infer=" << g_ai_reply_err_infer.load() << std::endl;
+        }
+
         int req_shmid = (int)(intptr_t)msg.u.d;
         if (req_shmid < 0)
         {
@@ -111,6 +164,7 @@ int main(int argc, char **argv)
         ipc_ai_reply_t reply{};
         memset(&reply, 0, sizeof(reply));
         reply.magic = IPC_MAGIC;
+        reply.status = IPC_STATUS_OK;
 
         if (hdr->cmd == IPC_CMD_DB_COUNT)
         {
@@ -129,7 +183,7 @@ int main(int argc, char **argv)
             if (hdr->frame_bytes != expect || hdr->frame_bytes == 0)
             {
                 lwp_shmdt(req_map);
-                send_error_reply(ch_ai, &msg);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_PARAM);
                 continue;
             }
 
@@ -137,31 +191,89 @@ int main(int argc, char **argv)
             dims_t in_shape{1, hdr->tensor_c, hdr->tensor_h, hdr->tensor_w};
             FrameCHWSize fs = {(int)hdr->tensor_c, (int)hdr->tensor_h, (int)hdr->tensor_w};
 
-            runtime_tensor input_tensor =
-                host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared).expect("create tensor");
-            auto ref_buf = input_tensor.impl()
-                               ->to_host()
-                               .unwrap()
-                               ->buffer()
-                               .as_host()
-                               .unwrap()
-                               .map(map_access_::map_write)
-                               .unwrap()
-                               .buffer();
+            auto rt_res = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared);
+            if (!rt_res.is_ok())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: create input tensor failed\n";
+                continue;
+            }
+            runtime_tensor input_tensor = std::move(rt_res.unwrap());
+
+            auto th_r = input_tensor.impl()->to_host();
+            if (!th_r.is_ok())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: to_host failed\n";
+                continue;
+            }
+            nncase::tensor host_tensor = std::move(th_r.unwrap());
+            auto bh_r = host_tensor->buffer().as_host();
+            if (!bh_r.is_ok())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: buffer as_host failed\n";
+                continue;
+            }
+            auto as_host = std::move(bh_r.unwrap());
+            auto map_r = as_host.map(map_access_::map_write);
+            if (!map_r.is_ok())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: map write failed\n";
+                continue;
+            }
+            auto mapped = std::move(map_r.unwrap());
+            auto ref_buf = mapped.buffer();
             memcpy(reinterpret_cast<char *>(ref_buf.data()), pixels, hdr->frame_bytes);
-            hrt::sync(input_tensor, sync_op_t::sync_write_back, true).expect("sync wb");
+
+            auto sync_r = hrt::sync(input_tensor, sync_op_t::sync_write_back, true);
+            if (!sync_r.is_ok())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: sync write_back failed\n";
+                continue;
+            }
 
             det_results.clear();
             rec_results.clear();
 
-            face_det.pre_process(input_tensor);
-            face_det.inference();
+            if (!face_det.pre_process(input_tensor))
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: detection pre_process failed\n";
+                continue;
+            }
+            if (!face_det.inference())
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                std::cerr << "face_ai: detection inference failed\n";
+                continue;
+            }
             face_det.post_process(fs, det_results);
 
+            bool rec_ok = true;
             for (size_t i = 0; i < det_results.size() && i < (size_t)IPC_MAX_FACES; ++i)
             {
-                face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points);
-                face_recg.inference();
+                if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points))
+                {
+                    std::cerr << "face_ai: recognition pre_process failed\n";
+                    rec_ok = false;
+                    break;
+                }
+                if (!face_recg.inference())
+                {
+                    std::cerr << "face_ai: recognition inference failed\n";
+                    rec_ok = false;
+                    break;
+                }
                 FaceRecognitionInfo recg_result;
                 face_recg.database_search(recg_result);
                 rec_results.push_back(recg_result);
@@ -182,6 +294,12 @@ int main(int argc, char **argv)
                 if (evt_ch >= 0 && hdr->cmd == IPC_CMD_INFER && recg_result.id == -1)
                     notify_stranger(evt_ch, recg_result.id, recg_result.score, recg_result.name.c_str());
             }
+            if (!rec_ok)
+            {
+                lwp_shmdt(req_map);
+                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
+                continue;
+            }
 
             if (hdr->cmd == IPC_CMD_REGISTER_COMMIT)
             {
@@ -200,7 +318,7 @@ int main(int argc, char **argv)
         else
         {
             lwp_shmdt(req_map);
-            send_error_reply(ch_ai, &msg);
+            reply_status_only(ch_ai, IPC_STATUS_ERR_BAD_CMD);
             continue;
         }
 

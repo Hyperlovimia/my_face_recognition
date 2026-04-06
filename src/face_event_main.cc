@@ -11,8 +11,10 @@
 
 #include "ipc_proto.h"
 #include "ipc_shm.h"
+#include "ipc_lwp_user.h"
 
 static std::atomic<int> g_video_ch{-1};
+static std::atomic<bool> g_evt_stop{false};
 
 static void print_help()
 {
@@ -28,7 +30,7 @@ static void print_help()
 
 static void connect_video_ctrl_thread()
 {
-    for (;;)
+    while (!g_evt_stop.load())
     {
         int ch = rt_channel_open(IPC_FACE_VIDEO_CTRL, 0);
         if (ch >= 0)
@@ -69,17 +71,30 @@ static bool send_video_ctrl(ipc_video_ctrl_op_t op, int32_t state, const char *r
     memset(&msg, 0, sizeof(msg));
     msg.type = RT_CHANNEL_RAW;
     msg.u.d = (void *)(intptr_t)shmid;
-    rt_channel_send(ch, &msg);
-    /* face_video recv 侧 ipc_shm_free(shmid) */
-    return true;
+
+    constexpr int k_send_retries = 3;
+    for (int attempt = 0; attempt < k_send_retries; ++attempt)
+    {
+        if (rt_channel_send(ch, &msg) == 0)
+            return true;
+        usleep(50 * 1000);
+    }
+    ipc_shm_free(shmid);
+    std::cerr << "face_event: send_video_ctrl failed after " << k_send_retries << " retries, shm freed\n";
+    return false;
 }
 
 static void evt_recv_loop(FILE *fp, int evt_ch)
 {
     struct rt_channel_msg msg;
-    for (;;)
+    while (!g_evt_stop.load())
     {
-        rt_channel_recv(evt_ch, &msg);
+        rt_err_t r = rt_channel_recv(evt_ch, &msg);
+        if (g_evt_stop.load())
+            break;
+        if (r != 0)
+            break;
+
         int shmid = (int)(intptr_t)msg.u.d;
         if (shmid < 0)
             continue;
@@ -117,6 +132,24 @@ static void evt_recv_loop(FILE *fp, int evt_ch)
     }
 }
 
+static void shutdown_event_process(int evt_ch, FILE *fp)
+{
+    g_evt_stop.store(true);
+
+    if (evt_ch >= 0)
+        rt_channel_close(evt_ch);
+
+    int vch = g_video_ch.load();
+    if (vch >= 0)
+        rt_channel_close(vch);
+
+    if (fp)
+    {
+        fprintf(fp, "--- face_event stopping ---\n");
+        fflush(fp);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *log_path = (argc >= 2) ? argv[1] : "/tmp/attendance.log";
@@ -132,17 +165,15 @@ int main(int argc, char **argv)
     if (evt_ch < 0)
     {
         printf("face_event: cannot create channel %s\n", IPC_FACE_EVT_CHANNEL);
+        if (fp)
+            fclose(fp);
         return -1;
     }
-
     printf("face_event: listening on %s (ch=%d), log=%s\n", IPC_FACE_EVT_CHANNEL, evt_ch, log_path);
     printf("face_event: stdin 在此输入；请先启动 face_ai，再启动 face_video。\n");
 
     std::thread th_conn(connect_video_ctrl_thread);
-    th_conn.detach();
-
     std::thread th_evt([&]() { evt_recv_loop(fp, evt_ch); });
-    th_evt.detach();
 
     print_help();
     std::cout << "输入 h/help 查看说明。\n";
@@ -152,7 +183,10 @@ int main(int argc, char **argv)
     {
         std::string input;
         if (!std::getline(std::cin, input))
+        {
+            std::cout << "face_event: stdin 结束，正在退出...\n";
             break;
+        }
 
         if (input == "h" || input == "help")
             print_help();
@@ -182,6 +216,13 @@ int main(int argc, char **argv)
                 std::cout << "请先输入 i 进入注册模式。\n";
         }
     }
+
+    shutdown_event_process(evt_ch, fp);
+
+    th_evt.join();
+    th_conn.join();
+
+    g_video_ch.store(-1);
 
     if (fp)
         fclose(fp);

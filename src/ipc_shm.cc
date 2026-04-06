@@ -27,17 +27,15 @@ void ipc_shm_free(int shmid)
         lwp_shmrm(shmid);
 }
 
-int ipc_pack_request(ipc_cmd_t cmd, const uint8_t *frame_rgb, size_t frame_len, uint32_t tensor_c,
-                     uint32_t tensor_h, uint32_t tensor_w, const char *register_name, uint32_t seq,
-                     int *out_shmid)
+int ipc_request_encode_buffer(void *dst, size_t dst_capacity, ipc_cmd_t cmd, const uint8_t *frame_rgb,
+                              size_t frame_len, uint32_t tensor_c, uint32_t tensor_h, uint32_t tensor_w,
+                              const char *register_name, uint32_t seq)
 {
-    size_t total = sizeof(ipc_req_hdr_t) + frame_len;
-    void *p = nullptr;
-    int shmid = ipc_shm_alloc(total, &p);
-    if (shmid < 0)
+    size_t need = sizeof(ipc_req_hdr_t) + frame_len;
+    if (dst_capacity < need)
         return -1;
 
-    ipc_req_hdr_t *hdr = (ipc_req_hdr_t *)p;
+    ipc_req_hdr_t *hdr = (ipc_req_hdr_t *)dst;
     hdr->magic = IPC_MAGIC;
     hdr->cmd = cmd;
     hdr->seq = seq;
@@ -50,7 +48,28 @@ int ipc_pack_request(ipc_cmd_t cmd, const uint8_t *frame_rgb, size_t frame_len, 
         strncpy(hdr->register_name, register_name, IPC_NAME_MAX - 1);
 
     if (frame_len && frame_rgb)
-        memcpy((uint8_t *)p + sizeof(ipc_req_hdr_t), frame_rgb, frame_len);
+        memcpy((uint8_t *)dst + sizeof(ipc_req_hdr_t), frame_rgb, frame_len);
+
+    return 0;
+}
+
+int ipc_pack_request(ipc_cmd_t cmd, const uint8_t *frame_rgb, size_t frame_len, uint32_t tensor_c,
+                     uint32_t tensor_h, uint32_t tensor_w, const char *register_name, uint32_t seq,
+                     int *out_shmid)
+{
+    size_t total = sizeof(ipc_req_hdr_t) + frame_len;
+    void *p = nullptr;
+    int shmid = ipc_shm_alloc(total, &p);
+    if (shmid < 0)
+        return -1;
+
+    if (ipc_request_encode_buffer(p, total, cmd, frame_rgb, frame_len, tensor_c, tensor_h, tensor_w, register_name,
+                                  seq) != 0)
+    {
+        lwp_shmdt(p);
+        ipc_shm_free(shmid);
+        return -1;
+    }
 
     lwp_shmdt(p);
     *out_shmid = shmid;

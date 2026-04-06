@@ -6,7 +6,7 @@
 
 void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
 {
-    if (!reply || reply->magic != IPC_MAGIC)
+    if (!reply || reply->magic != IPC_MAGIC || reply->status != IPC_STATUS_OK)
         return;
 
     const int ref_w = AI_FRAME_WIDTH;

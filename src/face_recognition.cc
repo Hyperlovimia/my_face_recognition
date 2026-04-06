@@ -45,18 +45,18 @@ FaceRecognition::~FaceRecognition()
 }
 
 
-void FaceRecognition::pre_process(runtime_tensor& input_tensor, float *sparse_points)
+bool FaceRecognition::pre_process(runtime_tensor& input_tensor, float *sparse_points)
 {
 	ScopedTiming st(model_name_ + " pre_process", debug_mode_);
 	get_affine_matrix(sparse_points);
 	Utils::affine_set(image_size_, input_size_,ai2d_builder_, matrix_dst_);
-	ai2d_builder_->invoke(input_tensor,ai2d_out_tensor_).expect("error occurred in ai2d running");
+	auto r = ai2d_builder_->invoke(input_tensor, ai2d_out_tensor_);
+	return r.is_ok();
 }
 
-void FaceRecognition::inference()
+bool FaceRecognition::inference()
 {
-	this->run();
-	this->get_output();
+	return try_run() && try_get_output();
 }
 
 int FaceRecognition::get_dir_files(const char *path)

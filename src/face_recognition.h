@@ -62,13 +62,13 @@ public:
      */
     ~FaceRecognition();
 
-    void pre_process(runtime_tensor& input_tensor, float *sparse_points);
+    bool pre_process(runtime_tensor& input_tensor, float *sparse_points);
 
     /**
      * @brief kmodel推理
-     * @return None
+     * @return false 表示 nncase 推理/读输出失败
      */
-    void inference();
+    bool inference();
 
 
 

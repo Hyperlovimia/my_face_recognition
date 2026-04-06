@@ -21,6 +21,16 @@ typedef enum {
     IPC_CMD_REGISTER_COMMIT = 3,
 } ipc_cmd_t;
 
+/* ipc_ai_reply_t.status：成功为 IPC_STATUS_OK；错误应答若仍通过 reply shmid 返回则填非 0 */
+typedef enum {
+    IPC_STATUS_OK = 0,
+    IPC_STATUS_ERR_MAGIC = 1,
+    IPC_STATUS_ERR_PARAM = 2,
+    IPC_STATUS_ERR_SHM = 3,
+    IPC_STATUS_ERR_INFER = 4,
+    IPC_STATUS_ERR_BAD_CMD = 5,
+} ipc_status_t;
+
 typedef struct {
     float x;
     float y;
@@ -54,6 +64,7 @@ typedef struct {
 
 typedef struct {
     uint32_t magic;
+    int32_t status; /* ipc_status_t */
     int32_t count;
     int32_t num_faces;
     ipc_face_bundle_t faces[IPC_MAX_FACES];

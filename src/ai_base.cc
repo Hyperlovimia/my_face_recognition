@@ -28,6 +28,7 @@
 #include <fstream>
 #include <string>
 #include <nncase/runtime/debug.h>
+#include <nncase/tensor.h>
 #include "ai_utils.h"
 
 using std::cout;
@@ -189,6 +190,13 @@ void AIBase::run()
     kmodel_interp_.run().expect("error occurred in running model");
 }
 
+bool AIBase::try_run()
+{
+    ScopedTiming st(model_name_ + " run", debug_mode_);
+    auto r = kmodel_interp_.run();
+    return r.is_ok();
+}
+
 ////////////////////////////////////////////////////////////
 /// 读取输出数据（映射到 host 内存）
 ////////////////////////////////////////////////////////////
@@ -220,6 +228,36 @@ void AIBase::get_output()
         // 保存输出指针（生命周期由 tensor 控制）
         p_outputs_.push_back(p_out);
     }
+}
+
+bool AIBase::try_get_output()
+{
+    ScopedTiming st(model_name_ + " get_output", debug_mode_);
+    p_outputs_.clear();
+
+    for (int i = 0; i < kmodel_interp_.outputs_size(); i++)
+    {
+        auto out_r = kmodel_interp_.output_tensor(i);
+        if (!out_r.is_ok())
+            return false;
+        runtime_tensor out = std::move(out_r.unwrap());
+        auto th_r = out.impl()->to_host();
+        if (!th_r.is_ok())
+            return false;
+        nncase::tensor host_tensor = std::move(th_r.unwrap());
+        auto bh_r = host_tensor->buffer().as_host();
+        if (!bh_r.is_ok())
+            return false;
+        auto as_host = std::move(bh_r.unwrap());
+        auto map_r = as_host.map(map_access_::map_read);
+        if (!map_r.is_ok())
+            return false;
+        auto mapped = std::move(map_r.unwrap());
+        auto buf = mapped.buffer();
+        float *p_out = reinterpret_cast<float *>(buf.data());
+        p_outputs_.push_back(p_out);
+    }
+    return true;
 }
 
 ////////////////////////////////////////////////////////////
