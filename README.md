@@ -11,7 +11,7 @@
 ## 编译
 
 ```bash
-cd rtsmart/examples/face_recognition
+cd rtsmart/examples/my_face_recognition
 ./build_app.sh
 ```
 

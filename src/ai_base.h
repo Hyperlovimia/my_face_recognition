@@ -75,11 +75,17 @@ public:
      */
     void run();
 
+    /** @return false 时 nncase 已失败，不会 terminate */
+    bool try_run();
+
     /**
      * @brief 获取kmodel输出，结果保存在对应的类属性中
      * @return None
      */
     void get_output();
+
+    /** @return false 时映射/读输出失败 */
+    bool try_get_output();
 
     runtime_tensor get_output_tensor(int idx);
 

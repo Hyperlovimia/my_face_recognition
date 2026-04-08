@@ -96,13 +96,13 @@ public:
      */
     ~FaceDetection();
 
-    void pre_process(runtime_tensor &input_tensor);
+    bool pre_process(runtime_tensor &input_tensor);
 
     /**
      * @brief kmodel推理
-     * @return None
+     * @return false 表示 nncase 推理/读输出失败
      */
-    void inference();
+    bool inference();
 
     /**
      * @brief kmodel推理结果后处理

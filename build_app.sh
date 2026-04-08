@@ -55,17 +55,30 @@ build_project() {
 }
 
 # =======================
-# Collect ELF and utility files
+# 仅收集交叉编译生成的 ELF 到 k230_bin（板端部署目录）
+# utils/ 为仓库内可选脚本（如三进程启动示例），不参与打包拷贝，避免与 k230_bin 混淆
 # =======================
 collect_outputs() {
-    local elf_file="${BUILD_DIR}/bin/face_recognition.elf"
-
-    if [ -f "${elf_file}" ]; then
-        echo "[INFO] Collecting ELF and utility files to ${K230_BIN_DIR}..."
-        cp -u "${elf_file}" "${K230_BIN_DIR}/"
-        cp -u utils/* "${K230_BIN_DIR}/" 2>/dev/null || true
+    local elves=(
+        "${BUILD_DIR}/bin/face_recognition.elf"
+        "${BUILD_DIR}/bin/face_video.elf"
+        "${BUILD_DIR}/bin/face_ai.elf"
+        "${BUILD_DIR}/bin/face_event.elf"
+    )
+    local found=0
+    for f in "${elves[@]}"; do
+        if [ -f "${f}" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "${found}" -eq 1 ]; then
+        echo "[INFO] Collecting ELF files to ${K230_BIN_DIR}..."
+        for f in "${elves[@]}"; do
+            [ -f "${f}" ] && cp -u "${f}" "${K230_BIN_DIR}/"
+        done
     else
-        echo "[WARN] ELF file not found: ${elf_file}"
+        echo "[WARN] No ELF files found under ${BUILD_DIR}/bin/"
     fi
 }
 

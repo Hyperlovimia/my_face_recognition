@@ -78,16 +78,16 @@ FaceDetection::FaceDetection(const char *kmodel_file, float obj_thresh,float nms
 }
 
 // opencv for image
-void FaceDetection::pre_process(runtime_tensor &input_tensor)
+bool FaceDetection::pre_process(runtime_tensor &input_tensor)
 {
     ScopedTiming st(model_name_ + " pre_process", debug_mode_);
-    ai2d_builder_->invoke(input_tensor,ai2d_out_tensor_).expect("error occurred in ai2d running");
+    auto r = ai2d_builder_->invoke(input_tensor, ai2d_out_tensor_);
+    return r.is_ok();
 }
 
-void FaceDetection::inference()
+bool FaceDetection::inference()
 {
-    this->run();
-    this->get_output();
+    return try_run() && try_get_output();
 }
 
 void FaceDetection::post_process(FrameCHWSize frame_size, vector<FaceDetectionInfo> &results)
