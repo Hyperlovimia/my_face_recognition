@@ -13,7 +13,7 @@ PipeLine::PipeLine(int debug_mode)
         connector_type = HX8377_V2_MIPI_4LAN_1080X1920_30FPS;
     }
     else if(DISPLAY_MODE == DISPLAY_MODE_NT35516){
-        connector_type = NT35516_MIPI_2LAN_536X960_30FPS;
+        connector_type = NT35516_MIPI_2LAN_540X960_30FPS;
     }
     else{
         // 默认回退为 1080P HDMI 输出
@@ -23,8 +23,8 @@ PipeLine::PipeLine(int debug_mode)
 
     // ------------------------ VO（视频输出）相关 ID ------------------------
     vo_dev_id = K_VO_DISPLAY_DEV_ID;        // VO 设备 ID
-    vi_vo_id  = K_VO_LAYER_VIDEO1;          // 用于显示摄像头视频的 VO layer
-    osd_vo_id = K_VO_LAYER_OSD0;            // 用于叠加 OSD 的 VO layer
+    vi_vo_id  = K_VO_LAYER1;                // 用于显示摄像头视频的 VO layer
+    osd_vo_id = K_VO_OSD3;                  // 用于叠加 OSD 的 VO layer
 
 
     // ------------------------ Sensor / VICAP 默认配置 ------------------------
@@ -168,31 +168,26 @@ int PipeLine::Create()
     // =============================================================================================
     // 4. 配置 VO（视频输出层：用于显示摄像头画面）
     // =============================================================================================
-    kd_mpi_vo_disable_layer(vi_vo_id);  // 先关闭 layer，避免旧配置干扰
+    kd_mpi_vo_disable_video_layer(vi_vo_id);  // 先关闭 layer，避免旧配置干扰
 
     memset(&vi_vo_attr, 0, sizeof(vi_vo_attr));
-    vi_vo_attr.layer_id        = vi_vo_id;
-    vi_vo_attr.position.x      = 0;
-    vi_vo_attr.position.y      = 0;
+    vi_vo_attr.display_rect.x  = 0;
+    vi_vo_attr.display_rect.y  = 0;
     vi_vo_attr.img_size.width  = DISPLAY_WIDTH;
     vi_vo_attr.img_size.height = DISPLAY_HEIGHT;
     vi_vo_attr.pixel_format    = PIXEL_FORMAT_YUV_SEMIPLANAR_420; // NV12
-    vi_vo_attr.global_alpha   = 0xFF;                            // 不透明
-    // 根据显示配置决定是否旋转
-    vi_vo_attr.func            = DISPLAY_ROTATE ? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
-    // 若旋转，需要额外的 DMA buffer
-    vi_vo_attr.rot_buf_nr      = DISPLAY_ROTATE ? 2 : 0;
-    vi_vo_attr.rot_buf_bpp     = 0;
+    vi_vo_attr.stride          = (DISPLAY_WIDTH / 8 - 1) + ((DISPLAY_HEIGHT - 1) << 16);
+    vi_vo_attr.func            = DISPLAY_ROTATE ? K_ROTATION_90 : K_ROTATION_0;
 
-    ret = kd_mpi_vo_set_layer_attr(vi_vo_id, &vi_vo_attr);
+    ret = kd_mpi_vo_set_video_layer_attr(vi_vo_id, &vi_vo_attr);
     if (ret != K_SUCCESS) {
-        printf("ERROR: kd_mpi_vo_set_layer_attr failed, ret=%d\n", ret);
+        printf("ERROR: kd_mpi_vo_set_video_layer_attr failed, ret=%d\n", ret);
         return ret;
     }
 
-    ret = kd_mpi_vo_enable_layer(vi_vo_id);
+    ret = kd_mpi_vo_enable_video_layer(vi_vo_id);
     if (ret != K_SUCCESS) {
-        printf("ERROR: kd_mpi_vo_enable_layer failed, ret=%d\n", ret);
+        printf("ERROR: kd_mpi_vo_enable_video_layer failed, ret=%d\n", ret);
         return ret;
     }
     vo_video_enabled_ = true;
@@ -204,29 +199,26 @@ int PipeLine::Create()
     // 5. 配置 OSD 层（ARGB8888 叠加图层）
     // =============================================================================================
     if(USE_OSD == 1){
-        kd_mpi_vo_disable_layer(osd_vo_id);
+        kd_mpi_vo_osd_disable(osd_vo_id);
 
         memset(&osd_vo_attr, 0, sizeof(osd_vo_attr));
-        osd_vo_attr.layer_id        = osd_vo_id;
-        osd_vo_attr.position.x      = 0;
-        osd_vo_attr.position.y      = 0;
+        osd_vo_attr.display_rect.x  = 0;
+        osd_vo_attr.display_rect.y  = 0;
         osd_vo_attr.img_size.width  = OSD_WIDTH;
         osd_vo_attr.img_size.height = OSD_HEIGHT;
-        osd_vo_attr.pixel_format    = PIXEL_FORMAT_ARGB_8888;  // OSD 常用 BGRA/ARGB
-        osd_vo_attr.global_alpha    = 0xFF;
-        osd_vo_attr.func            = DISPLAY_ROTATE ? GDMA_ROTATE_DEGREE_90 : GDMA_ROTATE_DEGREE_0;
-        osd_vo_attr.rot_buf_nr      = DISPLAY_ROTATE ? 2 : 0;
-        osd_vo_attr.rot_buf_bpp     = 0;
+        osd_vo_attr.pixel_format    = PIXEL_FORMAT_BGRA_8888;
+        osd_vo_attr.stride          = OSD_WIDTH * 4 / 8;
+        osd_vo_attr.global_alptha   = 0xFF;
 
-        ret = kd_mpi_vo_set_layer_attr(osd_vo_id, &osd_vo_attr);
+        ret = kd_mpi_vo_set_video_osd_attr(osd_vo_id, &osd_vo_attr);
         if (ret != K_SUCCESS) {
-            printf("ERROR: kd_mpi_vo_set_layer_attr failed, ret=%d\n", ret);
+            printf("ERROR: kd_mpi_vo_set_video_osd_attr failed, ret=%d\n", ret);
             return ret;
         }
 
-        ret = kd_mpi_vo_enable_layer(osd_vo_id);
+        ret = kd_mpi_vo_osd_enable(osd_vo_id);
         if (ret != K_SUCCESS) {
-            printf("ERROR: kd_mpi_vo_enable_layer failed, ret=%d\n", ret);
+            printf("ERROR: kd_mpi_vo_osd_enable failed, ret=%d\n", ret);
             return ret;
         }
         vo_osd_enabled_ = true;
@@ -281,20 +273,7 @@ int PipeLine::Create()
     // =============================================================================================
     // 6. 传感器探测 & VICAP 设备配置
     // =============================================================================================
-    // 自动探测 Sensor
-    k_vicap_probe_config probe_cfg;
     k_vicap_sensor_info sensor_info;
-    probe_cfg.csi_num = CONFIG_MPP_SENSOR_DEFAULT_CSI;
-    probe_cfg.width   = ISP_WIDTH;
-    probe_cfg.height  = ISP_HEIGHT;
-    probe_cfg.fps     = 30;
-    if(0x00 != kd_mpi_sensor_adapt_get(&probe_cfg, &sensor_info)) {
-        printf("vicap, can't probe sensor on %d, output %dx%d@%d\n",
-               probe_cfg.csi_num, probe_cfg.width, probe_cfg.height, probe_cfg.fps);
-        return -1;
-    }
-
-    sensor_type =  sensor_info.sensor_type;
     memset(&sensor_info, 0, sizeof(k_vicap_sensor_info));
     ret = kd_mpi_vicap_get_sensor_info(sensor_type, &sensor_info);
     if (ret) {
@@ -338,7 +317,8 @@ int PipeLine::Create()
     chn0_attr.pix_format     = PIXEL_FORMAT_YUV_SEMIPLANAR_420; // NV12
     chn0_attr.buffer_num     = VICAP_MAX_FRAME_COUNT;
     chn0_attr.buffer_size    = VICAP_ALIGN_UP((DISPLAY_WIDTH * DISPLAY_HEIGHT * 3 / 2), VICAP_ALIGN_1K);
-    chn0_attr.buffer_pool_id = VB_INVALID_POOLID;
+    chn0_attr.alignment      = 0;
+    chn0_attr.fps            = 0;
 
     printf("vicap ...kd_mpi_vicap_set_chn_attr, buffer_size[%d]\n", chn0_attr.buffer_size);
     ret = kd_mpi_vicap_set_chn_attr(vicap_dev, vicap_chn_to_vo, chn0_attr);
@@ -353,7 +333,7 @@ int PipeLine::Create()
     vicap_mpp_chn.chn_id = vicap_chn_to_vo;
     vo_mpp_chn.mod_id    = K_ID_VO;
     vo_mpp_chn.dev_id    = vo_dev_id;
-    vo_mpp_chn.chn_id    = vi_vo_id;
+    vo_mpp_chn.chn_id    = K_VO_DISPLAY_CHN_ID1;
     ret = kd_mpi_sys_bind(&vicap_mpp_chn, &vo_mpp_chn);
     if (ret) {
         printf("kd_mpi_sys_bind failed:0x%x\n", ret);
@@ -376,7 +356,8 @@ int PipeLine::Create()
     chn1_attr.pix_format     = PIXEL_FORMAT_RGB_888_PLANAR; // AI 常用输入格式
     chn1_attr.buffer_num     = VICAP_MAX_FRAME_COUNT;
     chn1_attr.buffer_size    = VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * 3 ), VICAP_ALIGN_1K);
-    chn1_attr.buffer_pool_id = VB_INVALID_POOLID;
+    chn1_attr.alignment      = 0;
+    chn1_attr.fps            = 0;
 
     printf("kd_mpi_vicap_set_chn_attr, buffer_size[%d]\n", chn1_attr.buffer_size);
     ret = kd_mpi_vicap_set_chn_attr(vicap_dev, vicap_chn_to_ai, chn1_attr);
@@ -482,9 +463,9 @@ int PipeLine::InsertFrame(void* osd_data){
     memcpy(insert_osd_vaddr, osd_data, OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
 
     // 插入到 VO 的 OSD layer
-    if (kd_mpi_vo_insert_frame(osd_vo_id, &osd_frame_info) != K_SUCCESS) {
-        printf("ERROR: kd_mpi_vo_insert_frame failed for OSD\n");
-        return ret;
+    if (kd_mpi_vo_chn_insert_frame(osd_vo_id + 3, &osd_frame_info) != K_SUCCESS) {
+        printf("ERROR: kd_mpi_vo_chn_insert_frame failed for OSD\n");
+        return -1;
     } 
     return ret;
 }
@@ -498,9 +479,9 @@ int PipeLine::Destroy()
     if(USE_OSD == 1)
     {
         if (vo_osd_enabled_) {
-            ret = kd_mpi_vo_disable_layer(osd_vo_id);
+            ret = kd_mpi_vo_osd_disable(osd_vo_id);
             if (ret) {
-                printf("kd_mpi_vo_disable_layer failed.\n");
+                printf("kd_mpi_vo_osd_disable failed.\n");
                 return ret;
             }
             vo_osd_enabled_ = false;
@@ -538,9 +519,9 @@ int PipeLine::Destroy()
 
     // ------------------ 解除 VI → VO 绑定 ------------------
     if (vo_video_enabled_) {
-        ret = kd_mpi_vo_disable_layer(vi_vo_id);
+        ret = kd_mpi_vo_disable_video_layer(vi_vo_id);
         if (ret) {
-            printf("kd_mpi_vo_disable_layer failed.\n");
+            printf("kd_mpi_vo_disable_video_layer failed.\n");
             return ret;
         }
         vo_video_enabled_ = false;
@@ -552,7 +533,7 @@ int PipeLine::Destroy()
         vicap_mpp_chn.chn_id = vicap_chn_to_vo;
         vo_mpp_chn.mod_id    = K_ID_VO;
         vo_mpp_chn.dev_id    = vo_dev_id;
-        vo_mpp_chn.chn_id    = vi_vo_id;
+        vo_mpp_chn.chn_id    = K_VO_DISPLAY_CHN_ID1;
         ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
         if (ret) {
             printf("kd_mpi_sys_unbind failed:0x%x\n", ret);

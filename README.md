@@ -1,7 +1,3 @@
-# 仓库使用
-
-在路径 `rtos_k230/src/rtsmart/examples/ai/` 下运行 git clone 即可
-
 # 轻量化人脸识别示例
 
 ## 概述
@@ -11,9 +7,16 @@
 ## 编译
 
 ```bash
-cd rtsmart/examples/my_face_recognition
+cd /home/hyperlovimia/k230_sdk
+docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
+```
+
+```bash
+cd src/reference/ai_poc/my_face_recognition
 ./build_app.sh
 ```
+
+项目必须位于 `k230_sdk/src/reference/ai_poc/my_face_recognition`。
 
 生成的编译产物在 `k230_bin` 目录中。
 

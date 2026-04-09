@@ -24,7 +24,7 @@
 // ==============================
 #include "k_module.h"
 #include "k_type.h"
-#include "k_gsdma_comm.h"
+#include "k_dma_comm.h"
 #include "k_vb_comm.h"
 #include "k_video_comm.h"
 #include "k_sys_comm.h"
@@ -39,7 +39,7 @@
 #include "mpi_connector_api.h"
 #include "k_autoconf_comm.h"
 #include "mpi_sensor_api.h"
-#include "mpi_gsdma_api.h"
+#include "mpi_dma_api.h"
 
 // ==============================
 // 项目内工具头文件
@@ -112,15 +112,15 @@ private:
     // ============================
     // VO（Video Output）相关
     // ============================
-    k_vo_layer_id vi_vo_id;     // 显示摄像头视频的 VO layer ID
-    k_vo_layer_attr vi_vo_attr;// VO layer 属性（分辨率、像素格式、旋转等）
+    k_vo_layer vi_vo_id;         // 显示摄像头视频的 VO layer ID
+    k_vo_video_layer_attr vi_vo_attr; // VO layer 属性（分辨率、像素格式、旋转等）
     k_s32 vo_dev_id;            // VO 设备 ID
 
     // ============================
     // OSD（叠加显示层）相关
     // ============================
-    k_vo_layer_id osd_vo_id;        // OSD layer ID（覆盖在视频之上）
-    k_vo_layer_attr osd_vo_attr;   // OSD layer 属性（ARGB、分辨率等）
+    k_vo_osd osd_vo_id;             // OSD layer ID（覆盖在视频之上）
+    k_vo_video_osd_attr osd_vo_attr;// OSD layer 属性（ARGB、分辨率等）
     k_u32 osd_pool_id;             // OSD 使用的 VB 内存池 ID
     k_vb_blk_handle handle;        // 从 VB 池申请的内存块句柄
     k_video_frame_info osd_frame_info; // OSD 帧信息（描述物理地址、格式等）

@@ -24,6 +24,7 @@
  */
 #include <iostream>
 #include <thread>
+#include <cstdint>
 #include "video_pipeline.h"
 #include "ai_utils.h"
 #include "face_detection.h"
@@ -159,7 +160,7 @@ void video_proc(char *argv[])
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
             dump_img.setTo(cv::Scalar(0, 0, 0));
             sensor_bgr.clear();
-            void* data=reinterpret_cast<void*>(dump_res.virt_addr);
+            uint8_t* data = reinterpret_cast<uint8_t*>(dump_res.virt_addr);
             cv::Mat ori_img_R(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data);
             cv::Mat ori_img_G(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data + AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
             cv::Mat ori_img_B(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH);

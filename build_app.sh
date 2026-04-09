@@ -11,14 +11,13 @@ set -e  # Exit immediately if a command fails
 SCRIPT=$(realpath -s "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
 
-export SDK_SRC_ROOT_DIR=$(realpath "${SCRIPTPATH}/../../../../../")
-export SDK_RTSMART_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/rtsmart/"
-export MPP_SRC_DIR="${SDK_RTSMART_SRC_DIR}/mpp/"
-export NNCASE_SRC_DIR="${SDK_RTSMART_SRC_DIR}/libs/nncase/"
-export OPENCV_SRC_DIR="${SDK_RTSMART_SRC_DIR}/libs/opencv/"
+export SDK_SRC_ROOT_DIR=$(realpath "${SCRIPTPATH}/../../../../")
+export MPP_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/mpp/"
+export NNCASE_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/nncase/"
+export OPENCV_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/utils/lib/opencv/"
 
 # Set cross-compile toolchain path
-export PATH=$PATH:~/.kendryte/k230_toolchains/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin
+export PATH=$PATH:/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin
 
 # =======================
 # Output directories
@@ -34,16 +33,14 @@ mkdir -p "${K230_BIN_DIR}"
 build_project() {
     pushd "${BUILD_DIR}"
 
-    # Incremental build: only run CMake if CMakeCache.txt does not exist
-    if [ ! -f "CMakeCache.txt" ]; then
-        echo "[INFO] Running initial CMake configuration..."
-        cmake -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX="$(pwd)" \
-              -DCMAKE_TOOLCHAIN_FILE=../cmake/Riscv64.cmake \
-              ..
-    else
-        echo "[INFO] Using existing CMake configuration for incremental build..."
-    fi
+    # 迁移目录后旧的 CMakeCache.txt 会记录原始源码路径，直接复用会配置失败。
+    rm -rf CMakeCache.txt CMakeFiles
+
+    echo "[INFO] Running CMake configuration..."
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$(pwd)" \
+          -DCMAKE_TOOLCHAIN_FILE=../cmake/Riscv64.cmake \
+          ..
 
     echo "[INFO] Starting build..."
     make -j --no-print-directory
@@ -55,8 +52,7 @@ build_project() {
 }
 
 # =======================
-# 仅收集交叉编译生成的 ELF 到 k230_bin（板端部署目录）
-# utils/ 为仓库内可选脚本（如三进程启动示例），不参与打包拷贝，避免与 k230_bin 混淆
+# 收集板端部署需要的 ELF、模型和脚本到 k230_bin
 # =======================
 collect_outputs() {
     local elves=(
@@ -77,6 +73,7 @@ collect_outputs() {
         for f in "${elves[@]}"; do
             [ -f "${f}" ] && cp -u "${f}" "${K230_BIN_DIR}/"
         done
+        cp -u utils/* "${K230_BIN_DIR}/" 2>/dev/null || true
     else
         echo "[WARN] No ELF files found under ${BUILD_DIR}/bin/"
     fi
