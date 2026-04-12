@@ -19,6 +19,7 @@ typedef enum {
     IPC_CMD_DB_COUNT = 1,
     IPC_CMD_DB_RESET = 2,
     IPC_CMD_REGISTER_COMMIT = 3,
+    IPC_CMD_SHUTDOWN = 4,
 } ipc_cmd_t;
 
 /* ipc_ai_reply_t.status：成功为 IPC_STATUS_OK；错误应答若仍通过 reply shmid 返回则填非 0 */

@@ -25,6 +25,7 @@ static void print_help()
     std::cout << "  n      : 查询注册人数\n";
     std::cout << "  q      : 退出（结束 face_video）\n";
     std::cout << "  请在「本进程」输入命令；需已启动 face_video。\n";
+    std::cout << "  单串口场景建议：先后台启动 face_ai / face_video，再前台启动 face_event。\n";
     std::cout << "=======================================\n" << std::endl;
 }
 
@@ -137,6 +138,15 @@ static void shutdown_event_process(int evt_ch, FILE *fp)
     g_evt_stop.store(true);
 
     if (evt_ch >= 0)
+    {
+        struct rt_channel_msg wake_msg;
+        memset(&wake_msg, 0, sizeof(wake_msg));
+        wake_msg.type = RT_CHANNEL_RAW;
+        wake_msg.u.d = (void *)-1;
+        rt_channel_send(evt_ch, &wake_msg);
+    }
+
+    if (evt_ch >= 0)
         rt_channel_close(evt_ch);
 
     int vch = g_video_ch.load();
@@ -170,7 +180,7 @@ int main(int argc, char **argv)
         return -1;
     }
     printf("face_event: listening on %s (ch=%d), log=%s\n", IPC_FACE_EVT_CHANNEL, evt_ch, log_path);
-    printf("face_event: stdin 在此输入；请先启动 face_ai，再启动 face_video。\n");
+    printf("face_event: stdin 在此输入；单串口建议先后台启动 face_ai、face_video，再前台启动本进程。\n");
 
     std::thread th_conn(connect_video_ctrl_thread);
     std::thread th_evt([&]() { evt_recv_loop(fp, evt_ch); });

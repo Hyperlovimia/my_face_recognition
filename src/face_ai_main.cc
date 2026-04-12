@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <time.h>
 #include <vector>
 
 #include <nncase/tensor.h>
@@ -18,6 +19,34 @@ using std::vector;
 
 static std::atomic<uint64_t> g_ai_ipc_recv{0};
 static std::atomic<uint64_t> g_ai_reply_err_infer{0};
+static std::atomic<uint64_t> g_ai_evt_send_ok{0};
+static std::atomic<uint64_t> g_ai_evt_send_fail{0};
+
+static int g_evt_ch = -1;
+static uint64_t g_evt_last_try_ms = 0;
+
+static constexpr uint64_t k_evt_reconnect_interval_ms = 1000;
+static constexpr uint64_t k_evt_cooldown_ms = 3000;
+static constexpr size_t k_evt_cache_slots = IPC_MAX_FACES + 4;
+
+typedef struct
+{
+    bool valid;
+    int id;
+    uint8_t is_stranger;
+    uint64_t last_sent_ms;
+    char name[IPC_NAME_MAX];
+} face_evt_cache_t;
+
+static face_evt_cache_t g_evt_cache[k_evt_cache_slots];
+
+static uint64_t now_monotonic_ms()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
 
 static bool ai_metrics_enabled(int debug_mode)
 {
@@ -25,10 +54,104 @@ static bool ai_metrics_enabled(int debug_mode)
     return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
 }
 
-static void notify_stranger(int evt_ch, int id, float score, const char *name)
+static void reset_evt_channel()
 {
+    if (g_evt_ch >= 0)
+    {
+        rt_channel_close(g_evt_ch);
+        g_evt_ch = -1;
+    }
+}
+
+static int ensure_evt_channel()
+{
+    if (g_evt_ch >= 0)
+        return g_evt_ch;
+
+    uint64_t now_ms = now_monotonic_ms();
+    if (now_ms - g_evt_last_try_ms < k_evt_reconnect_interval_ms)
+        return -1;
+
+    g_evt_last_try_ms = now_ms;
+    int ch = rt_channel_open(IPC_FACE_EVT_CHANNEL, 0);
+    if (ch < 0)
+        return -1;
+
+    g_evt_ch = ch;
+    std::cout << "face_ai: connected to " << IPC_FACE_EVT_CHANNEL << " (ch=" << g_evt_ch << ")\n";
+    return g_evt_ch;
+}
+
+static int find_face_event_cache_slot(int id, const char *name, bool is_stranger, bool *rate_limited)
+{
+    uint64_t now_ms = now_monotonic_ms();
+    int free_idx = -1;
+    int oldest_idx = 0;
+    *rate_limited = false;
+
+    for (size_t i = 0; i < k_evt_cache_slots; ++i)
+    {
+        if (!g_evt_cache[i].valid)
+        {
+            if (free_idx < 0)
+                free_idx = (int)i;
+            continue;
+        }
+
+        if (g_evt_cache[i].last_sent_ms < g_evt_cache[oldest_idx].last_sent_ms)
+            oldest_idx = (int)i;
+
+        bool same_entry = (g_evt_cache[i].id == id) && (g_evt_cache[i].is_stranger == (uint8_t)is_stranger);
+        if (!same_entry)
+            continue;
+
+        if (!is_stranger)
+        {
+            const char *lhs = g_evt_cache[i].name;
+            const char *rhs = name ? name : "";
+            if (strncmp(lhs, rhs, IPC_NAME_MAX) != 0)
+                continue;
+        }
+
+        if (now_ms - g_evt_cache[i].last_sent_ms < k_evt_cooldown_ms)
+        {
+            *rate_limited = true;
+            return (int)i;
+        }
+
+        return (int)i;
+    }
+
+    return (free_idx >= 0) ? free_idx : oldest_idx;
+}
+
+static void mark_face_event_sent(int slot_idx, int id, const char *name, bool is_stranger)
+{
+    uint64_t now_ms = now_monotonic_ms();
+    int idx = slot_idx;
+    if (idx < 0 || idx >= (int)k_evt_cache_slots)
+        idx = 0;
+
+    g_evt_cache[idx].valid = true;
+    g_evt_cache[idx].id = id;
+    g_evt_cache[idx].is_stranger = (uint8_t)is_stranger;
+    g_evt_cache[idx].last_sent_ms = now_ms;
+    memset(g_evt_cache[idx].name, 0, sizeof(g_evt_cache[idx].name));
+    if (name)
+        strncpy(g_evt_cache[idx].name, name, IPC_NAME_MAX - 1);
+}
+
+static void notify_face_event(int id, float score, const char *name, bool is_stranger)
+{
+    int evt_ch = ensure_evt_channel();
     if (evt_ch < 0)
         return;
+
+    bool rate_limited = false;
+    int cache_slot = find_face_event_cache_slot(id, name, is_stranger, &rate_limited);
+    if (rate_limited)
+        return;
+
     void *ep = nullptr;
     int eshm = ipc_shm_alloc(sizeof(ipc_evt_t), &ep);
     if (eshm < 0 || !ep)
@@ -40,7 +163,7 @@ static void notify_stranger(int evt_ch, int id, float score, const char *name)
     ev->score = score;
     if (name)
         strncpy(ev->name, name, IPC_NAME_MAX - 1);
-    ev->is_stranger = (id == -1) ? 1 : 0;
+    ev->is_stranger = is_stranger ? 1 : 0;
     lwp_shmdt(ep);
 
     struct rt_channel_msg nm;
@@ -49,9 +172,15 @@ static void notify_stranger(int evt_ch, int id, float score, const char *name)
     nm.u.d = (void *)(intptr_t)eshm;
     if (rt_channel_send(evt_ch, &nm) != 0)
     {
+        g_ai_evt_send_fail.fetch_add(1);
         ipc_shm_free(eshm);
-        std::cerr << "face_ai: notify_stranger rt_channel_send failed, shm freed\n";
+        std::cerr << "face_ai: event send failed, will reconnect " << IPC_FACE_EVT_CHANNEL << "\n";
+        reset_evt_channel();
+        return;
     }
+
+    mark_face_event_sent(cache_slot, id, name, is_stranger);
+    g_ai_evt_send_ok.fetch_add(1);
 }
 
 /* 请求侧 shmid 由 face_video 在 ipc_pack_request 中创建并在 rpc_ai 的 send_recv 返回后 ipc_shm_free。
@@ -106,10 +235,11 @@ int main(int argc, char **argv)
     int debug_mode = atoi(argv[7]);
     FrameCHWSize image_size = {AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH};
 
-    int evt_ch = rt_channel_open(IPC_FACE_EVT_CHANNEL, 0);
-    if (evt_ch < 0)
+    if (ensure_evt_channel() < 0)
+    {
         std::cout << "face_ai: warn: cannot open " << IPC_FACE_EVT_CHANNEL
-                  << " (start face_event first) — alerts disabled\n";
+                  << " now, event delivery will retry automatically\n";
+    }
 
     int ch_ai = rt_channel_open(IPC_FACE_AI_CHANNEL, O_CREAT);
     if (ch_ai < 0)
@@ -127,16 +257,20 @@ int main(int argc, char **argv)
 
     vector<FaceDetectionInfo> det_results;
     vector<FaceRecognitionInfo> rec_results;
+    bool should_exit = false;
 
     struct rt_channel_msg msg;
-    for (;;)
+    while (!should_exit)
     {
         rt_channel_recv(ch_ai, &msg);
         uint64_t recv_n = g_ai_ipc_recv.fetch_add(1) + 1;
         if (ai_metrics_enabled(debug_mode) && (recv_n % 200) == 0)
         {
             std::cerr << "[face_ai] metrics ipc_recv=" << recv_n
-                      << " reply_err_infer=" << g_ai_reply_err_infer.load() << std::endl;
+                      << " reply_err_infer=" << g_ai_reply_err_infer.load()
+                      << " evt_send_ok=" << g_ai_evt_send_ok.load()
+                      << " evt_send_fail=" << g_ai_evt_send_fail.load()
+                      << " evt_connected=" << ((g_evt_ch >= 0) ? "yes" : "no") << std::endl;
         }
 
         int req_shmid = (int)(intptr_t)msg.u.d;
@@ -170,6 +304,13 @@ int main(int argc, char **argv)
         {
             reply.count = face_recg.database_count(db_dir);
             reply.num_faces = 0;
+        }
+        else if (hdr->cmd == IPC_CMD_SHUTDOWN)
+        {
+            reply.count = 0;
+            reply.num_faces = 0;
+            should_exit = true;
+            std::cout << "face_ai: shutdown requested\n";
         }
         else if (hdr->cmd == IPC_CMD_DB_RESET)
         {
@@ -291,8 +432,11 @@ int main(int argc, char **argv)
                 reply.faces[reply.num_faces].rec.name[IPC_NAME_MAX - 1] = '\0';
                 reply.num_faces++;
 
-                if (evt_ch >= 0 && hdr->cmd == IPC_CMD_INFER && recg_result.id == -1)
-                    notify_stranger(evt_ch, recg_result.id, recg_result.score, recg_result.name.c_str());
+                if (hdr->cmd == IPC_CMD_INFER)
+                {
+                    bool is_stranger = (recg_result.id == -1);
+                    notify_face_event(recg_result.id, recg_result.score, recg_result.name.c_str(), is_stranger);
+                }
             }
             if (!rec_ok)
             {
@@ -341,8 +485,7 @@ int main(int argc, char **argv)
         rt_channel_reply(ch_ai, &out);
     }
 
-    if (evt_ch >= 0)
-        rt_channel_close(evt_ch);
+    reset_evt_channel();
     rt_channel_close(ch_ai);
     return 0;
 }

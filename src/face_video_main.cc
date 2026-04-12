@@ -20,6 +20,7 @@
 
 static std::atomic<bool> isp_stop(false);
 static std::atomic<int> cur_state(0);
+static std::atomic<bool> g_shutdown_ai_requested{false};
 static std::mutex g_ui;
 static std::string register_name;
 static std::atomic<int> g_video_ctrl_ch{-1};
@@ -100,6 +101,7 @@ static void ctrl_recv_loop()
 
         if ((ipc_video_ctrl_op_t)c->op == IPC_VIDEO_CTRL_OP_QUIT)
         {
+            g_shutdown_ai_requested.store(true);
             isp_stop = true;
             lwp_shmdt(p);
             ipc_shm_free(shmid);
@@ -430,6 +432,15 @@ static void video_ipc_loop(int debug_mode)
     g_infer_cv.notify_all();
     th_infer.join();
 
+    if (g_shutdown_ai_requested.load())
+    {
+        ipc_ai_reply_t shutdown_reply{};
+        if (rpc_ai_sync(ai_ch, IPC_CMD_SHUTDOWN, nullptr, 0, 1, 1, 1, nullptr, &shutdown_reply))
+            std::cout << "face_video: AI shutdown acknowledged\n";
+        else
+            std::cout << "face_video: warn: AI shutdown request failed\n";
+    }
+
     if (g_fixed_infer_ptr)
     {
         lwp_shmdt(g_fixed_infer_ptr);
@@ -455,6 +466,7 @@ int main(int argc, char **argv)
         return -1;
     }
     int debug_mode = atoi(argv[1]);
+    g_shutdown_ai_requested.store(false);
 
     std::thread th_ctrl(ctrl_recv_loop);
     for (int i = 0; i < 100 && g_video_ctrl_ch.load() < 0; i++)
