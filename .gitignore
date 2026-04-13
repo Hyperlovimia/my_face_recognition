@@ -2,3 +2,9 @@ k230_bin/
 build/
 tmp/
 .idea/
+/.venv/
+/models_src/calib_npy/
+/models_src/nncase_dump/
+/host_test/
+/models_src/prep_debug.npy
+/utils/face_antispoof.kmodel
