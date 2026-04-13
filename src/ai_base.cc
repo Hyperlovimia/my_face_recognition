@@ -266,3 +266,47 @@ bool AIBase::try_get_output()
 runtime_tensor AIBase::get_output_tensor(int idx){
     return kmodel_interp_.output_tensor(idx).expect("cannot get current output tensor");
 }
+
+void AIBase::dump_model_io()
+{
+    cout << "Model tensor count: inputs=" << kmodel_interp_.inputs_size()
+         << ", outputs=" << kmodel_interp_.outputs_size() << endl;
+
+    for (int i = 0; i < kmodel_interp_.inputs_size(); ++i)
+    {
+        auto desc = kmodel_interp_.input_desc(i);
+        auto shape = kmodel_interp_.input_shape(i);
+        cout << "  input[" << i << "] dtype=" << to_string(desc.datatype) << " shape=[";
+        for (size_t j = 0; j < shape.size(); ++j)
+        {
+            if (j)
+                cout << ",";
+            cout << shape[j];
+        }
+        cout << "]" << endl;
+    }
+
+    for (size_t i = 0; i < kmodel_interp_.outputs_size(); ++i)
+    {
+        auto desc = kmodel_interp_.output_desc(i);
+        auto shape = kmodel_interp_.output_shape(i);
+        cout << "  output[" << i << "] dtype=" << to_string(desc.datatype) << " shape=[";
+        for (size_t j = 0; j < shape.size(); ++j)
+        {
+            if (j)
+                cout << ",";
+            cout << shape[j];
+        }
+        cout << "]" << endl;
+    }
+}
+
+bool AIBase::model_input_is_float32(size_t i) const
+{
+    return kmodel_interp_.input_desc(i).datatype == typecode_t::dt_float32;
+}
+
+bool AIBase::model_input_is_uint8(size_t i) const
+{
+    return kmodel_interp_.input_desc(i).datatype == typecode_t::dt_uint8;
+}

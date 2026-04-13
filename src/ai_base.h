@@ -89,6 +89,17 @@ public:
 
     runtime_tensor get_output_tensor(int idx);
 
+    /**
+     * @brief 打印模型所有输入/输出的 dtype 与 shape（用于独立测试与调试）
+     */
+    void dump_model_io();
+
+    /** @brief 第 i 路输入是否为 float32（与 ONNX 浮点输入一致） */
+    bool model_input_is_float32(size_t i = 0) const;
+
+    /** @brief 第 i 路输入是否为 uint8（部分量化部署） */
+    bool model_input_is_uint8(size_t i = 0) const;
+
 
 protected:
     string model_name_;                    // 模型名字
