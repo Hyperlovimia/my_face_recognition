@@ -64,7 +64,6 @@ collect_outputs() {
         "${BUILD_DIR}/bin/face_video.elf"
         "${BUILD_DIR}/bin/face_ai.elf"
         "${BUILD_DIR}/bin/face_event.elf"
-        "${BUILD_DIR}/bin/fas_test.elf"
     )
     local found=0
     for f in "${elves[@]}"; do

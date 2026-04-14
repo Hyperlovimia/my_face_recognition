@@ -73,6 +73,16 @@ cv::Mat preprocess_reflect_pad_rgb(const cv::Mat &rgb, int target_h, int target_
     return padded;
 }
 
+void softmax2(float a, float b, float *o0, float *o1)
+{
+    const float m = (std::max)(a, b);
+    const float e0 = std::exp(a - m);
+    const float e1 = std::exp(b - m);
+    const float s = e0 + e1;
+    *o0 = e0 / s;
+    *o1 = e1 / s;
+}
+
 } // namespace
 
 FaceAntiSpoof::FaceAntiSpoof(const char *kmodel_file, int debug_mode)
@@ -117,10 +127,20 @@ bool FaceAntiSpoof::feed_image(const std::string &image_path)
         cerr << "feed_image: failed to read image: " << image_path << endl;
         return false;
     }
+    return feed_bgr_mat(bgr);
+}
+
+bool FaceAntiSpoof::feed_bgr_mat(const cv::Mat &bgr_in)
+{
+    if (bgr_in.empty() || bgr_in.type() != CV_8UC3)
+    {
+        cerr << "feed_bgr_mat: empty or not CV_8UC3" << endl;
+        return false;
+    }
 
     if (input_shapes_.empty() || input_shapes_[0].size() < 4)
     {
-        cerr << "feed_image: unexpected model input rank" << endl;
+        cerr << "feed_bgr_mat: unexpected model input rank" << endl;
         return false;
     }
 
@@ -131,7 +151,7 @@ bool FaceAntiSpoof::feed_image(const std::string &image_path)
     const size_t expected_elems = static_cast<size_t>(Nexp * Cexp * Hexp * Wexp);
 
     cv::Mat rgb;
-    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    cv::cvtColor(bgr_in, rgb, cv::COLOR_BGR2RGB);
 
     cv::Mat padded = preprocess_reflect_pad_rgb(rgb, Hexp, Wexp);
     if (padded.rows != Hexp || padded.cols != Wexp)
@@ -242,4 +262,31 @@ bool FaceAntiSpoof::feed_image(const std::string &image_path)
 bool FaceAntiSpoof::forward()
 {
     return try_run() && try_get_output();
+}
+
+bool FaceAntiSpoof::decode_liveness_scores(float *real_prob, float *spoof_prob) const
+{
+    if (!real_prob || !spoof_prob)
+        return false;
+    if (p_outputs_.empty() || !p_outputs_[0] || output_shapes_.empty())
+        return false;
+
+    size_t n = 1;
+    for (size_t d : output_shapes_[0])
+        n *= static_cast<size_t>(d);
+    if (n < 2)
+        return false;
+
+    const float *out = p_outputs_[0];
+    const float v0 = out[0];
+    const float v1 = out[1];
+    float p0 = v0;
+    float p1 = v1;
+    const float sumab = std::fabs(v0 + v1 - 1.0f);
+    if (sumab > 0.08f)
+        softmax2(v0, v1, &p0, &p1);
+
+    *spoof_prob = p0;
+    *real_prob = p1;
+    return true;
 }

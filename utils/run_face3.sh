@@ -7,6 +7,8 @@
 #   PID_DIR           PID 目录，默认 /tmp/face3_pids
 #   FACE_METRICS=1    face_video / face_ai 周期性输出指标到 stderr
 #   RUN_FACE3_RESTART=1  任一子进程退出后：先杀其余子进程，再整组重新拉起（循环监督）
+#   FAS_KMODEL=路径   静默活体 kmodel；文件不存在则不带第 9 参数（不启用活体）
+#   FACE_FAS_REAL_THRESH 活体 REAL 概率阈值，默认 0.5
 #
 # 默认：任一子进程退出 → 杀光其余进程 → 退出码 1（便于 systemd/openrc 重启策略）
 
@@ -28,6 +30,7 @@ DET_THRES="${DET_THRES:-0.5}"
 NMS_THRES="${NMS_THRES:-0.2}"
 REC_THRES="${REC_THRES:-70}"
 DEBUG_AI="${DEBUG_AI:-0}"
+FAS_KMODEL="${FAS_KMODEL:-${BIN_DIR}/face_antispoof.kmodel}"
 
 kill_from_pidfile() {
     _f="$1"
@@ -77,7 +80,15 @@ start_three() {
     sleep 0.5
 
     echo "[2/3] face_ai.elf pid -> ${PID_DIR}/face_ai.pid"
-    "${BIN_DIR}/face_ai.elf" "${DET_KMODEL}" "${DET_THRES}" "${NMS_THRES}" "${REC_KMODEL}" "${REC_THRES}" "${DB_DIR}" "${DEBUG_AI}" &
+    if [ -f "${FAS_KMODEL}" ]; then
+        echo "run_face3: FaceAntiSpoof kmodel: ${FAS_KMODEL}"
+        "${BIN_DIR}/face_ai.elf" "${DET_KMODEL}" "${DET_THRES}" "${NMS_THRES}" "${REC_KMODEL}" "${REC_THRES}" \
+            "${DB_DIR}" "${DEBUG_AI}" "${FAS_KMODEL}" &
+    else
+        echo "run_face3: no ${FAS_KMODEL}, face_ai without liveness"
+        "${BIN_DIR}/face_ai.elf" "${DET_KMODEL}" "${DET_THRES}" "${NMS_THRES}" "${REC_KMODEL}" "${REC_THRES}" \
+            "${DB_DIR}" "${DEBUG_AI}" &
+    fi
     echo $! > "${PID_DIR}/face_ai.pid"
     sleep 1
 

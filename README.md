@@ -12,6 +12,7 @@
 
 ```bash
 cd rtsmart/examples/my_face_recognition
+deactivate
 ./build_app.sh
 ```
 
