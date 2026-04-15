@@ -56,7 +56,7 @@ build_project() {
 
 # =======================
 # 仅收集交叉编译生成的 ELF 到 k230_bin（板端部署目录）
-# utils/ 为仓库内可选脚本（如三进程启动示例），不参与打包拷贝，避免与 k230_bin 混淆
+# RT-Smart 板端不依赖 utils/*.sh；模型文件按现场部署需要手工同步到 /data
 # =======================
 collect_outputs() {
     local elves=(
@@ -64,7 +64,6 @@ collect_outputs() {
         "${BUILD_DIR}/bin/face_video.elf"
         "${BUILD_DIR}/bin/face_ai.elf"
         "${BUILD_DIR}/bin/face_event.elf"
-        "${BUILD_DIR}/bin/fas_test.elf"
     )
     local found=0
     for f in "${elves[@]}"; do

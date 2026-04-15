@@ -54,7 +54,7 @@ public:
     bool forward();
 
     /**
-     * forward() 且输出为 2 类后有效。约定与 fas_test 一致：out[0]=SPOOF、out[1]=REAL；
+     * forward() 且输出为 2 类后有效。沿用原独立测试约定：out[0]=SPOOF、out[1]=REAL；
      * 若两路之和接近 1 则视为概率，否则对 logits 做 softmax。
      */
     bool decode_liveness_scores(float *real_prob, float *spoof_prob) const;

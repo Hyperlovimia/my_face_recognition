@@ -241,8 +241,8 @@ int main(int argc, char **argv)
     {
         std::cout << "Usage: face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> "
                      "<debug_mode> [<face_antispoof.kmodel>]\n";
-        std::cout << "  Optional 9th arg: silent liveness kmodel; omit to disable. Threshold: env "
-                     "FACE_FAS_REAL_THRESH (default 0.5).\n";
+        std::cout << "  Optional 9th arg: silent liveness kmodel; omit to disable. Liveness REAL threshold "
+                     "defaults to 0.5; do not rely on export on RT-Smart msh.\n";
         return -1;
     }
 

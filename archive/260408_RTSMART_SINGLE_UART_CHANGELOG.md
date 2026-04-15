@@ -196,6 +196,7 @@
 
 - `utils/run_face3.sh`
 - `utils/watchdog_face3.sh`
+- `utils/run.sh`
 
 原因不是它们逻辑本身错误，而是：
 
@@ -207,14 +208,16 @@
   - shell 函数
   - `if/for/while`
   - `trap`
-  - 标准 shell 重定向与后台管理
+  - `export` 设置运行时环境变量
+  - `ps`、`grep`、`killall` 等通用 Linux 进程管理命令
 
 因此在 RT-Smart 系统中：
 
 - `run_face3.sh` 无法直接执行
 - `watchdog_face3.sh` 无法直接执行
+- `run.sh` 也不作为板端入口保留
 
-既然项目最终目标是面向 RT-Smart 实机运行，继续保留这两个脚本反而会误导使用者，因此本轮已删除。
+既然项目最终目标是面向 RT-Smart 实机运行，继续保留这些脚本反而会误导使用者，因此本轮已删除。
 
 ## 6. 当前运行方式
 
@@ -235,16 +238,23 @@
 - `/data/face_event.elf`
 - `/data/face_detection_320.kmodel`
 - `/data/face_recognition.kmodel`
+- `/data/face_antispoof.kmodel`，仅启用活体检测时需要
 
-并确保数据库目录存在：
-
-```sh
-mkdir /data/face_db
-```
+`/data/face_db` 不存在时，`face_ai.elf` 会在启动时尝试自动创建。
 
 ### 6.3 正确启动顺序
 
 请按以下顺序启动：
+
+启用活体检测时，`face_ai.elf` 使用 9 参数，最后一项为活体模型路径：
+
+```sh
+/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/face_recognition.kmodel 70 /data/face_db 0 /data/face_antispoof.kmodel &
+/data/face_video.elf 0 &
+/data/face_event.elf /tmp/attendance.log
+```
+
+暂不启用活体检测时，`face_ai.elf` 使用 8 参数：
 
 ```sh
 /data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/face_recognition.kmodel 70 /data/face_db 0 &
@@ -257,6 +267,7 @@ mkdir /data/face_db
 - `face_ai` 后台启动
 - `face_video` 后台启动
 - `face_event` 最后前台启动，负责读取串口输入
+- 不依赖 `export`、脚本变量或脚本自动判断模型是否存在
 
 这样可以同时满足：
 

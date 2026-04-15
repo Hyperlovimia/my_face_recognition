@@ -1,5 +1,7 @@
 # 人脸活体（静默）kmodel 独立验证与 WSL 对照变更文档
 
+> 260415 说明：本文是历史归档，描述的是“独立 `fas_test.elf` 验证阶段”的方案。当前主线已将活体并入 `face_ai.elf`，`fas_test.elf`、`src/fas_test.cc` 与 `utils/run_fas_test.sh` 已移除，RT-Smart 板端请不要再按本文的 `fas_test` 上板步骤执行。当前启动方式请以 [260414_FACE_ANTISPOOF_INTEGRATION_CHANGELOG.md](./260414_FACE_ANTISPOOF_INTEGRATION_CHANGELOG.md) 和 [README.md](../README.md) 为准；本文第 6～8 节仍可作为模型转换、PTQ 与预处理对齐参考。
+
 ## 1. 文档说明
 
 本文档用于说明 `my_face_recognition` 工程中 **人脸活体（Face Anti-Spoof, FAS）** 相关的一次增量变更：在 **不改动三进程门禁主流程** 的前提下，新增 **板端可独立运行的 kmodel 测试程序** `fas_test.elf`，并补充 **WSL/PC 侧 ONNX 参考推理** 与 **预处理对齐** 能力，便于在实际上板前验证 `face_antispoof.kmodel` 的加载、推理与输出合理性。

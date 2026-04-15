@@ -29,8 +29,4 @@ target_link_libraries(face_ai.elf ${nncase_link} ${opencv_link})
 add_executable(face_event.elf face_event_main.cc ipc_shm.cc ipc_lwp_syscall.c)
 target_link_libraries(face_event.elf sys atomic)
 
-# 活体 kmodel 独立验证（不链 MPP）
-add_executable(fas_test.elf fas_test.cc face_antispoof.cc ai_base.cc ai_utils.cc)
-target_link_libraries(fas_test.elf ${nncase_link} ${opencv_link})
-
-install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf fas_test.elf DESTINATION bin)
+install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)
