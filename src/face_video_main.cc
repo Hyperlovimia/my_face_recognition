@@ -1,5 +1,6 @@
 /* RT-Smart: video capture + display process — VICAP/VO/OSD, talks to face_ai via IPC. */
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -48,11 +49,21 @@ static std::atomic<uint64_t> g_metric_infer_rpc_ok{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_fail{0};
 static std::atomic<uint64_t> g_metric_infer_stale{0};
 static std::atomic<uint64_t> g_metric_infer_applied{0};
+static constexpr int k_register_preview_hold_ms = 2000;
 
 static bool metrics_log_enabled(int debug_mode)
 {
     const char *e = std::getenv("FACE_METRICS");
     return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
+}
+
+static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_bgra)
+{
+    if (preview_bgra.empty())
+        return;
+
+    cv::Rect roi(0, 0, preview_bgra.cols, preview_bgra.rows);
+    preview_bgra.copyTo(draw_frame(roi));
 }
 
 static void ctrl_recv_loop()
@@ -268,6 +279,8 @@ static void video_ipc_loop(int debug_mode)
     DumpRes dump_res;
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
+    cv::Mat register_preview_bgra;
+    auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
     PipeLine pl(debug_mode);
     if (pl.Create() != 0)
@@ -320,6 +333,8 @@ static void video_ipc_loop(int debug_mode)
         int display_state = 0;
         ipc_ai_reply_t ai_reply{};
         memset(&ai_reply, 0, sizeof(ai_reply));
+        const auto now = std::chrono::steady_clock::now();
+        const bool preview_active = !register_preview_bgra.empty() && now < register_preview_deadline;
 
         uint8_t *frame_ptr = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
         size_t frame_len = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
@@ -449,10 +464,17 @@ static void video_ipc_loop(int debug_mode)
         if (display_state == 2)
         {
             cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::Mat resized_dump;
-            cv::resize(dump_img, resized_dump, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
-            cv::Rect roi(0, 0, resized_dump.cols, resized_dump.rows);
-            resized_dump.copyTo(draw_frame(roi));
+            cv::resize(dump_img, register_preview_bgra, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
+            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if (preview_active)
+        {
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if (!register_preview_bgra.empty())
+        {
+            register_preview_bgra.release();
         }
 
         pl.InsertFrame(draw_frame.data);

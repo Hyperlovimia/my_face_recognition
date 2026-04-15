@@ -22,6 +22,7 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <chrono>
 #include <iostream>
 #include <thread>
 #include "video_pipeline.h"
@@ -32,6 +33,17 @@
 using std::cerr;
 using std::cout;
 using std::endl;
+
+static constexpr int k_register_preview_hold_ms = 2000;
+
+static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_bgra)
+{
+    if (preview_bgra.empty())
+        return;
+
+    cv::Rect roi(0, 0, preview_bgra.cols, preview_bgra.rows);
+    preview_bgra.copyTo(draw_frame(roi));
+}
 
 std::atomic<bool> isp_stop(false);
 // 注册人名称
@@ -112,6 +124,8 @@ void video_proc(char *argv[])
     int display_state=0;
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT,AI_FRAME_WIDTH , CV_8UC3);
+    cv::Mat register_preview_bgra;
+    auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
     while(!isp_stop){
         // 创建一个ScopedTiming对象，用于计算总时间
@@ -128,6 +142,9 @@ void video_proc(char *argv[])
         //前处理，推理，后处理
         det_results.clear();
         rec_results.clear();
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool preview_active = !register_preview_bgra.empty() && now < register_preview_deadline;
 
         if(cur_state==-1){
             //不执行任何操作
@@ -218,10 +235,15 @@ void video_proc(char *argv[])
         
         if(display_state==2){
             cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::Mat resized_dump;
-            cv::resize(dump_img, resized_dump, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
-            cv::Rect roi(0, 0, resized_dump.cols, resized_dump.rows);
-            resized_dump.copyTo(draw_frame(roi));
+            cv::resize(dump_img, register_preview_bgra, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
+            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(preview_active){
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(!register_preview_bgra.empty()){
+            register_preview_bgra.release();
         }
         else{
             for (size_t i = 0; i < rec_results.size(); i++) {
