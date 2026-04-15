@@ -19,6 +19,10 @@ cd rtsmart/examples/ai/my_face_recognition
 ./build_app.sh
 ```
 
+```bash
+deactivate
+```
+
 生成的 ELF 产物在 `k230_bin` 目录中。将以下文件按需同步到板端 `/data`：
 
 - `face_ai.elf`

@@ -286,7 +286,10 @@ bool FaceAntiSpoof::decode_liveness_scores(float *real_prob, float *spoof_prob) 
     if (sumab > 0.08f)
         softmax2(v0, v1, &p0, &p1);
 
-    *spoof_prob = p0;
-    *real_prob = p1;
+    /* 类别维顺序必须与训练/ONNX 导出一致。
+     * 多数量产 FAS 导出为 out[0]=REAL、out[1]=SPOOF；旧文档曾写 [0]=SPOOF。
+     * 若出现「真人 REAL 分长期很低、翻拍/照片反而易过」，即为反类，应使用下面这组赋值。 */
+    *real_prob = p0;
+    *spoof_prob = p1;
     return true;
 }

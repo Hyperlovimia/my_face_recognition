@@ -20,7 +20,8 @@ static void print_help()
 {
     std::cout << "======== 操作说明 (三进程模式) ========\n";
     std::cout << "  h/help : 帮助\n";
-    std::cout << "  i      : 注册（截图后输入姓名）\n";
+    std::cout << "  i      : 现场注册 — 抓拍当前画面，下一行输入姓名\n";
+    std::cout << "  i 姓名 : 一键注册 — 本帧画面直接入库（陌生人可先对准入镜）\n";
     std::cout << "  d      : 清空数据库\n";
     std::cout << "  n      : 查询注册人数\n";
     std::cout << "  q      : 退出（结束 face_video）\n";
@@ -120,7 +121,7 @@ static void evt_recv_loop(FILE *fp, int evt_ch)
         }
         else if (ev->evt_kind == IPC_EVT_KIND_STRANGER || ev->is_stranger)
         {
-            printf("[ALERT] stranger (score=%.2f)\n", ev->score);
+            printf("[ALERT] 未识别 stranger (score=%.2f) — 可输入 i 或 i <姓名> 现场注册\n", ev->score);
             if (fp)
             {
                 fprintf(fp, "[STRANGER] score=%.2f\n", ev->score);
@@ -214,6 +215,19 @@ int main(int argc, char **argv)
             last_input = "i";
             send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 2, nullptr);
         }
+        else if (input.size() >= 2 && input[0] == 'i' && (input[1] == ' ' || input[1] == '\t'))
+        {
+            std::string rest = input.substr(2);
+            while (!rest.empty() && (rest[0] == ' ' || rest[0] == '\t'))
+                rest.erase(0, 1);
+            if (rest.empty())
+                std::cout << "用法: i <姓名> — 使用当前画面一键注册\n";
+            else
+            {
+                last_input.clear();
+                send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 5, rest.c_str());
+            }
+        }
         else if (input == "d")
             send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 4, nullptr);
         else if (input == "n")
@@ -224,16 +238,16 @@ int main(int argc, char **argv)
             send_video_ctrl(IPC_VIDEO_CTRL_OP_QUIT, 0, nullptr);
             break;
         }
-        else
-        {
-            if (last_input == "i")
-            {
-                send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 3, input.c_str());
-                last_input.clear();
-            }
             else
-                std::cout << "请先输入 i 进入注册模式。\n";
-        }
+            {
+                if (last_input == "i")
+                {
+                    send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 3, input.c_str());
+                    last_input.clear();
+                }
+                else
+                    std::cout << "陌生人现场注册: 输入 i（抓拍后再输姓名），或 i <姓名> 一键注册。\n";
+            }
     }
 
     shutdown_event_process(evt_ch, fp);

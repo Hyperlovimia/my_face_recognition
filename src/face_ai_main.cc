@@ -24,9 +24,16 @@ static float fas_real_thresh_from_env()
 {
     const char *e = std::getenv("FACE_FAS_REAL_THRESH");
     if (!e || !e[0])
-        return 0.5f;
+        /* 略低于 0.5：静默活体单帧分数对真人往往更「抖」，默认 0.5 容易误拒；假体若 REAL 长期很低仍易区分 */
+        return 0.4f;
     return static_cast<float>(std::atof(e));
 }
+
+/* 按人脸槽位对 REAL 概率做 EMA，减轻真人瞬时低分；人脸消失后对应槽位会重置 */
+static float g_fas_real_ema[IPC_MAX_FACES];
+static uint8_t g_fas_real_ema_inited[IPC_MAX_FACES];
+
+static constexpr float k_fas_ema_alpha = 0.38f;
 
 static std::atomic<uint64_t> g_ai_ipc_recv{0};
 static std::atomic<uint64_t> g_ai_reply_err_infer{0};
@@ -237,17 +244,20 @@ int main(int argc, char **argv)
 {
     std::cout << "face_ai: built " << __DATE__ << " " << __TIME__ << std::endl;
 
-    if (argc != 8 && argc != 9)
+    if (argc != 8 && argc != 9 && argc != 10)
     {
         std::cout << "Usage: face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> "
-                     "<debug_mode> [<face_antispoof.kmodel>]\n";
-        std::cout << "  Optional 9th arg: silent liveness kmodel; omit to disable. Liveness REAL threshold "
-                     "defaults to 0.5; do not rely on export on RT-Smart msh.\n";
+                     "<debug_mode> [<face_antispoof.kmodel> [<real_prob_threshold>]]\n";
+        std::cout << "  Optional 9th: silent liveness kmodel; omit to disable.\n";
+        std::cout << "  Optional 10th: REAL 概率阈值 (需同时带 9th)；默认 0.4 或环境变量 FACE_FAS_REAL_THRESH。\n";
+        std::cout << "  活体启用时对 REAL 做短时平滑(EMA)，减轻真人单帧误拒；板端勿依赖 export。\n";
         return -1;
     }
 
     int debug_mode = atoi(argv[7]);
-    const float fas_real_thresh = fas_real_thresh_from_env();
+    float fas_real_thresh = fas_real_thresh_from_env();
+    if (argc >= 10 && argv[9] && argv[9][0] != '\0')
+        fas_real_thresh = static_cast<float>(std::atof(argv[9]));
 
     std::unique_ptr<FaceAntiSpoof> fas;
     if (argc == 9 && argv[8] && argv[8][0] != '\0')
@@ -255,7 +265,8 @@ int main(int argc, char **argv)
         try
         {
             fas.reset(new FaceAntiSpoof(argv[8], debug_mode));
-            std::cout << "face_ai: FaceAntiSpoof loaded: " << argv[8] << " (REAL>=" << fas_real_thresh << ")\n";
+            std::cout << "face_ai: FaceAntiSpoof loaded: " << argv[8] << " (REAL>=" << fas_real_thresh
+                      << ", EMA alpha=" << k_fas_ema_alpha << ")\n";
         }
         catch (const std::exception &e)
         {
@@ -431,6 +442,9 @@ int main(int argc, char **argv)
             }
             face_det.post_process(fs, det_results);
 
+            for (size_t j = det_results.size(); j < (size_t)IPC_MAX_FACES; ++j)
+                g_fas_real_ema_inited[j] = 0;
+
             bool rec_ok = true;
             for (size_t i = 0; i < det_results.size() && i < (size_t)IPC_MAX_FACES; ++i)
             {
@@ -457,11 +471,21 @@ int main(int argc, char **argv)
                         rec_ok = false;
                         break;
                     }
+                    const float raw_real = live_real;
+                    if (!g_fas_real_ema_inited[i])
+                    {
+                        g_fas_real_ema[i] = raw_real;
+                        g_fas_real_ema_inited[i] = 1;
+                    }
+                    else
+                        g_fas_real_ema[i] =
+                            k_fas_ema_alpha * raw_real + (1.f - k_fas_ema_alpha) * g_fas_real_ema[i];
+                    live_real = g_fas_real_ema[i];
                     is_live = (live_real >= fas_real_thresh) ? 1 : 0;
                     if (debug_mode > 1)
                     {
-                        std::cout << "face_ai: liveness REAL=" << live_real << " SPOOF=" << live_spoof
-                                  << " pass=" << (int)is_live << std::endl;
+                        std::cout << "face_ai: liveness REAL_raw=" << raw_real << " REAL_ema=" << live_real
+                                  << " SPOOF=" << live_spoof << " pass=" << (int)is_live << std::endl;
                     }
                 }
 

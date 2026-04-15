@@ -397,6 +397,47 @@ static void video_ipc_loop(int debug_mode)
             cur_state = 0;
             display_state = 0;
         }
+        /* 本帧抓拍并提交注册，避免「i」与姓名分开发送时 cur_state 被覆盖导致未抓拍 */
+        else if (state == 5)
+        {
+            draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+            dump_img.setTo(cv::Scalar(0, 0, 0));
+            sensor_bgr.clear();
+            uint8_t *cap = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
+            cv::Mat cap_R(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap);
+            cv::Mat cap_G(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap + AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
+            cv::Mat cap_B(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
+            sensor_bgr.push_back(cap_B);
+            sensor_bgr.push_back(cap_G);
+            sensor_bgr.push_back(cap_R);
+            cv::merge(sensor_bgr, dump_img);
+
+            std::string name_copy;
+            {
+                std::lock_guard<std::mutex> lk(g_ui);
+                name_copy = register_name;
+            }
+            std::vector<uint8_t> chw_vec;
+            std::vector<cv::Mat> bgrChannels(3);
+            cv::split(dump_img, bgrChannels);
+            for (auto i = 2; i > -1; i--)
+            {
+                std::vector<uint8_t> row = std::vector<uint8_t>(bgrChannels[i].reshape(1, 1));
+                chw_vec.insert(chw_vec.end(), row.begin(), row.end());
+            }
+            uint32_t th = (uint32_t)dump_img.rows;
+            uint32_t tw = (uint32_t)dump_img.cols;
+            uint32_t tc = 3u;
+
+            ipc_ai_reply_t r{};
+            if (rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw, name_copy.c_str(),
+                            &r))
+            {
+                /* result printed in face_ai */
+            }
+            cur_state = 0;
+            display_state = 2;
+        }
         else if (state == 4)
         {
             ipc_ai_reply_t r{};
