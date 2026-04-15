@@ -21,10 +21,18 @@ void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
         int w = (int)(bw / ref_w * draw_img.cols);
         int h = (int)(bh / ref_h * draw_img.rows);
 
-        cv::rectangle(draw_img, cv::Rect(x, y, w, h), cv::Scalar(255, 255, 255, 255), 2, 2, 0);
+        const bool spoof = (f.is_live == 0);
+        const cv::Scalar box_color = spoof ? cv::Scalar(0, 0, 255, 255) : cv::Scalar(255, 255, 255, 255);
+        cv::rectangle(draw_img, cv::Rect(x, y, w, h), box_color, 2, 2, 0);
 
-        char text[96];
-        if (f.rec.id == -1)
+        char text[112];
+        if (spoof)
+        {
+            snprintf(text, sizeof(text), "SPOOF %.2f", f.liveness_real_score);
+            cv::putText(draw_img, text, {x, std::max(y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 0.9,
+                        cv::Scalar(0, 0, 255, 255), 1, 8, 0);
+        }
+        else if (f.rec.id == -1)
         {
             cv::putText(draw_img, "unknown", {x, std::max(y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
                         cv::Scalar(255, 0, 255, 255), 1, 8, 0);

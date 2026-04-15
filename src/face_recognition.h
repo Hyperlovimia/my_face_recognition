@@ -65,6 +65,12 @@ public:
     bool pre_process(runtime_tensor& input_tensor, float *sparse_points);
 
     /**
+     * @brief 在 pre_process 成功后调用：将识别模型输入（仿射对齐后的 NCHW uint8，R/G/B 平面）转为 BGR，供活体等与识别同源对齐的链路使用。
+     * @return false 表示维度过期或映射失败
+     */
+    bool aligned_face_to_bgr(cv::Mat &bgr) const;
+
+    /**
      * @brief kmodel推理
      * @return false 表示 nncase 推理/读输出失败
      */

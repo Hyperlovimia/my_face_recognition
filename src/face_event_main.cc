@@ -109,7 +109,16 @@ static void evt_recv_loop(FILE *fp, int evt_ch)
             continue;
         }
 
-        if (ev->is_stranger)
+        if (ev->evt_kind == IPC_EVT_KIND_LIVENESS_FAIL)
+        {
+            printf("[ALERT] spoof / liveness failed (REAL score=%.3f)\n", ev->score);
+            if (fp)
+            {
+                fprintf(fp, "[SPOOF] real_score=%.3f\n", ev->score);
+                fflush(fp);
+            }
+        }
+        else if (ev->evt_kind == IPC_EVT_KIND_STRANGER || ev->is_stranger)
         {
             printf("[ALERT] stranger (score=%.2f)\n", ev->score);
             if (fp)

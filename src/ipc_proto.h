@@ -61,6 +61,9 @@ typedef struct {
     float sparse_kps[10];
     float det_score;
     ipc_rec_face_t rec;
+    float liveness_real_score; /* REAL 概率；未启用活体检测时为 1.0 */
+    uint8_t is_live;           /* 1=活体通过或未启用活体；0=未通过 */
+    uint8_t _pad[3];
 } ipc_face_bundle_t;
 
 typedef struct {
@@ -71,12 +74,21 @@ typedef struct {
     ipc_face_bundle_t faces[IPC_MAX_FACES];
 } ipc_ai_reply_t;
 
+/** face_ai -> face_event：业务事件类型（考勤/报警/留痕） */
+typedef enum {
+    IPC_EVT_KIND_RECOGNIZED = 0,    /* 活体通过且识别为已注册人员 */
+    IPC_EVT_KIND_STRANGER = 1,      /* 活体通过，陌生人 */
+    IPC_EVT_KIND_LIVENESS_FAIL = 2, /* 启用活体且未通过（疑似翻拍/攻击），score 为 REAL 概率 */
+} ipc_evt_kind_t;
+
 typedef struct {
     uint32_t magic;
     int32_t face_id;
     float score;
     char name[IPC_NAME_MAX];
-    uint8_t is_stranger;
+    uint8_t is_stranger; /* 1=陌生人；与 evt_kind 一致时 STRANGER 为 1 */
+    uint8_t evt_kind;    /* ipc_evt_kind_t */
+    uint8_t _pad[2];
 } ipc_evt_t;
 
 typedef enum {

@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <opencv2/core.hpp>
+
 #include "ai_base.h"
 
 /**
@@ -45,8 +47,17 @@ public:
      */
     bool feed_image(const std::string &image_path);
 
+    /** 与 feed_image 相同预处理，输入为 BGR 图（如从视频帧 ROI 截取）。 */
+    bool feed_bgr_mat(const cv::Mat &bgr);
+
     /** try_run + try_get_output */
     bool forward();
+
+    /**
+     * forward() 且输出为 2 类后有效。约定与 fas_test 一致：out[0]=SPOOF、out[1]=REAL；
+     * 若两路之和接近 1 则视为概率，否则对 logits 做 softmax。
+     */
+    bool decode_liveness_scores(float *real_prob, float *spoof_prob) const;
 
     /** 打印缓存的输入/输出 shape（与 AIBase 构造时一致） */
     void print_cached_shapes(std::ostream &os = std::cout) const;

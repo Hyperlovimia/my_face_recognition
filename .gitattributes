@@ -1,0 +1,16 @@
+# 文本统一为 LF，避免 Windows/IDE 默认 CRLF 导致提交告警与 Linux/WSL/板端脚本异常
+* text=auto eol=lf
+
+# 二进制（勿做行尾转换）
+*.kmodel binary
+*.onnx binary
+*.elf binary
+*.a binary
+*.so binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
