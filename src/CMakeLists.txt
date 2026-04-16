@@ -1,4 +1,5 @@
 set(common_ai_src ai_utils.cc ai_base.cc face_detection.cc face_recognition.cc anchors_320.cc anchors_640.cc)
+set(scrfd_ai_src ai_utils.cc ai_base.cc face_detection_scrfd.cc face_recognition.cc)
 set(face_ai_src face_ai_main.cc ipc_shm.cc ipc_lwp_syscall.c ${common_ai_src} face_antispoof.cc)
 
 set(mpp_link -Wl,--start-group sys vicap vb isp vo connector sensor atomic gsdma -Wl,--end-group)
@@ -17,6 +18,10 @@ link_directories(${nncase_sdk_root}/riscv64/rvvlib/)
 add_executable(face_recognition.elf main.cc video_pipeline.cc ${common_ai_src})
 target_link_libraries(face_recognition.elf ${nncase_link} ${mpp_link} ${opencv_link})
 
+# 单进程 SCRFD 版本（使用 SCRFD 检测模型）
+add_executable(face_recognition_scrfd.elf main_scrfd.cc video_pipeline.cc ${scrfd_ai_src})
+target_link_libraries(face_recognition_scrfd.elf ${nncase_link} ${mpp_link} ${opencv_link})
+
 # 三进程：视频采集与显示
 add_executable(face_video.elf face_video_main.cc ipc_shm.cc ipc_lwp_syscall.c ipc_osd_draw.cc video_pipeline.cc)
 target_link_libraries(face_video.elf ${mpp_link} ${opencv_link})
@@ -29,4 +34,4 @@ target_link_libraries(face_ai.elf ${nncase_link} ${opencv_link})
 add_executable(face_event.elf face_event_main.cc ipc_shm.cc ipc_lwp_syscall.c)
 target_link_libraries(face_event.elf sys atomic)
 
-install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)
+install(TARGETS face_recognition.elf face_recognition_scrfd.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)

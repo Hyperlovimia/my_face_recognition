@@ -28,7 +28,7 @@
 #include <vector>
 #include "ai_utils.h"
 #include "ai_base.h"
-#include "face_detection.h"
+#include "face_detection_common.h"
 
 using std::vector;
 

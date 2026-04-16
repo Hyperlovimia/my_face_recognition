@@ -29,48 +29,11 @@
 #include <vector>
 #include "ai_utils.h"
 #include "ai_base.h"
+#include "face_detection_common.h"
 
 using std::vector;
 
-#define LOC_SIZE 4
-#define CONF_SIZE 2
-#define LAND_SIZE 10
 #define PI 3.1415926
-
-typedef struct Bbox
-{
-    float x; // 人脸检测框的左顶点x坐标
-    float y; // 人脸检测框的左顶点x坐标
-    float w;
-    float h;
-} Bbox;
-
-/**
- * @brief 人脸五官点
- */
-typedef struct SparseLandmarks
-{
-    float points[10]; // 人脸五官点,依次是图片的左眼（x,y）、右眼（x,y）,鼻子（x,y）,左嘴角（x,y）,右嘴角
-} SparseLandmarks;
-
-/**
- * @brief 用于NMS排序的roi对象
- */
-typedef struct NMSRoiObj
-{
-    int index;        // roi对象所在原列表的索引
-    float confidence; // roi对象的置信度
-} NMSRoiObj;
-
-/**
- * @brief 预测人脸roi信息
- */
-typedef struct FaceDetectionInfo
-{
-    Bbox bbox;                  // 人脸检测框
-    SparseLandmarks sparse_kps; // 人脸五官关键点
-    float score;                // 人脸检测框置信度
-} FaceDetectionInfo;
 
 /**
  * @brief 人脸检测
