@@ -61,8 +61,8 @@
     #define AI_FRAME_HEIGHT 360
     #define AI_FRAME_CHANNEL 3
     #define USE_OSD 1
-    #define OSD_WIDTH 960
-    #define OSD_HEIGHT 540
+    #define OSD_WIDTH 540
+    #define OSD_HEIGHT 960
     #define OSD_CHANNEL 4
 #else
     #error "Unsupported DISPLAY_MODE"

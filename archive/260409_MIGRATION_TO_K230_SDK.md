@@ -99,8 +99,13 @@ NT35516_MIPI_2LAN_540X960_30FPS
 
 - `DISPLAY_WIDTH = 960`
 - `DISPLAY_HEIGHT = 540`
-- `OSD_WIDTH = 960`
-- `OSD_HEIGHT = 540`
+- `OSD_WIDTH = 540`
+- `OSD_HEIGHT = 960`
+
+其中：
+
+- `DISPLAY_WIDTH / DISPLAY_HEIGHT` 表示 VICAP chn0 输出给 VO 的视频帧尺寸
+- `OSD_WIDTH / OSD_HEIGHT` 按 `test_demo/test_vi_vo` 保持竖屏 OSD 尺寸，用于匹配 NT35516 的显示方向
 
 ### 3.5 VO / OSD / VICAP API 迁移
 
@@ -113,6 +118,65 @@ NT35516_MIPI_2LAN_540X960_30FPS
 - `kd_mpi_vo_enable_layer -> kd_mpi_vo_enable_video_layer / kd_mpi_vo_osd_enable`
 - `kd_mpi_vo_insert_frame -> kd_mpi_vo_chn_insert_frame`
 - `GDMA_ROTATE_DEGREE_* -> K_ROTATION_*`
+
+同时需要注意：`K230_AI_Demo_Development_Process_Analysis/kmodel_related/kmodel_inference/test_demo/test_vi_vo`
+与当前 SDK 自带的 `src/reference/ai_poc/vi_vo` 并不是完全同一套配置。
+
+对当前这个项目，应优先以“板上实测能跑通”的 `test_demo/test_vi_vo` 为第一参考：
+
+- connector: `NT35516_MIPI_2LAN_540X960_30FPS`
+- sensor: `GC2093_MIPI_CSI2_1920X1080_30FPS_10BIT_LINEAR`
+- VICAP chn0 / VO layer: `PIXEL_FORMAT_YVU_PLANAR_420`
+- AI 通道: `PIXEL_FORMAT_BGR_888_PLANAR`
+- OSD: `PIXEL_FORMAT_ARGB_8888`
+
+而 `ai_poc/vi_vo` 是一个更通用的板级样例，里面大量逻辑依赖板型宏：
+
+- `CONFIG_BOARD_K230D_CANMV`
+- `CONFIG_BOARD_K230_CANMV_01STUDIO`
+- `STUDIO_HDMI`
+
+不同宏分支下会切换不同的：
+
+- connector
+- sensor
+- 分辨率
+- 显示格式
+
+因此它“在源码里存在一套可用配置”，不等于“对你当前这块板子就是正确参考”。
+
+### 3.5 当前与 `test_vi_vo` 的逐段差异清单
+
+已经收敛到基本一致的部分：
+
+- connector 初始化仍使用 `NT35516_MIPI_2LAN_540X960_30FPS`
+- VO video layer 仍使用 `PIXEL_FORMAT_YVU_PLANAR_420`
+- NT35516 旋转场景下，VO video layer 仍按 `540x960 + K_ROTATION_90`
+- VICAP chn0 仍使用 `PIXEL_FORMAT_YVU_PLANAR_420`
+- VICAP chn1 仍使用 `PIXEL_FORMAT_BGR_888_PLANAR`
+- OSD 仍使用 `K_VO_OSD3 + PIXEL_FORMAT_ARGB_8888`
+- OSD 插帧接口仍使用 `kd_mpi_vo_chn_insert_frame(osd_id + 3, ...)`
+- OSD 私有池的创建时序已经调回到 “VO/OSD 配置完成后再申请 pool/block”，更接近参考 demo
+- OSD block 的申请与 mmap 大小改为参考 demo 风格：`frame_bytes + 4096`
+
+为了兼容当前项目运行环境而保留的补丁：
+
+- `kd_mpi_connector_close()` 在当前 SDK 封装里返回值不可靠，因此仍然保持 connector fd 由 `PipeLine` 持有，直到 `Destroy()` 再 `close()`
+- 针对 `kd_mpi_sys_bind failed:0xa0058009`，仍然保留了 “先幂等 `unbind`，再 `bind`” 的兼容逻辑
+- 针对 `VB is already initialized by system/another app`，仍然保留了 `K_ERR_VB_BUSY` 兼容逻辑
+
+这部分兼容逻辑这次又进一步收敛了一步：
+
+- 不再只是“盲目复用已有 VB”
+- 而是在 `VB busy` 时调用 `kd_mpi_vb_get_config()`
+- 检查当前系统已有 common pool 是否真的能覆盖 `test_vi_vo` 这条显示链路所需的 `YUV` / `BGR` block size
+- 若覆盖不了，则直接打印当前 VB 配置并失败退出，避免继续进入“无报错但黑屏”的模糊状态
+
+当前仍然没有强行改成和 `test_vi_vo` 完全一致的一处差异：
+
+- 本项目 `chn1` 给 AI 的分辨率仍然保持为 `AI_FRAME_WIDTH x AI_FRAME_HEIGHT`，没有直接改回参考 demo 的 `1280x720`
+
+原因是这一通道已经被当前人脸识别主流程、IPC 以及 tensor 尺寸约束使用；它属于“AI 业务链路差异”，不是“VO 显示链路差异”。后续若要继续向参考 demo 收敛，应优先排查显示链路本身，而不是先改动 AI 输入尺寸。
 
 同时去掉了新 SDK 中不存在的旧接口和字段：
 

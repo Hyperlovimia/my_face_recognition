@@ -103,6 +103,8 @@ private:
     // Video Buffer（VB）相关
     // ============================
     k_vb_config config;   // VB 全局配置结构体（内存池数量、大小等）
+    k_u64 yuv_buffer_size_ = 0;   // chn0 实际使用的 VB block 大小
+    k_u64 ai_buffer_size_ = 0;    // chn1 实际使用的 VB block 大小
 
     // ============================
     // 屏幕 / Connector 相关
@@ -126,6 +128,8 @@ private:
     k_vb_blk_handle handle;        // 从 VB 池申请的内存块句柄
     k_video_frame_info osd_frame_info; // OSD 帧信息（描述物理地址、格式等）
     void *insert_osd_vaddr;        // OSD 内存块的虚拟地址（CPU 写入绘制结果）
+    k_u32 osd_frame_size_ = 0;     // OSD 有效像素数据大小
+    k_u32 osd_mmap_size_ = 0;      // OSD mmap/munmap 使用的映射大小
 
     // ============================
     // Sensor & VICAP 采集相关

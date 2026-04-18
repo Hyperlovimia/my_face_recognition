@@ -1,5 +1,59 @@
 #include "video_pipeline.h"
 
+namespace {
+
+constexpr k_u32 kOsdInsertChnOffset = 3;
+
+bool FindCompatibleVbPool(const k_vb_config &vb_config, k_u64 required_size, int *matched_index,
+                          k_u64 *matched_size, k_u32 *matched_count)
+{
+    int best_index = -1;
+    k_u64 best_size = 0;
+    k_u32 best_count = 0;
+
+    for (int i = 0; i < VB_MAX_COMM_POOLS; ++i) {
+        const k_vb_pool_config &pool = vb_config.comm_pool[i];
+        if (pool.blk_cnt == 0 || pool.blk_size < required_size) {
+            continue;
+        }
+        if (best_index < 0 || pool.blk_size < best_size) {
+            best_index = i;
+            best_size = pool.blk_size;
+            best_count = pool.blk_cnt;
+        }
+    }
+
+    if (best_index < 0) {
+        return false;
+    }
+
+    if (matched_index != nullptr) {
+        *matched_index = best_index;
+    }
+    if (matched_size != nullptr) {
+        *matched_size = best_size;
+    }
+    if (matched_count != nullptr) {
+        *matched_count = best_count;
+    }
+    return true;
+}
+
+void PrintVbConfigSummary(const k_vb_config &vb_config)
+{
+    printf("Current VB config summary:\n");
+    for (int i = 0; i < VB_MAX_COMM_POOLS; ++i) {
+        const k_vb_pool_config &pool = vb_config.comm_pool[i];
+        if (pool.blk_cnt == 0) {
+            continue;
+        }
+        printf("  comm_pool[%d]: blk_cnt=%u blk_size=%lu mode=%u\n",
+               i, pool.blk_cnt, (unsigned long)pool.blk_size, pool.mode);
+    }
+}
+
+}  // namespace
+
 PipeLine::PipeLine(int debug_mode)
 {
     //配置屏幕类型
@@ -50,24 +104,17 @@ PipeLine::~PipeLine()
 {
 }
 
-static k_u32 osd_vb_create_pool()
-{
-    k_u32 private_pool_id;
-    k_vb_pool_config pool_config;
-    memset(&pool_config, 0, sizeof(pool_config));
-    pool_config.blk_cnt = 3;
-    pool_config.blk_size = VICAP_ALIGN_UP((OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL), VICAP_ALIGN_1K);
-    pool_config.mode = VB_REMAP_MODE_NOCACHE;
-    private_pool_id = kd_mpi_vb_create_pool(&pool_config);
-
-    return private_pool_id;
-}
-
 int PipeLine::Create()
 {
     ScopedTiming st("PipeLine::Create", debug_mode_);
     k_s32 ret = 0;
     bool vb_preinitialized = false;
+    const k_u64 required_yuv_blk_size =
+        VICAP_ALIGN_UP((DISPLAY_WIDTH * DISPLAY_HEIGHT * 3 / 2), VICAP_ALIGN_1K);
+    const k_u64 required_ai_blk_size =
+        VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * AI_FRAME_CHANNEL), VICAP_ALIGN_1K);
+    const k_u32 vo_layer_width = DISPLAY_ROTATE ? DISPLAY_HEIGHT : DISPLAY_WIDTH;
+    const k_u32 vo_layer_height = DISPLAY_ROTATE ? DISPLAY_WIDTH : DISPLAY_HEIGHT;
 
     // =============================================================================================
     // 1. 配置 Video Buffer（VB）系统
@@ -76,12 +123,12 @@ int PipeLine::Create()
     config.max_pool_cnt = 64;  // 最多支持 64 个内存池
     config.comm_pool[0].blk_cnt = 5;
     config.comm_pool[0].mode = VB_REMAP_MODE_NOCACHE;
-    config.comm_pool[0].blk_size =
-        VICAP_ALIGN_UP((DISPLAY_WIDTH * DISPLAY_HEIGHT * 3 / 2), VICAP_ALIGN_1K);
+    config.comm_pool[0].blk_size = required_yuv_blk_size;
     config.comm_pool[1].blk_cnt = 5;
     config.comm_pool[1].mode = VB_REMAP_MODE_NOCACHE;
-    config.comm_pool[1].blk_size =
-        VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * AI_FRAME_CHANNEL), VICAP_ALIGN_1K);
+    config.comm_pool[1].blk_size = required_ai_blk_size;
+    yuv_buffer_size_ = required_yuv_blk_size;
+    ai_buffer_size_ = required_ai_blk_size;
 
     ret = kd_mpi_vicap_set_mclk(VICAP_MCLK0, VICAP_PLL0_CLK_DIV4, 16, 1);
     if (ret) {
@@ -93,6 +140,37 @@ int PipeLine::Create()
     ret = kd_mpi_vb_set_config(&config);
     if (ret == K_ERR_VB_BUSY) {
         printf("VB is already initialized by system/another app, reuse existing VB configuration.\n");
+        k_vb_config current_vb_config;
+        memset(&current_vb_config, 0, sizeof(current_vb_config));
+        ret = kd_mpi_vb_get_config(&current_vb_config);
+        if (ret) {
+            printf("kd_mpi_vb_get_config failed ret:%d\n", ret);
+            return ret;
+        }
+
+        int yuv_pool_index = -1;
+        int ai_pool_index = -1;
+        k_u32 yuv_pool_cnt = 0;
+        k_u32 ai_pool_cnt = 0;
+        if (!FindCompatibleVbPool(current_vb_config, required_yuv_blk_size, &yuv_pool_index,
+                                  &yuv_buffer_size_, &yuv_pool_cnt)) {
+            printf("Existing VB has no common pool large enough for VO YUV output. required=%lu\n",
+                   (unsigned long)required_yuv_blk_size);
+            PrintVbConfigSummary(current_vb_config);
+            return K_ERR_VB_BUSY;
+        }
+        if (!FindCompatibleVbPool(current_vb_config, required_ai_blk_size, &ai_pool_index,
+                                  &ai_buffer_size_, &ai_pool_cnt)) {
+            printf("Existing VB has no common pool large enough for AI output. required=%lu\n",
+                   (unsigned long)required_ai_blk_size);
+            PrintVbConfigSummary(current_vb_config);
+            return K_ERR_VB_BUSY;
+        }
+
+        printf("Reuse VB comm_pool[%d] for VO YUV: blk_size=%lu blk_cnt=%u\n",
+               yuv_pool_index, (unsigned long)yuv_buffer_size_, yuv_pool_cnt);
+        printf("Reuse VB comm_pool[%d] for AI BGR: blk_size=%lu blk_cnt=%u\n",
+               ai_pool_index, (unsigned long)ai_buffer_size_, ai_pool_cnt);
         vb_preinitialized = true;
         ret = K_SUCCESS;
     }
@@ -123,21 +201,7 @@ int PipeLine::Create()
     }
 
     // =============================================================================================
-    // 2. 创建 OSD 专用 VB 内存池（用于 ARGB8888 叠加图层）
-    // =============================================================================================
-    // 用于存放一帧 OSD 数据（如 AI 结果绘制）
-    if(USE_OSD == 1){
-        k_vb_pool_config pool_config;
-        memset(&pool_config, 0, sizeof(pool_config));
-        pool_config.blk_cnt = 3; // 3 个缓冲块，避免帧冲突
-        pool_config.blk_size = VICAP_ALIGN_UP((OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL), VICAP_ALIGN_1K);
-        pool_config.mode = VB_REMAP_MODE_NOCACHE; // 非 cache 映射，避免缓存一致性问题
-        osd_pool_id = kd_mpi_vb_create_pool(&pool_config);
-    }
-
-
-    // =============================================================================================
-    // 3. 屏幕（Connector）配置
+    // 2. 屏幕（Connector）配置
     // =============================================================================================
     k_connector_info connector_info;
     memset(&connector_info, 0, sizeof(k_connector_info));
@@ -179,17 +243,18 @@ int PipeLine::Create()
     connector_fd_ = connector_fd;
 
     // =============================================================================================
-    // 4. 配置 VO（视频输出层：用于显示摄像头画面）
+    // 3. 配置 VO（视频输出层：用于显示摄像头画面）
     // =============================================================================================
     kd_mpi_vo_disable_video_layer(vi_vo_id);  // 先关闭 layer，避免旧配置干扰
 
     memset(&vi_vo_attr, 0, sizeof(vi_vo_attr));
     vi_vo_attr.display_rect.x  = 0;
     vi_vo_attr.display_rect.y  = 0;
-    vi_vo_attr.img_size.width  = DISPLAY_WIDTH;
-    vi_vo_attr.img_size.height = DISPLAY_HEIGHT;
-    vi_vo_attr.pixel_format    = PIXEL_FORMAT_YUV_SEMIPLANAR_420; // NV12
-    vi_vo_attr.stride          = (DISPLAY_WIDTH / 8 - 1) + ((DISPLAY_HEIGHT - 1) << 16);
+    vi_vo_attr.img_size.width  = vo_layer_width;
+    vi_vo_attr.img_size.height = vo_layer_height;
+    // 你的板上已实测 test_demo/test_vi_vo 可以跑通，因此这里以它为第一参考。
+    vi_vo_attr.pixel_format    = PIXEL_FORMAT_YVU_PLANAR_420;
+    vi_vo_attr.stride          = (vo_layer_width / 8 - 1) + ((vo_layer_height - 1) << 16);
     vi_vo_attr.func            = DISPLAY_ROTATE ? K_ROTATION_90 : K_ROTATION_0;
 
     ret = kd_mpi_vo_set_video_layer_attr(vi_vo_id, &vi_vo_attr);
@@ -205,11 +270,11 @@ int PipeLine::Create()
     }
     vo_video_enabled_ = true;
 
-    printf("VICAP to VO: layer=%d configured for %ux%u NV12, rotate90=%d\n",
-           vi_vo_id, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_ROTATE ? 1 : 0);
+    printf("VICAP to VO: layer=%d configured for %ux%u YVU420P, rotate90=%d\n",
+           vi_vo_id, vo_layer_width, vo_layer_height, DISPLAY_ROTATE ? 1 : 0);
 
     // =============================================================================================
-    // 5. 配置 OSD 层（ARGB8888 叠加图层）
+    // 4. 配置 OSD 层（ARGB8888 叠加图层）
     // =============================================================================================
     if(USE_OSD == 1){
         kd_mpi_vo_osd_disable(osd_vo_id);
@@ -219,7 +284,7 @@ int PipeLine::Create()
         osd_vo_attr.display_rect.y  = 0;
         osd_vo_attr.img_size.width  = OSD_WIDTH;
         osd_vo_attr.img_size.height = OSD_HEIGHT;
-        osd_vo_attr.pixel_format    = PIXEL_FORMAT_BGRA_8888;
+        osd_vo_attr.pixel_format    = PIXEL_FORMAT_ARGB_8888;
         osd_vo_attr.stride          = OSD_WIDTH * 4 / 8;
         osd_vo_attr.global_alptha   = 0xFF;
 
@@ -236,14 +301,27 @@ int PipeLine::Create()
         }
         vo_osd_enabled_ = true;
 
-        printf("OSD to VO: layer=%d configured for %ux%u BGRA8888, rotate90=%d\n",
-               osd_vo_id, OSD_WIDTH, OSD_HEIGHT, DISPLAY_ROTATE ? 1 : 0);
+        printf("OSD to VO: layer=%d configured for %ux%u ARGB8888\n",
+               osd_vo_id, OSD_WIDTH, OSD_HEIGHT);
+
+        k_vb_pool_config pool_config;
+        memset(&pool_config, 0, sizeof(pool_config));
+        pool_config.blk_cnt = 4;
+        pool_config.blk_size =
+            VICAP_ALIGN_UP((OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL * 2), VICAP_ALIGN_1K);
+        pool_config.mode = VB_REMAP_MODE_NOCACHE;
+        osd_pool_id = kd_mpi_vb_create_pool(&pool_config);
+        if (osd_pool_id == VB_INVALID_POOLID) {
+            printf("kd_mpi_vb_create_pool for OSD failed.\n");
+            return -1;
+        }
 
         // --------------------- 从 OSD VB 池获取一块缓存，用于写入叠加数据 ---------------------
-        k_s32 size = VICAP_ALIGN_UP(OSD_HEIGHT * OSD_WIDTH * OSD_CHANNEL, VICAP_ALIGN_1K);
+        osd_frame_size_ = OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL;
+        osd_mmap_size_ = osd_frame_size_ + 4096;
 
         // 从指定内存池中申请一块缓存
-        handle = kd_mpi_vb_get_block(osd_pool_id, size, NULL);
+        handle = kd_mpi_vb_get_block(osd_pool_id, osd_mmap_size_, NULL);
         if (handle == VB_INVALID_HANDLE)
         {
             printf("%s get vb block error\n", __func__);
@@ -260,7 +338,7 @@ int PipeLine::Create()
         }
 
         // 映射为用户态虚拟地址（非 cache）
-        k_u32* virt_addr = (k_u32 *)kd_mpi_sys_mmap(phys_addr, size);
+        k_u32* virt_addr = (k_u32 *)kd_mpi_sys_mmap(phys_addr, osd_mmap_size_);
         if (virt_addr == NULL)
         {
             printf("%s mmap error\n", __func__);
@@ -271,8 +349,8 @@ int PipeLine::Create()
         memset(&osd_frame_info, 0, sizeof(osd_frame_info));
         osd_frame_info.v_frame.width        = OSD_WIDTH;
         osd_frame_info.v_frame.height       = OSD_HEIGHT;
-        osd_frame_info.v_frame.stride[0]    = OSD_WIDTH*4;
-        osd_frame_info.v_frame.pixel_format = PIXEL_FORMAT_BGRA_8888;
+        osd_frame_info.v_frame.stride[0]    = OSD_WIDTH;
+        osd_frame_info.v_frame.pixel_format = PIXEL_FORMAT_ARGB_8888;
         osd_frame_info.mod_id               = K_ID_VO;
         osd_frame_info.pool_id              = osd_pool_id;
         osd_frame_info.v_frame.phys_addr[0] = phys_addr;
@@ -284,7 +362,7 @@ int PipeLine::Create()
 
 
     // =============================================================================================
-    // 6. 传感器探测 & VICAP 设备配置
+    // 5. 传感器探测 & VICAP 设备配置
     // =============================================================================================
     k_vicap_sensor_info sensor_info;
     memset(&sensor_info, 0, sizeof(k_vicap_sensor_info));
@@ -316,10 +394,12 @@ int PipeLine::Create()
     }
 
     // =============================================================================================
-    // 7. VICAP 通道 0：输出到 VO 显示
+    // 6. VICAP 通道 0：输出到 VO 显示
     // =============================================================================================
     k_vicap_chn_attr chn0_attr;
     memset(&chn0_attr, 0, sizeof(k_vicap_chn_attr));
+    chn0_attr.out_win.h_start = 0;
+    chn0_attr.out_win.v_start = 0;
     chn0_attr.out_win.width  = DISPLAY_WIDTH;
     chn0_attr.out_win.height = DISPLAY_HEIGHT;
     chn0_attr.crop_win       = dev_attr.acq_win;
@@ -327,9 +407,9 @@ int PipeLine::Create()
     chn0_attr.crop_enable    = K_FALSE;
     chn0_attr.scale_enable   = K_FALSE;
     chn0_attr.chn_enable     = K_TRUE;
-    chn0_attr.pix_format     = PIXEL_FORMAT_YUV_SEMIPLANAR_420; // NV12
+    chn0_attr.pix_format     = PIXEL_FORMAT_YVU_PLANAR_420;
     chn0_attr.buffer_num     = VICAP_MAX_FRAME_COUNT;
-    chn0_attr.buffer_size    = VICAP_ALIGN_UP((DISPLAY_WIDTH * DISPLAY_HEIGHT * 3 / 2), VICAP_ALIGN_1K);
+    chn0_attr.buffer_size    = yuv_buffer_size_;
     chn0_attr.alignment      = 0;
     chn0_attr.fps            = 0;
 
@@ -347,18 +427,43 @@ int PipeLine::Create()
     vo_mpp_chn.mod_id    = K_ID_VO;
     vo_mpp_chn.dev_id    = vo_dev_id;
     vo_mpp_chn.chn_id    = K_VO_DISPLAY_CHN_ID1;
+
+    // 参考工程默认假设系统处于干净状态；实际反复运行时，若上次异常退出，
+    // 这里可能残留同一条 VI->VO 绑定。先做一次幂等解绑，避免 bind 命中 NOT_PERM。
+    ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
+    if (ret == K_SUCCESS) {
+        printf("Cleared stale VICAP->VO bind before rebinding.\n");
+    } else if (ret != K_ERR_SYS_UNEXIST) {
+        printf("kd_mpi_sys_unbind before bind returned:0x%x\n", ret);
+    }
+
     ret = kd_mpi_sys_bind(&vicap_mpp_chn, &vo_mpp_chn);
+    if (ret == K_ERR_SYS_NOT_PERM) {
+        // 某些固件版本在目标端已有绑定时返回 NOT_PERM，并打印 "dest have bind src"。
+        // 再执行一次解绑后重绑，兼容板端遗留状态。
+        printf("kd_mpi_sys_bind reported existing destination bind, retrying after unbind.\n");
+        ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
+        if (ret != K_SUCCESS && ret != K_ERR_SYS_UNEXIST) {
+            printf("kd_mpi_sys_unbind retry failed:0x%x\n", ret);
+            return ret;
+        }
+        ret = kd_mpi_sys_bind(&vicap_mpp_chn, &vo_mpp_chn);
+    }
+
     if (ret) {
         printf("kd_mpi_sys_bind failed:0x%x\n", ret);
+        return ret;
     } else {
         vicap_vo_bound_ = true;
     }
 
     // =============================================================================================
-    // 8. VICAP 通道 1：输出给 AI 使用（RGB Planar）
+    // 7. VICAP 通道 1：输出给 AI 使用（RGB Planar）
     // =============================================================================================
     k_vicap_chn_attr chn1_attr;
     memset(&chn1_attr, 0, sizeof(k_vicap_chn_attr));
+    chn1_attr.out_win.h_start = 0;
+    chn1_attr.out_win.v_start = 0;
     chn1_attr.out_win.width  = AI_FRAME_WIDTH;
     chn1_attr.out_win.height = AI_FRAME_HEIGHT;
     chn1_attr.crop_win       = dev_attr.acq_win;
@@ -366,10 +471,9 @@ int PipeLine::Create()
     chn1_attr.crop_enable    = K_FALSE;
     chn1_attr.scale_enable   = K_FALSE;
     chn1_attr.chn_enable     = K_TRUE;
-    // 与 test_vi_vo 保持一致：SDK 枚举名是 BGR_888_PLANAR，实际下游按 RGB CHW 使用。
     chn1_attr.pix_format     = PIXEL_FORMAT_BGR_888_PLANAR;
     chn1_attr.buffer_num     = VICAP_MAX_FRAME_COUNT;
-    chn1_attr.buffer_size    = VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * 3 ), VICAP_ALIGN_1K);
+    chn1_attr.buffer_size    = ai_buffer_size_;
     chn1_attr.alignment      = 0;
     chn1_attr.fps            = 0;
 
@@ -477,7 +581,7 @@ int PipeLine::InsertFrame(void* osd_data){
     memcpy(insert_osd_vaddr, osd_data, OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
 
     // 插入到 VO 的 OSD layer
-    if (kd_mpi_vo_chn_insert_frame(osd_vo_id + 3, &osd_frame_info) != K_SUCCESS) {
+    if (kd_mpi_vo_chn_insert_frame(osd_vo_id + kOsdInsertChnOffset, &osd_frame_info) != K_SUCCESS) {
         printf("ERROR: kd_mpi_vo_chn_insert_frame failed for OSD\n");
         return -1;
     } 
@@ -502,12 +606,14 @@ int PipeLine::Destroy()
         }
         if (insert_osd_vaddr != nullptr) {
             ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
-                                    OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
+                                    osd_mmap_size_);
             if (ret) {
                 printf("kd_mpi_sys_munmap failed.\n");
                 return ret;
             }
             insert_osd_vaddr = nullptr;
+            osd_mmap_size_ = 0;
+            osd_frame_size_ = 0;
         }
         if (osd_block_acquired_) {
             ret = kd_mpi_vb_release_block(handle);
