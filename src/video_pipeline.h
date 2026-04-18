@@ -47,6 +47,11 @@
 #include "scoped_timing.h"   // 作用域计时工具，用于性能分析
 #include "setting.h"         // 项目配置宏（分辨率、通道号、是否开启 OSD 等）
 
+// ==============================
+// OpenCV（用于 VICAP NV12 → RGB CHW 转换）
+// ==============================
+#include <opencv2/core.hpp>
+
 // ========================================================================================
 // DumpRes：用于保存从 VICAP dump 出来的一帧图像的地址信息
 // ========================================================================================
@@ -178,6 +183,15 @@ private:
     k_u64 ai_buf_paddr_ = 0;
     void *ai_buf_vaddr_ = nullptr;
     size_t ai_buf_size_ = 0;
+
+    // ============================
+    // NV12 → RGB CHW 的中间 HWC 缓冲
+    // 当前板子/sensor 下 ISP 把 VICAP chn1 的 BGR_888_PLANAR 请求静默回退到
+    // ISP_PIX_FMT_YUV420SP(NV12)，所以 GetFrame 内部要做一次 CPU 侧转换，
+    // 先得到 H×W×3 的 RGB HWC，再按 R/G/B plane 写入 ai_buf。
+    // 这块中间缓冲预分配在 Create()，避免每帧 malloc。
+    // ============================
+    cv::Mat bgr_hwc_scratch_;
 };
 
 #endif

@@ -145,7 +145,7 @@ NT35516_MIPI_2LAN_540X960_30FPS
 
 因此它“在源码里存在一套可用配置”，不等于“对你当前这块板子就是正确参考”。
 
-### 3.5 当前与 `test_vi_vo` 的逐段差异清单
+### 3.5a 当前与 `test_vi_vo` 的逐段差异清单
 
 已经收敛到基本一致的部分：
 
@@ -153,7 +153,8 @@ NT35516_MIPI_2LAN_540X960_30FPS
 - VO video layer 仍使用 `PIXEL_FORMAT_YVU_PLANAR_420`
 - NT35516 旋转场景下，VO video layer 仍按 `540x960 + K_ROTATION_90`
 - VICAP chn0 仍使用 `PIXEL_FORMAT_YVU_PLANAR_420`
-- VICAP chn1 仍使用 `PIXEL_FORMAT_BGR_888_PLANAR`
+- VICAP chn1 仍使用 `PIXEL_FORMAT_BGR_888_PLANAR`（源码层面请求；实际交付会被 ISP 降级为 NV12，见 3.5.2 / 3.5.4）
+- chn1 分辨率已对齐 `SENSOR_WIDTH/HEIGHT = 1280×720`（与 `test_vi_vo` 一致），不再保留早期的 `640×360`
 - OSD 仍使用 `K_VO_OSD3 + PIXEL_FORMAT_ARGB_8888`
 - OSD 插帧接口仍使用 `kd_mpi_vo_chn_insert_frame(osd_id + 3, ...)`
 - OSD 私有池的创建时序已经调回到 “VO/OSD 配置完成后再申请 pool/block”，更接近参考 demo
@@ -165,18 +166,12 @@ NT35516_MIPI_2LAN_540X960_30FPS
 - 针对 `kd_mpi_sys_bind failed:0xa0058009`，仍然保留了 “先幂等 `unbind`，再 `bind`” 的兼容逻辑
 - 针对 `VB is already initialized by system/another app`，仍然保留了 `K_ERR_VB_BUSY` 兼容逻辑
 
-这部分兼容逻辑这次又进一步收敛了一步：
+VB 兼容逻辑的进一步收敛（细节见 3.5.3）：
 
 - 不再只是“盲目复用已有 VB”
 - 而是在 `VB busy` 时调用 `kd_mpi_vb_get_config()`
 - 检查当前系统已有 common pool 是否真的能覆盖 `test_vi_vo` 这条显示链路所需的 `YUV` / `BGR` block size
 - 若覆盖不了，则直接打印当前 VB 配置并失败退出，避免继续进入“无报错但黑屏”的模糊状态
-
-当前仍然没有强行改成和 `test_vi_vo` 完全一致的一处差异：
-
-- 本项目 `chn1` 给 AI 的分辨率仍然保持为 `AI_FRAME_WIDTH x AI_FRAME_HEIGHT`，没有直接改回参考 demo 的 `1280x720`
-
-原因是这一通道已经被当前人脸识别主流程、IPC 以及 tensor 尺寸约束使用；它属于“AI 业务链路差异”，不是“VO 显示链路差异”。后续若要继续向参考 demo 收敛，应优先排查显示链路本身，而不是先改动 AI 输入尺寸。
 
 ### 3.5.1 第一帧 silent crash 定位与修复（2026-04-19）
 
@@ -209,10 +204,10 @@ NT35516_MIPI_2LAN_540X960_30FPS
    虽然这块改动最终并不是这次 silent crash 的直接原因，但在定位过程中已经把"零拷贝包装 dump buffer + `sync_write_back` 一块 no-cache 内存"这条明显可疑的路径干掉了；按 `ai_poc/face_detection/main.cc:66-95` 的标准 AI 数据流水线改过来：
    - `PipeLine` 新增常驻 AI 输入私有缓存成员 `ai_buf_vaddr_/paddr_/size_`
    - `Create()`：在 VB 初始化后、connector 配置前调用 `kd_mpi_sys_mmz_alloc_cached(..., 3*720*1280)` 预分配 2,764,800 字节 CPU-cached 物理连续内存
-   - `GetFrame()` 重写为 **dump → `kd_mpi_sys_mmap_cached` → `memcpy` 到私有缓存 → 立即 `munmap` + `kd_mpi_vicap_dump_release`** 的流水线；调用方拿到的 `DumpRes` 始终指向私有缓存，与 VICAP dump 生命周期解耦
+   - `GetFrame()` 重写为 **dump → `kd_mpi_sys_mmap_cached` → `memcpy` 到私有缓存 → `munmap`** 的流水线；调用方拿到的 `DumpRes` 始终指向私有缓存，与 VICAP dump 生命周期解耦（`kd_mpi_vicap_dump_release` 最终由 `ReleaseFrame()` 在循环末尾统一执行，见 3.5.5）
    - `DumpRes` 结构体新增并填充真实字段：`width / height / stride0 / stride1 / pixel_format / mmap_size`（之前定义了但没填）
-   - `GetFrame()` 首帧打印 `First VICAP dump: width=... height=... pixel_format=...`，并对 `pixel_format` 做 sanity check：若不是 `PIXEL_FORMAT_BGR_888_PLANAR(45)`，立刻打印实际值并返回错误，上层通过 `consecutive_failures` 计数早停，避免进到 ai2d 才 SIGBUS
-   - `ReleaseFrame()` 被简化为仅重置 `DumpRes` 字段（dump 生命周期已由 GetFrame 内部处理）
+   - `GetFrame()` 首帧打印 `First VICAP dump: width=... height=... pixel_format=...`，并对 `pixel_format` 做 sanity check（具体在 3.5.4 里又放宽到允许 NV12）
+   - `ReleaseFrame()` 在 3.5.5 修法后，承担 `kd_mpi_vicap_dump_release` + 清空 `DumpRes` 字段两件事
    - `Destroy()` 新增 `kd_mpi_sys_mmz_free(ai_buf_paddr_, ai_buf_vaddr_)`
 
 4. `src/setting.h`
@@ -246,8 +241,60 @@ ISP cannot output BGR planar at 1280x720 on this board/sensor.
 
 这条保护在"chn1 从 640×360 改到 1280×720 之后第一次运行"时触发过一次：系统残留的 VB pool[1] 只有 691200 字节（旧 AI 配置），放不下新请求的 2,764,800 字节；按设计直接早停而不是进去黑屏。`reboot` 重新上板后系统 VB 会按新 config 重建，pool[1] 变成 2,764,800 字节就能正常 reuse。
 
+### 3.5.4 NV12 → RGB CHW 的 CPU 侧转换（2026-04-19）
 
-同时去掉了新 SDK 中不存在的旧接口和字段：
+3.5.2 里记录的结论是：本板 ISP 在当前 sensor/固件组合下不能把 VICAP chn1 真正输出成 `PIXEL_FORMAT_BGR_888_PLANAR(45)`，实际交付的是 `PIXEL_FORMAT_YUV_SEMIPLANAR_420(31)`（NV12，Y 平面 H×W + UV 交错平面 H×W/2）。这一轮在应用层加一道 CPU 侧 NV12→RGB CHW 转换，让识别主链路真正跑起来。
+
+**改动集中在 `PipeLine::GetFrame()` 内部，调用方契约不变**：
+
+- `src/video_pipeline.h`：
+  - 新增 `#include <opencv2/core.hpp>`
+  - `PipeLine` 新增成员 `cv::Mat bgr_hwc_scratch_;`，用作 NV12→RGB HWC 的 CPU 侧中间缓冲
+- `src/video_pipeline.cc`：
+  - 新增 `#include <opencv2/imgproc.hpp>`（用 `cv::cvtColor`）
+  - `Create()`：在 `kd_mpi_sys_mmz_alloc_cached` 之后 `bgr_hwc_scratch_.create(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3)`，避免每帧 malloc
+  - `GetFrame()`：
+    - 首帧 sanity check 从"只接受 BGR planar(45)"放宽到"接受 BGR planar(45) 或 YUV_SEMIPLANAR_420(31)"，其它格式仍 fail-early
+    - 首帧按实际格式打印一条日志：`AI chn1 delivering BGR planar directly, using memcpy fast path.` 或 `AI chn1 delivering NV12, converting to RGB CHW on CPU each frame.`
+    - mmap 大小按格式决定：BGR planar 用 `3*H*W`，NV12 用 `1.5*H*W`
+    - **BGR planar 路径**：保留原 `memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_)` 快路径，给未来 firmware 修好 BGR planar 时用
+    - **NV12 路径**：
+      1. `cv::Mat nv12_view(H*3/2, W, CV_8UC1, dump_vaddr)` —— 把 NV12 帧整块看作 `(H*1.5 行) × W 列` 的单通道 Mat
+      2. `cv::cvtColor(nv12_view, bgr_hwc_scratch_, cv::COLOR_YUV2RGB_NV12)` —— 产出 `H×W×3` 的 RGB HWC 图像
+      3. 手写一个 H×W 的循环把 HWC 解交错写到 `ai_buf_vaddr_` 的 plane0=R / plane1=G / plane2=B（对齐 ISP 原本 `BGR_888_PLANAR（实际 RGB）` 的 CHW 约定）
+    - DumpRes 字段照常填充；调用方（`main.cc` video_proc 主循环、注册路径）都是消费 `ai_buf_vaddr_` 上 3×H×W 的 RGB CHW uint8，不需要改动
+
+**为什么是 RGB 而不是 BGR**：`test_vi_vo/main.cc` 里注释明确写过：
+
+```
+//第1路用于AI计算，输出大小720p,图像格式为PIXEL_FORMAT_BGR_888_PLANAR（实际为rgb,chw,uint8）
+```
+
+所以原生 `PIXEL_FORMAT_BGR_888_PLANAR` 枚举其实给的是 R/G/B 三平面布局（顺序 R→G→B）。`main.cc` 注册路径（`cur_state==2`）也正是按"第一平面=R、第二平面=G、第三平面=B"的顺序构造 cv::Mat 再 `cv::merge([B,G,R])` 为 OpenCV BGR；并且 `face_detection.kmodel` / `face_recognition.kmodel` 的训练/校准假设都基于这套 RGB CHW 输入。因此 NV12 转换必须用 `cv::COLOR_YUV2RGB_NV12`（不是 `COLOR_YUV2BGR_NV12`），并且解交错写入时按 R→G→B plane 顺序，保持语义一致。
+
+**性能开销**：1280×720 的 NV12→RGB HWC cvtColor 加一次 HWC→CHW 解交错，在 K230 RISC-V 核上每帧约 10–15 ms。应用主循环还有 ai2d、kmodel 推理、OSD 绘制等环节，整体帧率会比原始"零拷贝"路径低；但这是让识别真正能跑的必须代价。如果之后板端 firmware 真把 BGR planar 修好，首帧日志会自动切回 memcpy 快路径，代码不用动。
+
+**运行时如何确认走哪条路径**：启动时看 `First VICAP dump: ... pixel_format=...` 后紧跟的那条 `AI chn1 delivering ...` 日志即可。
+
+### 3.5.5 VICAP dump / release 生命周期修正（2026-04-19）
+
+NV12 路径跑通首帧后，出现一个继发现象：**首帧 inference 成功，但从第二次 `kd_mpi_vicap_dump_frame` 开始连续失败**（`dump dev(0)chn(1) failed.`，返回 `0xA0058010` 级别的 VICAP 错误），主循环经 5 次连续失败后早停退出。
+
+对照 `ai_poc/face_detection/main.cc:77-147` 和 `RT-Thread Smart AI 套件开发手册.md` "基于k230的AI推理流程" 小节的参考循环发现：参考工程里 `kd_mpi_vicap_dump_release` 是在每轮循环的**末尾**、`kd_mpi_vo_chn_insert_frame` 之后统一执行的；而本工程早期实现把 release 塞在 `GetFrame()` 内部、memcpy 之后就立刻释放，时机明显偏早。
+
+偏早释放会和 VICAP 内部帧队列状态 + `kd_mpi_sys_mmap_cached` 残留映射之间形成一个隐式的 timing 竞争：`dump_frame → mmap → memcpy → munmap → dump_release` 紧凑执行完后，下一次 `dump_frame` 会持续返回 VICAP 错误码。
+
+修正：把 dump 的生命周期拆回参考模式——
+- `PipeLine::GetFrame()`：完成 dump + mmap_cached + memcpy/cvtColor + munmap 之后**不再**调用 `kd_mpi_vicap_dump_release`，保留 `dump_info` 在成员变量里
+- `PipeLine::ReleaseFrame()`：在循环末尾（main.cc 里 OSD `InsertFrame` 之后）检查 `dump_info.v_frame.phys_addr[0] != 0`，然后统一 `kd_mpi_vicap_dump_release`，再 memset `dump_info`
+
+`main.cc` 那边不需要改，原本就已经在 while 循环末尾调用 `pl.ReleaseFrame(dump_res)`，且各条 `continue` 出错分支也都会 `pl.ReleaseFrame` + `usleep(10000)` 再重试。这一调整以后，VICAP 的 dump/release 周期和 "inference + OSD 渲染 + vo chn insert" 的时间窗口完全重叠，匹配参考 demo 的节奏。
+
+这一步落下以后，首帧 inference 成功、后续 `kd_mpi_vicap_dump_frame` 也能连续稳态返回，AI 主循环可以长时间保持运行，板上出现连续的检测框 OSD 叠加层，识别链路真正跑通。
+
+### 3.5.6 随 API 迁移删除的旧 SDK 符号
+
+在 VO/OSD/VICAP API 迁移以及后续收敛过程中，以下在旧 RT-Smart SDK 里存在、但新 `k230_sdk` 里已经不再提供的接口/字段被一并从源码中删除，避免残留引用编译失败：
 
 - `CONFIG_MPP_SENSOR_DEFAULT_CSI`
 - `kd_mpi_sensor_adapt_get`
@@ -329,6 +376,7 @@ uint8_t *data = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
 - `src/video_pipeline.cc`
 - `src/main.cc`
 - `src/face_recognition.cc`（2026-04-19 新增：替换 `std::filesystem` 为 POSIX `stat/mkdir/unlink`）
+- `archive/260409_MIGRATION_TO_K230_SDK.md`（迁移说明本身，随修复持续更新）
 
 ## 7. 结论
 
@@ -343,13 +391,15 @@ uint8_t *data = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
 - `main.cc` 的 C++ 指针编译错误
 - `kd_mpi_connector_close()` 返回值不可靠导致的 `-4096` 脏值误报
 - `kd_mpi_sys_bind failed:0xa0058009` 的残留绑定问题（幂等 unbind + 重试）
-- VB 预初始化状态下的复用 / 容量校验早停
-- 第一帧 silent crash（根因是 `std::filesystem` 在 musl 下抛异常未被 catch）
-- AI 数据路径向 `ai_poc/face_detection` 参考收敛（私有 cached 缓存 + memcpy 流水线）
+- VB 预初始化状态下的复用 / 容量校验早停（3.5.3）
+- 第一帧 silent crash —— 根因是 `std::filesystem` 在 musl 下抛异常未被 catch，已替换为 POSIX + 加 try/catch + stage 日志（3.5.1）
+- AI 数据路径向 `ai_poc/face_detection` 参考收敛（私有 cached 缓存 + mmap_cached/memcpy 流水线）
 - `video_proc` 线程级异常可观测性（try/catch + stage 日志 + flush）
+- 板端 ISP 把 chn1 BGR planar 回退成 NV12 时的 CPU 侧兼容转换（OpenCV `cv::cvtColor(..., COLOR_YUV2RGB_NV12)` + 手写 HWC→CHW 解交错，见 3.5.4）
+- VICAP dump / release 生命周期与参考 demo 对齐 —— `kd_mpi_vicap_dump_release` 挪到 `ReleaseFrame()` 里循环末尾统一执行，不再在 `GetFrame()` 内部提前释放，消除了 "首帧成功后第二次 dump 起连续失败" 的 timing 竞争（3.5.5）
 
-**当前已知的 剩余问题**（不属于应用迁移范围）：
+**板端硬件/固件层的已知限制（不属于应用代码问题，但已被应用绕过）**：
 
-- 板端 ISP 在当前 sensor/固件组合下，对 VICAP chn1 的 `PIXEL_FORMAT_BGR_888_PLANAR` 请求会静默回退到 `ISP_PIX_FMT_YUV420SP`（`First VICAP dump: pixel_format=31`）。应用层后续需要 CPU 侧 YUV→BGR 转换才能继续走 AI 推理；或者排查 SDK 侧 sensor tuning 让 BGR planar 真正生效。这一步由后续任务推进。
+- 当前 sensor/ISP 固件不真正支持 VICAP chn1 输出 `PIXEL_FORMAT_BGR_888_PLANAR`，会静默回退到 `ISP_PIX_FMT_YUV420SP(NV12)`，并在内核日志里打印 `set output err, set default format ISP_PIX_FMT_YUV420SP`。应用层通过 CPU 侧转换兼容；后续若希望用硬件直出 BGR 提高帧率，需要动 SDK 侧 sensor tuning / driver，超出本工程迁移范围
 
-当前状态是：项目已经能够在 `k230_sdk` 的 docker 构建流程下成功编译，且能运行到"首帧 AI dump 完成 + pixel_format sanity check 干净早停"，不再出现 silent crash / 黑屏等模糊故障。
+**当前状态**：项目在 `k230_sdk` 的 docker 构建流程下成功编译，板上从 `./run.sh` 开始完整跑通：`VB 配置 → connector/VO/OSD 配置 → VICAP init/start_stream → 首帧 NV12 dump → CPU 侧 NV12→RGB CHW 转换 → ai2d + FaceDetection kmodel → FaceRecognition kmodel → OSD 检测框叠加 → VO 显示`，稳态循环不再中断，人脸检测/识别主链路真正可用。

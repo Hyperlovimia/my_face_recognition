@@ -1,5 +1,7 @@
 #include "video_pipeline.h"
 
+#include <opencv2/imgproc.hpp>
+
 namespace {
 
 constexpr k_u32 kOsdInsertChnOffset = 3;
@@ -218,6 +220,14 @@ int PipeLine::Create()
     }
     printf("AI input private buffer: paddr=%lx vaddr=%p size=%zu\n",
            (unsigned long)ai_buf_paddr_, ai_buf_vaddr_, ai_buf_size_);
+
+    // NV12 → RGB HWC 中间缓冲。实际 VICAP chn1 交付 NV12 时，GetFrame 会在 CPU 侧
+    // 先 cvtColor 到这块 H×W×3 的 HWC 图像，再按 R/G/B plane 写入 ai_buf。
+    bgr_hwc_scratch_.create(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
+    if (bgr_hwc_scratch_.empty()) {
+        printf("bgr_hwc_scratch_ create failed\n");
+        return -1;
+    }
 
     // =============================================================================================
     // 2. 屏幕（Connector）配置
@@ -552,30 +562,49 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         return -1;
     }
 
+    const k_u32 pix_format = dump_info.v_frame.pixel_format;
+    const k_u32 f_width = dump_info.v_frame.width;
+    const k_u32 f_height = dump_info.v_frame.height;
+    const k_u32 f_stride0 = dump_info.v_frame.stride[0];
+    const k_u32 f_stride1 = dump_info.v_frame.stride[1];
+
     if (!dump_frame_info_logged_) {
         printf("First VICAP dump: width=%u height=%u pixel_format=%d stride0=%u stride1=%u phys0=%lx phys1=%lx\n",
-               dump_info.v_frame.width, dump_info.v_frame.height, dump_info.v_frame.pixel_format,
-               dump_info.v_frame.stride[0], dump_info.v_frame.stride[1],
+               f_width, f_height, pix_format, f_stride0, f_stride1,
                (unsigned long)dump_info.v_frame.phys_addr[0],
                (unsigned long)dump_info.v_frame.phys_addr[1]);
         dump_frame_info_logged_ = true;
 
-        // 首帧做一次格式 sanity check：若 ISP 真把 BGR planar 回退成 YUV420SP，
-        // 提前退出而不是让下游 ai2d 越界读 DMA 导致 silent crash。
-        if (dump_info.v_frame.pixel_format != PIXEL_FORMAT_BGR_888_PLANAR) {
-            printf("ERROR: expected PIXEL_FORMAT_BGR_888_PLANAR(%d) on AI channel, got %d\n",
-                   (int)PIXEL_FORMAT_BGR_888_PLANAR, dump_info.v_frame.pixel_format);
-            printf("ISP cannot output BGR planar at %ux%u on this board/sensor. "
-                   "Check firmware or adjust AI_FRAME_* in setting.h.\n",
-                   (unsigned)AI_FRAME_WIDTH, (unsigned)AI_FRAME_HEIGHT);
+        // 首帧格式 sanity check：目前仅接受两种 chn1 输出 —— BGR planar（参考 demo 理想路径），
+        // 或 NV12/YUV420SP（当前板子实际交付的格式，会在 CPU 侧做一次转换）。
+        if (pix_format != PIXEL_FORMAT_BGR_888_PLANAR &&
+            pix_format != PIXEL_FORMAT_YUV_SEMIPLANAR_420) {
+            printf("ERROR: unsupported AI channel pixel_format=%d (expected BGR_888_PLANAR=%d or YUV_SEMIPLANAR_420=%d)\n",
+                   pix_format,
+                   (int)PIXEL_FORMAT_BGR_888_PLANAR,
+                   (int)PIXEL_FORMAT_YUV_SEMIPLANAR_420);
             kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
             memset(&dump_info, 0, sizeof(k_video_frame_info));
             return -1;
         }
+        if (pix_format == PIXEL_FORMAT_BGR_888_PLANAR) {
+            printf("AI chn1 delivering BGR planar directly, using memcpy fast path.\n");
+        } else {
+            printf("AI chn1 delivering NV12, converting to RGB CHW on CPU each frame.\n");
+        }
+    }
+
+    // 不同格式对应不同的 dump 帧内存大小
+    size_t dump_bytes = 0;
+    if (pix_format == PIXEL_FORMAT_BGR_888_PLANAR) {
+        dump_bytes = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+    } else {
+        // NV12: Y 平面 H*W + UV 交错平面 H*W/2
+        dump_bytes = (size_t)AI_FRAME_HEIGHT * AI_FRAME_WIDTH * 3 / 2;
     }
 
     // 把 dump 帧映射成 CPU-cached 虚拟地址（参考 ai_poc/face_detection/main.cc:93）
-    void *dump_vaddr = kd_mpi_sys_mmap_cached(dump_info.v_frame.phys_addr[0], (k_u32)ai_buf_size_);
+    void *dump_vaddr = kd_mpi_sys_mmap_cached(dump_info.v_frame.phys_addr[0], (k_u32)dump_bytes);
     if (dump_vaddr == nullptr) {
         printf("kd_mpi_sys_mmap_cached failed for dumped frame.\n");
         kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
@@ -583,31 +612,52 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         return -1;
     }
 
-    // 拷贝到常驻私有缓存（断开与 VICAP dump buffer 的生命周期耦合）
-    memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_);
-    kd_mpi_sys_munmap(dump_vaddr, (k_u32)ai_buf_size_);
+    if (pix_format == PIXEL_FORMAT_BGR_888_PLANAR) {
+        // ISP 直出 BGR planar（实际为 RGB CHW 布局）—— 直接搬运到私有缓存
+        memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_);
+    } else {
+        // NV12 → RGB HWC（cv::cvtColor） → R/G/B plane 解交错写入 ai_buf
+        //
+        // 1. 把 NV12 帧当作 (H*3/2) 行 × W 列的单通道 Mat
+        // 2. cv::COLOR_YUV2RGB_NV12 产出 H×W×3 的 RGB HWC
+        // 3. 手动把 HWC 拆成 R/G/B plane 写入 ai_buf（CHW 布局，uint8）
+        //
+        // ai_buf 的 plane 次序按 ISP "BGR_888_PLANAR（实际RGB）" 约定：
+        //   plane0 = R，plane1 = G，plane2 = B
+        // main.cc 的注册路径和 AI tensor shape {3, H, W} 都基于这个约定。
+        cv::Mat nv12_view(AI_FRAME_HEIGHT * 3 / 2, AI_FRAME_WIDTH, CV_8UC1, dump_vaddr);
+        cv::cvtColor(nv12_view, bgr_hwc_scratch_, cv::COLOR_YUV2RGB_NV12);
 
-    // 保存 dump_info 字段用于 DumpRes，随后立刻 release dump
-    k_u32 f_width = dump_info.v_frame.width;
-    k_u32 f_height = dump_info.v_frame.height;
-    k_u32 f_stride0 = dump_info.v_frame.stride[0];
-    k_u32 f_stride1 = dump_info.v_frame.stride[1];
-    k_u32 f_pix_format = dump_info.v_frame.pixel_format;
-
-    ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
-    if (ret) {
-        printf("kd_mpi_vicap_dump_release failed: ret=%d\n", ret);
+        uint8_t *const ai_data = static_cast<uint8_t *>(ai_buf_vaddr_);
+        uint8_t *const dst_r = ai_data + 0 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+        uint8_t *const dst_g = ai_data + 1 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+        uint8_t *const dst_b = ai_data + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+        const uint8_t *src = bgr_hwc_scratch_.data;
+        const int total_pixels = AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+        for (int i = 0; i < total_pixels; ++i) {
+            dst_r[i] = src[i * 3 + 0];
+            dst_g[i] = src[i * 3 + 1];
+            dst_b[i] = src[i * 3 + 2];
+        }
     }
-    memset(&dump_info, 0, sizeof(k_video_frame_info));
 
-    // DumpRes 指向私有缓存；下游 host_runtime_tensor 直接消费这块地址
+    kd_mpi_sys_munmap(dump_vaddr, (k_u32)dump_bytes);
+
+    // 注意：dump_release 现在挪到 ReleaseFrame 里调用，整体生命周期对齐
+    // ai_poc/face_detection/main.cc:77-147 —— dump → mmap+memcpy → munmap
+    // → [AI 推理] → [OSD insert] → dump_release 是在循环末尾统一执行。
+    // 如果这里过早 release，VICAP 内部的帧队列状态和 mmap_cached 的残留
+    // 映射之间会出现 timing 竞争，下一次 dump_frame 会连续失败。
+
+    // DumpRes 指向私有缓存；下游 host_runtime_tensor 直接消费这块地址，
+    // 无论 chn1 实际交付的是 BGR planar 还是 NV12，调用方看到的永远是 RGB CHW。
     dump_res.virt_addr = reinterpret_cast<uintptr_t>(ai_buf_vaddr_);
     dump_res.phy_addr = (uintptr_t)ai_buf_paddr_;
     dump_res.width = f_width;
     dump_res.height = f_height;
     dump_res.stride0 = f_stride0;
     dump_res.stride1 = f_stride1;
-    dump_res.pixel_format = f_pix_format;
+    dump_res.pixel_format = pix_format;
     dump_res.mmap_size = ai_buf_size_;
 
     return 0;
@@ -615,7 +665,19 @@ int PipeLine::GetFrame(DumpRes &dump_res){
 
 int PipeLine::ReleaseFrame(DumpRes &dump_res){
     ScopedTiming st("PipeLine::ReleaseFrame", debug_mode_);
-    // dump 的生命周期已由 GetFrame 内部处理；这里只重置 DumpRes 语义。
+    int ret = 0;
+
+    // 对齐 ai_poc/face_detection 的循环末尾 release 模式：
+    // 只要 GetFrame 成功 dump 过，dump_info 里就有一帧待释放。
+    if (dump_info.v_frame.phys_addr[0] != 0) {
+        ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+        if (ret) {
+            printf("kd_mpi_vicap_dump_release failed: ret=0x%x\n", ret);
+        }
+        memset(&dump_info, 0, sizeof(k_video_frame_info));
+    }
+
+    // 清空 DumpRes 语义字段
     dump_res.virt_addr = 0;
     dump_res.phy_addr = 0;
     dump_res.width = 0;
@@ -624,7 +686,7 @@ int PipeLine::ReleaseFrame(DumpRes &dump_res){
     dump_res.stride1 = 0;
     dump_res.pixel_format = 0;
     dump_res.mmap_size = 0;
-    return 0;
+    return ret;
 }
 
 int PipeLine::InsertFrame(void* osd_data){
