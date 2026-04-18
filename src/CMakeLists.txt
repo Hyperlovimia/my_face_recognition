@@ -1,5 +1,5 @@
 set(common_ai_src ai_utils.cc ai_base.cc face_detection.cc face_recognition.cc anchors_320.cc anchors_640.cc)
-set(scrfd_ai_src ai_utils.cc ai_base.cc face_detection_scrfd.cc face_recognition.cc)
+set(common_ai_src_scrfd ai_utils.cc ai_base.cc face_detection_scrfd.cc face_recognition.cc)
 set(face_ai_src face_ai_main.cc ipc_shm.cc ipc_lwp_syscall.c ${common_ai_src} face_antispoof.cc)
 
 set(mpp_link -Wl,--start-group sys vicap vb isp vo connector sensor atomic gsdma -Wl,--end-group)
@@ -14,12 +14,12 @@ include_directories(${k230_mpp_root}/include/comm)
 include_directories(${k230_mpp_root}/userapps/sample/sample_vo)
 link_directories(${nncase_sdk_root}/riscv64/rvvlib/)
 
-# 单进程原版（保留）
+# 单进程原版（RetinaFace检测）
 add_executable(face_recognition.elf main.cc video_pipeline.cc ${common_ai_src})
 target_link_libraries(face_recognition.elf ${nncase_link} ${mpp_link} ${opencv_link})
 
-# 单进程 SCRFD 版本（使用 SCRFD 检测模型）
-add_executable(face_recognition_scrfd.elf main_scrfd.cc video_pipeline.cc ${scrfd_ai_src})
+# 单进程 SCRFD 版（SCRFD检测）
+add_executable(face_recognition_scrfd.elf main_scrfd.cc video_pipeline.cc ${common_ai_src_scrfd})
 target_link_libraries(face_recognition_scrfd.elf ${nncase_link} ${mpp_link} ${opencv_link})
 
 # 三进程：视频采集与显示

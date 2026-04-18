@@ -1,37 +1,26 @@
-/* Copyright (c) 2023, Canaan Bright Sight Co., Ltd
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- * 1. Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- * notice, this list of conditions and the following disclaimer in the
- * documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
- * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
- * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+#include <chrono>
 #include <iostream>
 #include <thread>
 #include "video_pipeline.h"
 #include "ai_utils.h"
+#include "face_detection.h"
 #include "face_detection_scrfd.h"
 #include "face_recognition.h"
 
 using std::cerr;
 using std::cout;
 using std::endl;
+
+static constexpr int k_register_preview_hold_ms = 2000;
+
+static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_bgra)
+{
+    if (preview_bgra.empty())
+        return;
+
+    cv::Rect roi(0, 0, preview_bgra.cols, preview_bgra.rows);
+    preview_bgra.copyTo(draw_frame(roi));
+}
 
 std::atomic<bool> isp_stop(false);
 static std::string register_name;
@@ -41,7 +30,7 @@ void print_usage(const char *name)
 {
     cout << "Usage: " << name << " <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> <debug_mode>" << endl
          << "Options:" << endl
-         << "  kmodel_det               人脸检测kmodel路径 (SCRFD模型)\n"
+         << "  kmodel_det               人脸检测kmodel路径 (SCRFD)\n"
          << "  det_thres                人脸检测阈值\n"
          << "  nms_thres                人脸检测nms阈值\n"
          << "  kmodel_recg              人脸识别kmodel路径\n"
@@ -71,7 +60,7 @@ void print_help() {
 void video_proc(char *argv[])
 {
     int debug_mode = atoi(argv[7]);
-    FrameCHWSize image_size={AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH};
+    FrameCHWSize image_size={AI_FRAME_CHANNEL,AI_FRAME_HEIGHT, AI_FRAME_WIDTH};
     cv::Mat draw_frame(OSD_HEIGHT, OSD_WIDTH, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     runtime_tensor input_tensor;
     dims_t in_shape { 1, AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH };
@@ -83,22 +72,23 @@ void video_proc(char *argv[])
         isp_stop = true;
         return;
     }
-    
     DumpRes dump_res;
     FaceDetectionSCRFD face_det(argv[1], atof(argv[2]), atof(argv[3]), image_size, debug_mode);
     
-    char* db_dir = argv[6];
+    char* db_dir=argv[6];
     FaceRecognition face_recg(argv[4], atoi(argv[5]), image_size, debug_mode);
     face_recg.database_init(db_dir);
 
-    vector<FaceDetectionInfo> det_results;
+    vector<FaceDetectionSCRFDInfo> det_results;
     vector<FaceRecognitionInfo> rec_results;
 
-    int display_state = 0;
+    int display_state=0;
     std::vector<cv::Mat> sensor_bgr(3);
-    cv::Mat dump_img(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
+    cv::Mat dump_img(AI_FRAME_HEIGHT, AI_FRAME_WIDTH , CV_8UC3);
+    cv::Mat register_preview_bgra;
+    auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
-    while(!isp_stop) {
+    while(!isp_stop){
         ScopedTiming st("total time", debug_mode);
         ret = pl.GetFrame(dump_res);
         if (ret != 0) {
@@ -106,20 +96,24 @@ void video_proc(char *argv[])
             isp_stop = true;
             break;
         }
-        input_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, { (gsl::byte *)dump_res.virt_addr, compute_size(in_shape) }, false, hrt::pool_shared, dump_res.phy_addr).expect("cannot create input tensor");
+        input_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, { (gsl::byte *)dump_res.virt_addr, compute_size(in_shape) },false, hrt::pool_shared, dump_res.phy_addr).expect("cannot create input tensor");
         hrt::sync(input_tensor, sync_op_t::sync_write_back, true).expect("sync write_back failed");
         
         det_results.clear();
         rec_results.clear();
 
-        if(cur_state == -1) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool preview_active = !register_preview_bgra.empty() && now < register_preview_deadline;
+
+        if(cur_state==-1){
         }
-        else if(cur_state == 0) {
+        else if(cur_state==0){
             face_det.pre_process(input_tensor);
             face_det.inference();
             face_det.post_process(image_size, det_results);
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
-            for (size_t i = 0; i < det_results.size(); ++i) {
+            for (int i = 0; i < det_results.size(); ++i)
+            {
                 face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points);
                 face_recg.inference();
                 FaceRecognitionInfo recg_result;
@@ -127,17 +121,17 @@ void video_proc(char *argv[])
                 rec_results.push_back(recg_result);
             }
         }
-        else if (cur_state == 1) {
+        else if (cur_state==1){
             int reg_num = face_recg.database_count(db_dir);
-            std::cout << "当前注册人数：" + std::to_string(reg_num) + "人。" << std::endl;
-            cur_state = 0;
-            display_state = 0;
+            std::cout<<"当前注册人数：" + std::to_string(reg_num) + "人。"<<std::endl;
+            cur_state=0;
+            display_state=0;
         }
-        else if (cur_state == 2) {
+        else if (cur_state==2){
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
             dump_img.setTo(cv::Scalar(0, 0, 0));
             sensor_bgr.clear();
-            void* data = reinterpret_cast<void*>(dump_res.virt_addr);
+            void* data=reinterpret_cast<void*>(dump_res.virt_addr);
             cv::Mat ori_img_R(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data);
             cv::Mat ori_img_G(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data + AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
             cv::Mat ori_img_B(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, data + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
@@ -150,53 +144,66 @@ void video_proc(char *argv[])
             sensor_bgr.push_back(ori_img_R);
             cv::merge(sensor_bgr, dump_img);
 
-            cur_state = 0;
-            display_state = 2;
+            cur_state=0;
+            display_state=2;
         }
-        else if (cur_state == 3) {
-            FrameCHWSize reg_size = {dump_img.channels(), dump_img.rows, dump_img.cols};
+        else if (cur_state==3){
+            FrameCHWSize reg_size={dump_img.channels(),dump_img.rows,dump_img.cols};
             std::vector<uint8_t> chw_vec;
             std::vector<cv::Mat> bgrChannels(3);
             cv::split(dump_img, bgrChannels);
-            for (auto i = 2; i > -1; i--) {
+            for (auto i = 2; i > -1; i--)
+            {
                 std::vector<uint8_t> data = std::vector<uint8_t>(bgrChannels[i].reshape(1, 1));
                 chw_vec.insert(chw_vec.end(), data.begin(), data.end());
             }
-            dims_t reg_shape { 1, 3, dump_img.rows, dump_img.cols };
-            runtime_tensor reg_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, reg_shape, hrt::pool_shared).expect("cannot create input tensor");
+            dims_t in_shape_reg { 1, 3, dump_img.rows, dump_img.cols };
+            runtime_tensor reg_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape_reg, hrt::pool_shared).expect("cannot create input tensor");
             auto ref_buf = reg_tensor.impl()->to_host().unwrap()->buffer().as_host().unwrap().map(map_access_::map_write).unwrap().buffer();
             memcpy(reinterpret_cast<char *>(ref_buf.data()), chw_vec.data(), chw_vec.size());
             hrt::sync(reg_tensor, sync_op_t::sync_write_back, true).expect("write back input failed");
             face_det.pre_process(reg_tensor);
             face_det.inference();
             face_det.post_process(reg_size, det_results);
-            if (det_results.size() == 1) {
+            if(det_results.size()==1){
                 face_recg.pre_process(reg_tensor, det_results[0].sparse_kps.points);
                 face_recg.inference();
                 face_recg.database_add(register_name, db_dir);
-                std::cout << "注册成功！" << std::endl;
-            } else {
-                std::cout << "注册图片中需要满足仅有一张人脸，请重新注册！" << std::endl;
+                std::cout<<"注册成功！"<<std::endl;
             }
-            cur_state = 0;
-            display_state = 0;
+            else{
+                std::cout<<"注册图片中需要满足仅有一张人脸，请重新注册！"<<std::endl;
+            }
+            cur_state=0;
+            display_state=0;
         }
-        else if (cur_state == 4) {
+        else if (cur_state==4){
             face_recg.database_reset(db_dir);
-            std::cout << "人脸数据库已清空！" << std::endl;
-            cur_state = 0;
-            display_state = 0;
+            std::cout<<"人脸数据库已清空！"<<std::endl;
+            cur_state=0;
+            display_state=0;
         }
         
-        if (display_state == 2) {
+        if(display_state==2){
             cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::Mat resized_dump;
-            cv::resize(dump_img, resized_dump, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
-            cv::Rect roi(0, 0, resized_dump.cols, resized_dump.rows);
-            resized_dump.copyTo(draw_frame(roi));
-        } else {
+            cv::resize(dump_img, register_preview_bgra, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
+            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(preview_active){
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(!register_preview_bgra.empty()){
+            register_preview_bgra.release();
+        }
+        else{
             for (size_t i = 0; i < rec_results.size(); i++) {
-                face_recg.draw_result(draw_frame, det_results[i].bbox, rec_results[i]);
+                Bbox bbox;
+                bbox.x = det_results[i].bbox.x;
+                bbox.y = det_results[i].bbox.y;
+                bbox.w = det_results[i].bbox.w;
+                bbox.h = det_results[i].bbox.h;
+                face_recg.draw_result(draw_frame, bbox, rec_results[i]);
             }
         }
         
@@ -208,10 +215,10 @@ void video_proc(char *argv[])
 
 int main(int argc, char *argv[])
 {
-    std::cout << "case " << argv[0] << " built at " << __DATE__ << " " << __TIME__ << std::endl;
-    std::cout << "Using SCRFD face detection model" << std::endl;
-    std::cout << "Press 'q+Enter' to exit." << std::endl;
-    if (argc != 8) {
+    std::cout << "case " << argv[0] << " (SCRFD) built at " << __DATE__ << " " << __TIME__ << std::endl;
+    std::cout << "Press 'q+Enter'  to exit." << std::endl;
+    if (argc != 8)
+    {
         print_usage(argv[0]);
         return -1;
     }
@@ -220,8 +227,7 @@ int main(int argc, char *argv[])
     std::string last_input = "";
     sleep(2);
     std::cout << "输入 'h' 或 'help' 并回车 查看命令说明" << std::endl;
-    
-    while(true) {
+    while(true){
         std::string input;
         std::getline(std::cin, input);
 
@@ -229,11 +235,11 @@ int main(int argc, char *argv[])
             print_help();
         }
         else if (input == "i") {
-            cur_state = 2;
-            last_input = "i";
+            cur_state = 2; 
+            last_input="i";
         }
         else if (input == "d") {
-            cur_state = 4;
+            cur_state = 4;      
             last_input = "d";
         }
         else if (input == "n") {
@@ -241,15 +247,16 @@ int main(int argc, char *argv[])
             last_input = "n";
         }
         else if (input == "q") {
-            usleep(100000);
-            isp_stop.store(true);
+            usleep(100000);     
+            isp_stop.store(true);      
             break;
         }
         else {
             if (last_input == "i") {
                 register_name = input;
                 cur_state = 3;
-            } else {
+            }
+            else {
                 std::cout << "请先输入 'i' 并回车以进入注册模式！" << std::endl;
             }
         }
