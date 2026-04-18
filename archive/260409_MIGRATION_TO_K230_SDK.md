@@ -131,7 +131,29 @@ kd_mpi_vo_chn_insert_frame(osd_vo_id + 3, &osd_frame_info)
 
 这个写法已与 SDK 现有 AI POC 保持一致。
 
-### 3.7 main.cc 指针问题
+### 3.7 connector close 返回值问题
+
+当前 `k230_sdk` 里的 `kd_mpi_connector_close()` 包装实现只有：
+
+```c
+close(fd);
+```
+
+没有显式 `return`，因此调用方如果读取它的返回值，可能得到未定义结果。
+
+为避免运行时出现类似：
+
+```text
+ERROR: kd_mpi_connector_close failed, ret=-4096
+```
+
+当前工程已改成和 `test_demo/test_vi_vo` 一致的生命周期：
+
+- `open -> power_set -> init`
+- 初始化成功后不立即检查 `kd_mpi_connector_close()` 的返回值
+- 在管线销毁时直接关闭底层 fd
+
+### 3.8 main.cc 指针问题
 
 原始代码里把 `void *` 当成可做偏移的指针使用，C++ 下会编译失败。
 

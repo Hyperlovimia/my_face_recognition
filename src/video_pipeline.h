@@ -108,6 +108,7 @@ private:
     // 屏幕 / Connector 相关
     // ============================
     k_connector_type connector_type; // 显示接口类型（MIPI、HDMI、LCD 等）
+    k_s32 connector_fd_ = -1;        // connector 句柄，按 test_vi_vo 的方式在运行期保持打开
 
     // ============================
     // VO（Video Output）相关

@@ -74,6 +74,20 @@ int PipeLine::Create()
     // =============================================================================================
     memset(&config, 0, sizeof(k_vb_config));
     config.max_pool_cnt = 64;  // 最多支持 64 个内存池
+    config.comm_pool[0].blk_cnt = 5;
+    config.comm_pool[0].mode = VB_REMAP_MODE_NOCACHE;
+    config.comm_pool[0].blk_size =
+        VICAP_ALIGN_UP((DISPLAY_WIDTH * DISPLAY_HEIGHT * 3 / 2), VICAP_ALIGN_1K);
+    config.comm_pool[1].blk_cnt = 5;
+    config.comm_pool[1].mode = VB_REMAP_MODE_NOCACHE;
+    config.comm_pool[1].blk_size =
+        VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * AI_FRAME_CHANNEL), VICAP_ALIGN_1K);
+
+    ret = kd_mpi_vicap_set_mclk(VICAP_MCLK0, VICAP_PLL0_CLK_DIV4, 16, 1);
+    if (ret) {
+        printf("kd_mpi_vicap_set_mclk failed ret:%d\n", ret);
+        return ret;
+    }
 
     // 设置 VB 全局配置
     ret = kd_mpi_vb_set_config(&config);
@@ -148,6 +162,7 @@ int PipeLine::Create()
     ret = kd_mpi_connector_power_set(connector_fd, K_TRUE);
     if (ret) {
         printf("ERROR: kd_mpi_connector_power_set failed, ret=%d\n", ret);
+        close(connector_fd);
         return ret;
     }
 
@@ -155,15 +170,13 @@ int PipeLine::Create()
     ret = kd_mpi_connector_init(connector_fd, connector_info);
     if (ret) {
         printf("ERROR: kd_mpi_connector_init failed, ret=%d\n", ret);
+        close(connector_fd);
         return ret;
     }
 
-    // 关闭设备句柄（配置完成即可关闭）
-    ret = kd_mpi_connector_close(connector_fd);
-    if (ret) {
-        printf("ERROR: kd_mpi_connector_close failed, ret=%d\n", ret);
-        return ret;
-    }
+    // SDK 当前 kd_mpi_connector_close() 缺少 return，直接读取其返回值会产生未定义行为。
+    // 这里沿用 test_vi_vo 的做法：初始化完成后继续持有该 fd，直到进程退出/销毁。
+    connector_fd_ = connector_fd;
 
     // =============================================================================================
     // 4. 配置 VO（视频输出层：用于显示摄像头画面）
@@ -353,7 +366,8 @@ int PipeLine::Create()
     chn1_attr.crop_enable    = K_FALSE;
     chn1_attr.scale_enable   = K_FALSE;
     chn1_attr.chn_enable     = K_TRUE;
-    chn1_attr.pix_format     = PIXEL_FORMAT_RGB_888_PLANAR; // AI 常用输入格式
+    // 与 test_vi_vo 保持一致：SDK 枚举名是 BGR_888_PLANAR，实际下游按 RGB CHW 使用。
+    chn1_attr.pix_format     = PIXEL_FORMAT_BGR_888_PLANAR;
     chn1_attr.buffer_num     = VICAP_MAX_FRAME_COUNT;
     chn1_attr.buffer_size    = VICAP_ALIGN_UP((AI_FRAME_WIDTH * AI_FRAME_HEIGHT * 3 ), VICAP_ALIGN_1K);
     chn1_attr.alignment      = 0;
@@ -486,6 +500,15 @@ int PipeLine::Destroy()
             }
             vo_osd_enabled_ = false;
         }
+        if (insert_osd_vaddr != nullptr) {
+            ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
+                                    OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
+            if (ret) {
+                printf("kd_mpi_sys_munmap failed.\n");
+                return ret;
+            }
+            insert_osd_vaddr = nullptr;
+        }
         if (osd_block_acquired_) {
             ret = kd_mpi_vb_release_block(handle);
             if (ret) {
@@ -493,6 +516,7 @@ int PipeLine::Destroy()
                 return ret;
             }
             osd_block_acquired_ = false;
+            handle = VB_INVALID_HANDLE;
         }
     }
     printf("kd_mpi_vb_release_block\n");
@@ -547,21 +571,17 @@ int PipeLine::Destroy()
 
     // ------------------ 销毁 OSD 内存池 ------------------
     if (osd_pool_id != VB_INVALID_POOLID){
-        if (insert_osd_vaddr != nullptr) {
-            ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
-                                    OSD_WIDTH * OSD_HEIGHT * OSD_CHANNEL);
-            if (ret) {
-                printf("kd_mpi_sys_munmap failed.\n");
-                return ret;
-            }
-            insert_osd_vaddr = nullptr;
-        }
         ret = kd_mpi_vb_destory_pool(osd_pool_id);
         if (ret) {
             printf("kd_mpi_vb_destory_pool failed.\n");
             return ret;
         }
         osd_pool_id = VB_INVALID_POOLID;
+    }
+
+    if (connector_fd_ >= 0) {
+        close(connector_fd_);
+        connector_fd_ = -1;
     }
 
     // ------------------ 反初始化 VB ------------------
