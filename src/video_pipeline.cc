@@ -200,6 +200,25 @@ int PipeLine::Create()
         vb_inited_by_pipeline_ = true;
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // 预分配 AI 输入私有缓存（CPU-cached + 物理连续）
+    // 参考 ai_poc/face_detection/main.cc:66-69。每帧 dump 到这块常驻缓存，
+    // AI tensor 始终消费它，与 VICAP dump 的生命周期解耦。
+    // ---------------------------------------------------------------------------------------------
+    ai_buf_size_ = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
+    ret = kd_mpi_sys_mmz_alloc_cached(&ai_buf_paddr_, &ai_buf_vaddr_,
+                                      "ai_input", "anonymous", (k_u32)ai_buf_size_);
+    if (ret) {
+        printf("kd_mpi_sys_mmz_alloc_cached failed for AI input buffer: ret=%d size=%zu\n",
+               ret, ai_buf_size_);
+        ai_buf_vaddr_ = nullptr;
+        ai_buf_paddr_ = 0;
+        ai_buf_size_ = 0;
+        return ret;
+    }
+    printf("AI input private buffer: paddr=%lx vaddr=%p size=%zu\n",
+           (unsigned long)ai_buf_paddr_, ai_buf_vaddr_, ai_buf_size_);
+
     // =============================================================================================
     // 2. 屏幕（Connector）配置
     // =============================================================================================
@@ -514,9 +533,8 @@ int PipeLine::Create()
 
 int PipeLine::GetFrame(DumpRes &dump_res){
     ScopedTiming st("PipeLine::GetFrame", debug_mode_);
-    int ret=0;
-    dump_res.virt_addr = 0;
-    dump_res.phy_addr = 0;
+    int ret = 0;
+    memset(&dump_res, 0, sizeof(dump_res));
     memset(&dump_info, 0, sizeof(k_video_frame_info));
 
     // 从 VICAP dump 一帧（阻塞最多 1000ms）
@@ -534,43 +552,79 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         return -1;
     }
 
-    // 将物理地址映射为虚拟地址，供 CPU 访问
-    dump_res.virt_addr = reinterpret_cast<uintptr_t>(
-        kd_mpi_sys_mmap(dump_info.v_frame.phys_addr[0],
-                        AI_FRAME_CHANNEL*AI_FRAME_HEIGHT*AI_FRAME_WIDTH));
-    if (dump_res.virt_addr == 0) {
-        printf("kd_mpi_sys_mmap failed for dumped frame.\n");
+    if (!dump_frame_info_logged_) {
+        printf("First VICAP dump: width=%u height=%u pixel_format=%d stride0=%u stride1=%u phys0=%lx phys1=%lx\n",
+               dump_info.v_frame.width, dump_info.v_frame.height, dump_info.v_frame.pixel_format,
+               dump_info.v_frame.stride[0], dump_info.v_frame.stride[1],
+               (unsigned long)dump_info.v_frame.phys_addr[0],
+               (unsigned long)dump_info.v_frame.phys_addr[1]);
+        dump_frame_info_logged_ = true;
+
+        // 首帧做一次格式 sanity check：若 ISP 真把 BGR planar 回退成 YUV420SP，
+        // 提前退出而不是让下游 ai2d 越界读 DMA 导致 silent crash。
+        if (dump_info.v_frame.pixel_format != PIXEL_FORMAT_BGR_888_PLANAR) {
+            printf("ERROR: expected PIXEL_FORMAT_BGR_888_PLANAR(%d) on AI channel, got %d\n",
+                   (int)PIXEL_FORMAT_BGR_888_PLANAR, dump_info.v_frame.pixel_format);
+            printf("ISP cannot output BGR planar at %ux%u on this board/sensor. "
+                   "Check firmware or adjust AI_FRAME_* in setting.h.\n",
+                   (unsigned)AI_FRAME_WIDTH, (unsigned)AI_FRAME_HEIGHT);
+            kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+            memset(&dump_info, 0, sizeof(k_video_frame_info));
+            return -1;
+        }
+    }
+
+    // 把 dump 帧映射成 CPU-cached 虚拟地址（参考 ai_poc/face_detection/main.cc:93）
+    void *dump_vaddr = kd_mpi_sys_mmap_cached(dump_info.v_frame.phys_addr[0], (k_u32)ai_buf_size_);
+    if (dump_vaddr == nullptr) {
+        printf("kd_mpi_sys_mmap_cached failed for dumped frame.\n");
         kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
         memset(&dump_info, 0, sizeof(k_video_frame_info));
         return -1;
     }
 
-    dump_res.phy_addr = reinterpret_cast<uintptr_t>(dump_info.v_frame.phys_addr[0]);
+    // 拷贝到常驻私有缓存（断开与 VICAP dump buffer 的生命周期耦合）
+    memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_);
+    kd_mpi_sys_munmap(dump_vaddr, (k_u32)ai_buf_size_);
+
+    // 保存 dump_info 字段用于 DumpRes，随后立刻 release dump
+    k_u32 f_width = dump_info.v_frame.width;
+    k_u32 f_height = dump_info.v_frame.height;
+    k_u32 f_stride0 = dump_info.v_frame.stride[0];
+    k_u32 f_stride1 = dump_info.v_frame.stride[1];
+    k_u32 f_pix_format = dump_info.v_frame.pixel_format;
+
+    ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+    if (ret) {
+        printf("kd_mpi_vicap_dump_release failed: ret=%d\n", ret);
+    }
+    memset(&dump_info, 0, sizeof(k_video_frame_info));
+
+    // DumpRes 指向私有缓存；下游 host_runtime_tensor 直接消费这块地址
+    dump_res.virt_addr = reinterpret_cast<uintptr_t>(ai_buf_vaddr_);
+    dump_res.phy_addr = (uintptr_t)ai_buf_paddr_;
+    dump_res.width = f_width;
+    dump_res.height = f_height;
+    dump_res.stride0 = f_stride0;
+    dump_res.stride1 = f_stride1;
+    dump_res.pixel_format = f_pix_format;
+    dump_res.mmap_size = ai_buf_size_;
+
     return 0;
 }
 
 int PipeLine::ReleaseFrame(DumpRes &dump_res){
     ScopedTiming st("PipeLine::ReleaseFrame", debug_mode_);
-    int ret=0;
-
-    // 解除虚拟地址映射
-    if (dump_res.virt_addr != 0) {
-        kd_mpi_sys_munmap(reinterpret_cast<void*>(dump_res.virt_addr),
-                          AI_FRAME_CHANNEL*AI_FRAME_HEIGHT*AI_FRAME_WIDTH);
-    }
-
-    // 释放 VICAP dump 帧
-    if (dump_info.v_frame.phys_addr[0] != 0) {
-        ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
-        if (ret)
-        {
-            printf("kd_mpi_vicap_dump_release failed.\n");
-        }
-    }
+    // dump 的生命周期已由 GetFrame 内部处理；这里只重置 DumpRes 语义。
     dump_res.virt_addr = 0;
     dump_res.phy_addr = 0;
-    memset(&dump_info, 0, sizeof(k_video_frame_info));
-    return ret;
+    dump_res.width = 0;
+    dump_res.height = 0;
+    dump_res.stride0 = 0;
+    dump_res.stride1 = 0;
+    dump_res.pixel_format = 0;
+    dump_res.mmap_size = 0;
+    return 0;
 }
 
 int PipeLine::InsertFrame(void* osd_data){
@@ -688,6 +742,17 @@ int PipeLine::Destroy()
     if (connector_fd_ >= 0) {
         close(connector_fd_);
         connector_fd_ = -1;
+    }
+
+    // 释放 AI 输入私有缓存（在 VB exit 之前，保持与 mmz 配对）
+    if (ai_buf_vaddr_ != nullptr) {
+        int free_ret = kd_mpi_sys_mmz_free(ai_buf_paddr_, ai_buf_vaddr_);
+        if (free_ret) {
+            printf("kd_mpi_sys_mmz_free failed: %d\n", free_ret);
+        }
+        ai_buf_vaddr_ = nullptr;
+        ai_buf_paddr_ = 0;
+        ai_buf_size_ = 0;
     }
 
     // ------------------ 反初始化 VB ------------------

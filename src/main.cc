@@ -83,6 +83,8 @@ void print_help() {
 void video_proc(char *argv[])
 {
     int debug_mode = atoi(argv[7]);
+    int consecutive_failures = 0;
+    bool first_frame_logged = false;
     FrameCHWSize image_size={AI_FRAME_CHANNEL,AI_FRAME_HEIGHT, AI_FRAME_WIDTH};
     // 创建一个空的Mat对象，用于存储绘制的帧
     cv::Mat draw_frame(OSD_HEIGHT, OSD_WIDTH, CV_8UC4, cv::Scalar(0, 0, 0, 0));
@@ -92,6 +94,7 @@ void video_proc(char *argv[])
 
     // 创建一个PipeLine对象，用于处理视频流
     PipeLine pl(debug_mode);
+try {
     // 初始化PipeLine对象
     int ret = pl.Create();
     if (ret != 0) {
@@ -99,13 +102,23 @@ void video_proc(char *argv[])
         isp_stop = true;
         return;
     }
+    std::cerr << "[stage] pl.Create OK" << std::endl;
+    std::cerr.flush();
     // 创建一个DumpRes对象，用于存储帧数据
     DumpRes dump_res;
     FaceDetection face_det(argv[1], atof(argv[2]),atof(argv[3]),image_size, debug_mode);
-    
+    std::cerr << "[stage] FaceDetection ctor OK" << std::endl;
+    std::cerr.flush();
+
     char* db_dir=argv[6];
     FaceRecognition face_recg(argv[4], atoi(argv[5]), image_size, debug_mode);
+    std::cerr << "[stage] FaceRecognition ctor OK" << std::endl;
+    std::cerr.flush();
+    std::cerr << "[stage] calling database_init(" << db_dir << ") ..." << std::endl;
+    std::cerr.flush();
     face_recg.database_init(db_dir);
+    std::cerr << "[stage] database_init OK" << std::endl;
+    std::cerr.flush();
 
     vector<FaceDetectionInfo> det_results;
     vector<FaceRecognitionInfo> rec_results;
@@ -121,11 +134,48 @@ void video_proc(char *argv[])
         ret = pl.GetFrame(dump_res);
         if (ret != 0) {
             std::cout << "GetFrame failed: " << ret << std::endl;
-            isp_stop = true;
-            break;
+            if (++consecutive_failures >= 5) {
+                std::cout << "Too many consecutive frame failures, stopping pipeline." << std::endl;
+                isp_stop = true;
+                break;
+            }
+            usleep(10000);
+            continue;
         }
-        input_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, { (gsl::byte *)dump_res.virt_addr, compute_size(in_shape) },false, hrt::pool_shared, dump_res.phy_addr).expect("cannot create input tensor");
-        hrt::sync(input_tensor, sync_op_t::sync_write_back, true).expect("sync write_back failed");
+        consecutive_failures = 0;
+        if (!first_frame_logged) {
+            std::cerr << "[stage] first GetFrame OK: virt=0x" << std::hex << dump_res.virt_addr
+                      << " phy=0x" << dump_res.phy_addr << std::dec
+                      << " " << dump_res.width << "x" << dump_res.height
+                      << " pix=" << dump_res.pixel_format
+                      << " size=" << dump_res.mmap_size << std::endl;
+        }
+
+        auto input_tensor_r =
+            host_runtime_tensor::create(typecode_t::dt_uint8, in_shape,
+                                        {(gsl::byte *)dump_res.virt_addr, compute_size(in_shape)},
+                                        false, hrt::pool_shared, dump_res.phy_addr);
+        if (!input_tensor_r.is_ok()) {
+            std::cout << "cannot create input tensor from dumped frame, skip this frame" << std::endl;
+            pl.ReleaseFrame(dump_res);
+            usleep(10000);
+            continue;
+        }
+        input_tensor = std::move(input_tensor_r.unwrap());
+        if (!first_frame_logged) {
+            std::cerr << "[stage] first tensor create OK" << std::endl;
+        }
+
+        auto sync_r = hrt::sync(input_tensor, sync_op_t::sync_write_back, true);
+        if (!sync_r.is_ok()) {
+            std::cout << "sync write_back failed on dumped frame, skip this frame" << std::endl;
+            pl.ReleaseFrame(dump_res);
+            usleep(10000);
+            continue;
+        }
+        if (!first_frame_logged) {
+            std::cerr << "[stage] first sync_write_back OK" << std::endl;
+        }
         //前处理，推理，后处理
         det_results.clear();
         rec_results.clear();
@@ -135,14 +185,44 @@ void video_proc(char *argv[])
         }
         else if(cur_state==0){
             // 正常执行人脸识别
-            face_det.pre_process(input_tensor);
-            face_det.inference();
+            if (!first_frame_logged) {
+                std::cerr << "[stage] entering first face_det.pre_process" << std::endl;
+            }
+            if (!face_det.pre_process(input_tensor)) {
+                std::cout << "FaceDetection pre_process failed, skip this frame" << std::endl;
+                draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+                pl.InsertFrame(draw_frame.data);
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            if (!first_frame_logged) {
+                std::cerr << "[stage] first face_det.pre_process OK, calling inference" << std::endl;
+            }
+            if (!face_det.inference()) {
+                std::cout << "FaceDetection inference failed, skip this frame" << std::endl;
+                draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+                pl.InsertFrame(draw_frame.data);
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            if (!first_frame_logged) {
+                std::cerr << "[stage] first face_det full inference OK" << std::endl;
+                first_frame_logged = true;
+            }
             face_det.post_process(image_size,det_results);
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
             for (int i = 0; i < det_results.size(); ++i)
             {
-                face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points);
-                face_recg.inference();
+                if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points)) {
+                    std::cout << "FaceRecognition pre_process failed, skip current face" << std::endl;
+                    continue;
+                }
+                if (!face_recg.inference()) {
+                    std::cout << "FaceRecognition inference failed, skip current face" << std::endl;
+                    continue;
+                }
                 FaceRecognitionInfo recg_result;
                 face_recg.database_search(recg_result);
                 rec_results.push_back(recg_result);
@@ -190,16 +270,76 @@ void video_proc(char *argv[])
             }
             // 创建tensor
             dims_t in_shape { 1, 3, dump_img.rows, dump_img.cols };
-            runtime_tensor reg_tensor = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared).expect("cannot create input tensor");
-            auto ref_buf = reg_tensor.impl()->to_host().unwrap()->buffer().as_host().unwrap().map(map_access_::map_write).unwrap().buffer();
+            auto reg_tensor_r = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared);
+            if (!reg_tensor_r.is_ok()) {
+                std::cout << "cannot create register tensor, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            runtime_tensor reg_tensor = std::move(reg_tensor_r.unwrap());
+            auto to_host_r = reg_tensor.impl()->to_host();
+            if (!to_host_r.is_ok()) {
+                std::cout << "register tensor to_host failed, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            nncase::tensor host_tensor = std::move(to_host_r.unwrap());
+            auto as_host_r = host_tensor->buffer().as_host();
+            if (!as_host_r.is_ok()) {
+                std::cout << "register tensor as_host failed, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            auto as_host = std::move(as_host_r.unwrap());
+            auto map_r = as_host.map(map_access_::map_write);
+            if (!map_r.is_ok()) {
+                std::cout << "register tensor map failed, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            auto mapped = std::move(map_r.unwrap());
+            auto ref_buf = mapped.buffer();
             memcpy(reinterpret_cast<char *>(ref_buf.data()), chw_vec.data(), chw_vec.size());
-            hrt::sync(reg_tensor, sync_op_t::sync_write_back, true).expect("write back input failed");
-            face_det.pre_process(reg_tensor);
-            face_det.inference();
+            auto reg_sync_r = hrt::sync(reg_tensor, sync_op_t::sync_write_back, true);
+            if (!reg_sync_r.is_ok()) {
+                std::cout << "register tensor sync failed, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
+            if (!face_det.pre_process(reg_tensor) || !face_det.inference()) {
+                std::cout << "FaceDetection register path failed, skip register request" << std::endl;
+                cur_state=0;
+                display_state=0;
+                pl.ReleaseFrame(dump_res);
+                usleep(10000);
+                continue;
+            }
             face_det.post_process(reg_size,det_results);
             if(det_results.size()==1){
-                face_recg.pre_process(reg_tensor, det_results[0].sparse_kps.points);
-                face_recg.inference();
+                if (!face_recg.pre_process(reg_tensor, det_results[0].sparse_kps.points) ||
+                    !face_recg.inference()) {
+                    std::cout << "FaceRecognition register path failed, skip register request" << std::endl;
+                    cur_state=0;
+                    display_state=0;
+                    pl.ReleaseFrame(dump_res);
+                    usleep(10000);
+                    continue;
+                }
                 face_recg.database_add(register_name, db_dir);
                 std::cout<<"注册成功！"<<std::endl;
             }
@@ -231,11 +371,24 @@ void video_proc(char *argv[])
         }
         
         // 将绘制的帧插入到PipeLine中
-        pl.InsertFrame(draw_frame.data);
+        if (pl.InsertFrame(draw_frame.data) != 0) {
+            std::cout << "InsertFrame failed, skip current OSD update" << std::endl;
+        }
         // 释放帧数据
         pl.ReleaseFrame(dump_res);
     }
     pl.Destroy();
+} catch (const std::exception &e) {
+    std::cerr << "video_proc std::exception: " << e.what() << std::endl;
+    std::cerr.flush();
+    isp_stop = true;
+    pl.Destroy();
+} catch (...) {
+    std::cerr << "video_proc unknown exception (not std::exception)" << std::endl;
+    std::cerr.flush();
+    isp_stop = true;
+    pl.Destroy();
+}
 }
 
 int main(int argc, char *argv[])

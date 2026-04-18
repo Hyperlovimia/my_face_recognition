@@ -23,11 +23,37 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 #include <vector>
 #include "face_recognition.h"
-#include <filesystem>
 
-namespace fs = std::filesystem;
+namespace {
+// K230 musl 下 std::filesystem::create_directories 可能静默抛异常，
+// 这里用 POSIX stat/mkdir 做一个可移植的实现。
+bool ensure_dir_exists_posix(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true;
+        }
+        std::cerr << "path exists but is not a directory: " << path << std::endl;
+        return false;
+    }
+    if (errno != ENOENT) {
+        std::cerr << "stat(" << path << ") failed: errno=" << errno << std::endl;
+        return false;
+    }
+    if (mkdir(path, 0755) == 0) {
+        std::cout << "人脸数据库不存在，已成功创建该目录: " << path << std::endl;
+        return true;
+    }
+    std::cerr << "mkdir(" << path << ") failed: errno=" << errno << std::endl;
+    return false;
+}
+}  // namespace
 
 FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize image_size,int debug_mode) : AIBase(kmodel_file, "FaceRecognition", debug_mode)
 {
@@ -88,22 +114,29 @@ int FaceRecognition::get_dir_files(const char *path)
 void FaceRecognition::database_init(char *db_pth)
 {
 	ScopedTiming st(model_name_ + " database_init", debug_mode_);
-	// 将 char* 转换为 std::string 或直接使用 fs::path
-    fs::path dir_path(db_pth);
+	std::cerr << "[db_init] path=" << (db_pth ? db_pth : "(null)") << std::endl;
+	std::cerr.flush();
 
-    if (!fs::exists(dir_path)) {
-        // 如果目录不存在，则尝试创建它
-        if (fs::create_directories(dir_path)) {
-            std::cout << "人脸数据库不存在，已成功创建该目录: " << dir_path << std::endl;
-        } else {
-            std::cerr << "无法创建目录: " << dir_path << std::endl;
-        }
-    }
+	if (db_pth == nullptr) {
+		std::cerr << "[db_init] db_pth is null, skip." << std::endl;
+		return;
+	}
+
+	if (!ensure_dir_exists_posix(db_pth)) {
+		std::cerr << "[db_init] ensure_dir_exists_posix failed, continue with empty db" << std::endl;
+		valid_register_face_ = 0;
+		std::cerr.flush();
+		return;
+	}
+	std::cerr << "[db_init] directory ready" << std::endl;
+	std::cerr.flush();
 
 	vector<string> files;
 	int file_num = get_dir_files(db_pth);
 	if( debug_mode_> 0)
 		std::cout<<"found "<< file_num <<" pieces of data in db"<<std::endl;
+	std::cerr << "[db_init] file_num=" << file_num << std::endl;
+	std::cerr.flush();
 
 	valid_register_face_ = 0;
 	for (int i = 1; i <= file_num; ++i)
@@ -119,6 +152,8 @@ void FaceRecognition::database_init(char *db_pth)
 		valid_register_face_ += 1;
 	}
 	std::cout << "init database Done!" << std::endl;
+	std::cerr.flush();
+	std::cout.flush();
 }
 
 void FaceRecognition::database_reset(char *db_pth){
@@ -132,12 +167,8 @@ void FaceRecognition::database_reset(char *db_pth){
         std::string db_file = std::string(db_pth) + "/" + std::to_string(i) + ".db";
         std::string name_file = std::string(db_pth) + "/" + std::to_string(i) + ".name";
 
-        if (fs::exists(db_file)) {
-            fs::remove(db_file);
-        }
-        if (fs::exists(name_file)) {
-            fs::remove(name_file);
-        }
+        unlink(db_file.c_str());
+        unlink(name_file.c_str());
     }
 
     // 清空内存中的缓存

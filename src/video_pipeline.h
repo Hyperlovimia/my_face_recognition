@@ -54,6 +54,12 @@ typedef struct DumpRes
 {
     uintptr_t virt_addr;   // 用户态虚拟地址（CPU 访问，用于 AI 推理/图像处理）
     uintptr_t phy_addr;    // 物理地址（供 DMA/硬件模块使用）
+    k_u32 width;           // 当前 dump 帧宽
+    k_u32 height;          // 当前 dump 帧高
+    k_u32 stride0;         // plane0 stride
+    k_u32 stride1;         // plane1 stride
+    k_u32 pixel_format;    // 当前 dump 帧像素格式
+    size_t mmap_size;      // 当前 dump 帧 mmap 大小
 } DumpRes;
 
 
@@ -161,6 +167,17 @@ private:
     bool vicap_inited_ = false;
     bool vicap_stream_started_ = false;
     bool vicap_vo_bound_ = false;
+    bool dump_frame_info_logged_ = false;
+
+    // ============================
+    // AI 输入私有缓存（CPU-cached + 物理连续）
+    // 参考 ai_poc/face_detection/main.cc:67-95：VICAP dump 出来的帧通过
+    // kd_mpi_sys_mmap_cached + memcpy 搬运到这块常驻缓存，AI tensor 始终消费它，
+    // 与 VICAP dump buffer 的生命周期彻底解耦。
+    // ============================
+    k_u64 ai_buf_paddr_ = 0;
+    void *ai_buf_vaddr_ = nullptr;
+    size_t ai_buf_size_ = 0;
 };
 
 #endif

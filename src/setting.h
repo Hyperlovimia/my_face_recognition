@@ -57,8 +57,11 @@
     #define DISPLAY_WIDTH 960
     #define DISPLAY_HEIGHT 540
     #define DISPLAY_ROTATE 1
-    #define AI_FRAME_WIDTH 640
-    #define AI_FRAME_HEIGHT 360
+    // 与 test_vi_vo / ai_poc/face_detection 保持一致：chn1 = 1280x720 BGR planar。
+    // 640x360 在当前 ISP/sensor 组合下会触发 `set output err, set default format ISP_PIX_FMT_YUV420SP`
+    // 格式回退，导致 dump 的数据和应用端假设不一致。
+    #define AI_FRAME_WIDTH 1280
+    #define AI_FRAME_HEIGHT 720
     #define AI_FRAME_CHANNEL 3
     #define USE_OSD 1
     #define OSD_WIDTH 540
