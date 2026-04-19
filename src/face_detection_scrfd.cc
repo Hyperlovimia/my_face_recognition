@@ -70,16 +70,10 @@ void FaceDetectionSCRFD::decode_single_stride(float *scores, float *bboxes, floa
                     float cx = (w + 0.5f) * stride;
                     float cy = (h + 0.5f) * stride;
                     
-                    float bbox_raw[4];
-                    for (int i = 0; i < 4; i++)
-                    {
-                        bbox_raw[i] = bboxes[idx * 4 + i];
-                    }
-                    
-                    float x1 = cx - bbox_raw[0] * stride;
-                    float y1 = cy - bbox_raw[1] * stride;
-                    float x2 = cx + bbox_raw[2] * stride;
-                    float y2 = cy + bbox_raw[3] * stride;
+                    float x1 = cx - bboxes[idx * 4 + 0] * stride;
+                    float y1 = cy - bboxes[idx * 4 + 1] * stride;
+                    float x2 = cx + bboxes[idx * 4 + 2] * stride;
+                    float y2 = cy + bboxes[idx * 4 + 3] * stride;
                     
                     face.bbox.x = x1;
                     face.bbox.y = y1;
@@ -88,10 +82,8 @@ void FaceDetectionSCRFD::decode_single_stride(float *scores, float *bboxes, floa
                     
                     for (int k = 0; k < 5; k++)
                     {
-                        float kpx = cx + kps[idx * 10 + k * 2] * stride;
-                        float kpy = cy + kps[idx * 10 + k * 2 + 1] * stride;
-                        face.sparse_kps.points[k * 2] = kpx;
-                        face.sparse_kps.points[k * 2 + 1] = kpy;
+                        face.sparse_kps.points[k * 2] = cx + kps[idx * 10 + k * 2] * stride;
+                        face.sparse_kps.points[k * 2 + 1] = cy + kps[idx * 10 + k * 2 + 1] * stride;
                     }
                     
                     faces.push_back(face);
@@ -115,6 +107,9 @@ float FaceDetectionSCRFD::compute_iou(BboxSCRFD &a, BboxSCRFD &b)
     float area_a = a.w * a.h;
     float area_b = b.w * b.h;
     float union_area = area_a + area_b - inter;
+    
+    if (union_area <= 0.0f)
+        return 0.0f;
     
     return inter / union_area;
 }
@@ -141,7 +136,7 @@ void FaceDetectionSCRFD::nms(vector<FaceDetectionSCRFDInfo> &faces, float nms_th
                 continue;
             
             float iou = compute_iou(faces[i].bbox, faces[j].bbox);
-            if (iou > nms_thresh)
+            if (iou >= nms_thresh)
             {
                 suppressed[j] = true;
             }
@@ -196,10 +191,16 @@ void FaceDetectionSCRFD::post_process(FrameCHWSize frame_size, vector<FaceDetect
         x2 = std::max(0.0f, std::min(x2, (float)frame_size.width));
         y2 = std::max(0.0f, std::min(y2, (float)frame_size.height));
         
+        float w = x2 - x1;
+        float h = y2 - y1;
+        
+        if (w <= 0 || h <= 0)
+            continue;
+        
         face.bbox.x = x1;
         face.bbox.y = y1;
-        face.bbox.w = x2 - x1;
-        face.bbox.h = y2 - y1;
+        face.bbox.w = w;
+        face.bbox.h = h;
         
         for (int k = 0; k < 5; k++)
         {
