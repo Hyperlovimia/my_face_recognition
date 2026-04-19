@@ -707,70 +707,29 @@ int PipeLine::InsertFrame(void* osd_data){
 int PipeLine::Destroy()
 {
     ScopedTiming st("PipeLine::Destroy", debug_mode_);
-    int ret=0;
+    int ret = 0;
+    int first_error = 0;
+    auto record_error = [&](const char *step, int err) {
+        if (err == 0) {
+            return;
+        }
+        printf("PipeLine::Destroy step failed: %s ret=0x%x\n", step, err);
+        if (first_error == 0) {
+            first_error = err;
+        }
+    };
 
-    // ------------------ 关闭 OSD ------------------
-    if(USE_OSD == 1)
-    {
-        if (vo_osd_enabled_) {
-            ret = kd_mpi_vo_osd_disable(osd_vo_id);
-            if (ret) {
-                printf("kd_mpi_vo_osd_disable failed.\n");
-                return ret;
-            }
-            vo_osd_enabled_ = false;
-        }
-        if (insert_osd_vaddr != nullptr) {
-            ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
-                                    osd_mmap_size_);
-            if (ret) {
-                printf("kd_mpi_sys_munmap failed.\n");
-                return ret;
-            }
-            insert_osd_vaddr = nullptr;
-            osd_mmap_size_ = 0;
-            osd_frame_size_ = 0;
-        }
-        if (osd_block_acquired_) {
-            ret = kd_mpi_vb_release_block(handle);
-            if (ret) {
-                printf("kd_mpi_vb_release_block failed.\n");
-                return ret;
-            }
-            osd_block_acquired_ = false;
-            handle = VB_INVALID_HANDLE;
-        }
+    if (dump_info.v_frame.phys_addr[0] != 0) {
+        ret = kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
+        record_error("kd_mpi_vicap_dump_release", ret);
+        memset(&dump_info, 0, sizeof(k_video_frame_info));
     }
-    printf("kd_mpi_vb_release_block\n");
 
     // ------------------ 停止 VICAP ------------------
     if (vicap_stream_started_) {
         ret = kd_mpi_vicap_stop_stream(vicap_dev);
-        if (ret) {
-            printf("kd_mpi_vicap_stop_stream failed.\n");
-            return ret;
-        }
+        record_error("kd_mpi_vicap_stop_stream", ret);
         vicap_stream_started_ = false;
-    }
-
-    // 反初始化 VICAP
-    if (vicap_inited_) {
-        ret = kd_mpi_vicap_deinit(vicap_dev);
-        if (ret) {
-            printf("kd_mpi_vicap_deinit failed.\n");
-            return ret;
-        }
-        vicap_inited_ = false;
-    }
-
-    // ------------------ 解除 VI → VO 绑定 ------------------
-    if (vo_video_enabled_) {
-        ret = kd_mpi_vo_disable_video_layer(vi_vo_id);
-        if (ret) {
-            printf("kd_mpi_vo_disable_video_layer failed.\n");
-            return ret;
-        }
-        vo_video_enabled_ = false;
     }
 
     if (vicap_vo_bound_) {
@@ -781,37 +740,72 @@ int PipeLine::Destroy()
         vo_mpp_chn.dev_id    = vo_dev_id;
         vo_mpp_chn.chn_id    = K_VO_DISPLAY_CHN_ID1;
         ret = kd_mpi_sys_unbind(&vicap_mpp_chn, &vo_mpp_chn);
-        if (ret) {
-            printf("kd_mpi_sys_unbind failed:0x%x\n", ret);
-        }
+        record_error("kd_mpi_sys_unbind", ret);
         vicap_vo_bound_ = false;
+    }
+
+    // 反初始化 VICAP
+    if (vicap_inited_) {
+        ret = kd_mpi_vicap_deinit(vicap_dev);
+        record_error("kd_mpi_vicap_deinit", ret);
+        vicap_inited_ = false;
+    }
+
+    // ------------------ 关闭 OSD / VO ------------------
+    if(USE_OSD == 1 && vo_osd_enabled_)
+    {
+        ret = kd_mpi_vo_osd_disable(osd_vo_id);
+        record_error("kd_mpi_vo_osd_disable", ret);
+        vo_osd_enabled_ = false;
+    }
+
+    if (vo_video_enabled_) {
+        ret = kd_mpi_vo_disable_video_layer(vi_vo_id);
+        record_error("kd_mpi_vo_disable_video_layer", ret);
+        vo_video_enabled_ = false;
     }
 
     /* 等待一帧时间，确保 VO 释放 VB */
     k_u32 display_ms = 1000 / 33;
     usleep(1000 * display_ms);
 
-    // ------------------ 销毁 OSD 内存池 ------------------
-    if (osd_pool_id != VB_INVALID_POOLID){
-        ret = kd_mpi_vb_destory_pool(osd_pool_id);
-        if (ret) {
-            printf("kd_mpi_vb_destory_pool failed.\n");
-            return ret;
+    // ------------------ 清理 OSD 内存 ------------------
+    if(USE_OSD == 1)
+    {
+        if (insert_osd_vaddr != nullptr) {
+            ret = kd_mpi_sys_munmap(reinterpret_cast<void*>(insert_osd_vaddr),
+                                    osd_mmap_size_);
+            record_error("kd_mpi_sys_munmap(osd)", ret);
+            insert_osd_vaddr = nullptr;
+            osd_mmap_size_ = 0;
+            osd_frame_size_ = 0;
         }
-        osd_pool_id = VB_INVALID_POOLID;
+
+        if (osd_block_acquired_) {
+            ret = kd_mpi_vb_release_block(handle);
+            record_error("kd_mpi_vb_release_block", ret);
+            osd_block_acquired_ = false;
+            handle = VB_INVALID_HANDLE;
+        }
+
+        if (osd_pool_id != VB_INVALID_POOLID){
+            ret = kd_mpi_vb_destory_pool(osd_pool_id);
+            record_error("kd_mpi_vb_destory_pool", ret);
+            osd_pool_id = VB_INVALID_POOLID;
+        }
     }
 
     if (connector_fd_ >= 0) {
-        close(connector_fd_);
+        if (close(connector_fd_) != 0) {
+            record_error("close(connector_fd_)", errno);
+        }
         connector_fd_ = -1;
     }
 
     // 释放 AI 输入私有缓存（在 VB exit 之前，保持与 mmz 配对）
     if (ai_buf_vaddr_ != nullptr) {
-        int free_ret = kd_mpi_sys_mmz_free(ai_buf_paddr_, ai_buf_vaddr_);
-        if (free_ret) {
-            printf("kd_mpi_sys_mmz_free failed: %d\n", free_ret);
-        }
+        ret = kd_mpi_sys_mmz_free(ai_buf_paddr_, ai_buf_vaddr_);
+        record_error("kd_mpi_sys_mmz_free", ret);
         ai_buf_vaddr_ = nullptr;
         ai_buf_paddr_ = 0;
         ai_buf_size_ = 0;
@@ -820,14 +814,11 @@ int PipeLine::Destroy()
     // ------------------ 反初始化 VB ------------------
     if (vb_inited_by_pipeline_) {
         ret = kd_mpi_vb_exit();
-        if (ret) {
-            printf("kd_mpi_vb_exit failed.\n");
-            return ret;
-        }
+        record_error("kd_mpi_vb_exit", ret);
         vb_inited_by_pipeline_ = false;
     } else {
         printf("Keep pre-initialized VB untouched.\n");
     }
 
-    return 0;
+    return first_error;
 }

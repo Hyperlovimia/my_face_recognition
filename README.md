@@ -29,6 +29,13 @@ cd src/reference/ai_poc/my_face_recognition
 ./run.sh
 ```
 
+程序支持两种退出方式：
+
+- 输入 `q` 后回车，走正常清理退出
+- 按 `Ctrl+C`，触发优雅退出并执行 `PipeLine::Destroy()`
+
+如果退出日志里能看到 `PipeLine::Destroy` 相关输出，说明视频链路的清理路径已经真正执行，可直接再次启动，无需重启板子。
+
 运行参数：
 
 ```bash
@@ -54,7 +61,7 @@ Usage: face_recognition.elf <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <
 | 清空人脸数据库   | ✔        |d|
 | 人脸注册         | ✔        |输入人脸名称|
 | 注册人数查询     | ✔        |n|
-| 退出程序         | ✔        |q|
+| 退出程序         | ✔        |q / Ctrl+C|
 
 > 注：
 > 注册截图时请确保画面中仅有一张清晰可见的人脸。

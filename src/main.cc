@@ -22,9 +22,15 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#include <iostream>
-#include <thread>
+#include <atomic>
+#include <cerrno>
+#include <csignal>
 #include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <poll.h>
+#include <thread>
+#include <unistd.h>
 #include "video_pipeline.h"
 #include "ai_utils.h"
 #include "face_detection.h"
@@ -38,6 +44,43 @@ std::atomic<bool> isp_stop(false);
 // 注册人名称
 static std::string register_name;
 int cur_state = 0;
+
+namespace {
+
+volatile sig_atomic_t g_signal_exit_requested = 0;
+
+void handle_exit_signal(int signo)
+{
+    (void)signo;
+    g_signal_exit_requested = 1;
+}
+
+bool exit_requested()
+{
+    return isp_stop.load() || g_signal_exit_requested != 0;
+}
+
+bool install_exit_signal_handlers()
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_exit_signal;
+    sigfillset(&sa.sa_mask);
+
+    if (sigaction(SIGINT, &sa, nullptr) != 0) {
+        std::cerr << "sigaction(SIGINT) failed: " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (sigaction(SIGTERM, &sa, nullptr) != 0) {
+        std::cerr << "sigaction(SIGTERM) failed: " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
 
 void print_usage(const char *name)
 {
@@ -127,12 +170,15 @@ try {
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT,AI_FRAME_WIDTH , CV_8UC3);
 
-    while(!isp_stop){
+    while(!exit_requested()){
         // 创建一个ScopedTiming对象，用于计算总时间
         ScopedTiming st("total time", debug_mode);
         // 从PipeLine中获取一帧数据，并创建tensor
         ret = pl.GetFrame(dump_res);
         if (ret != 0) {
+            if (exit_requested()) {
+                break;
+            }
             std::cout << "GetFrame failed: " << ret << std::endl;
             if (++consecutive_failures >= 5) {
                 std::cout << "Too many consecutive frame failures, stopping pipeline." << std::endl;
@@ -394,12 +440,15 @@ try {
 int main(int argc, char *argv[])
 {
     std::cout << "case " << argv[0] << " built at " << __DATE__ << " " << __TIME__ << std::endl;
-    std::cout << "Press 'q+Enter'  to exit." << std::endl;
+    std::cout << "Press 'q+Enter' or Ctrl+C to exit." << std::endl;
     if (argc != 8)
     {
         print_usage(argv[0]);
         return -1;
     }
+
+    if (!install_exit_signal_handlers())
+        return -1;
 
     std::thread thread_isp(video_proc, argv);
     // 命令行输入处理主循环
@@ -407,9 +456,29 @@ int main(int argc, char *argv[])
     sleep(2);
     // 输入提示信息
     std::cout << "输入 'h' 或 'help' 并回车 查看命令说明" << std::endl;
-    while(true){
+    while(!exit_requested()){
+        struct pollfd stdin_pollfd;
+        memset(&stdin_pollfd, 0, sizeof(stdin_pollfd));
+        stdin_pollfd.fd = STDIN_FILENO;
+        stdin_pollfd.events = POLLIN | POLLHUP | POLLERR;
+
+        int poll_ret = poll(&stdin_pollfd, 1, 200);
+        if (poll_ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "poll(stdin) failed: " << strerror(errno) << std::endl;
+            break;
+        }
+        if (poll_ret == 0) {
+            continue;
+        }
+
         std::string input;
-        std::getline(std::cin, input);  // 获取用户输入
+        if (!std::getline(std::cin, input)) {
+            std::cout << "stdin closed, exiting." << std::endl;
+            break;
+        }
 
         if (input == "h" || input == "help") {
             print_help();  // 打印帮助信息
@@ -447,6 +516,12 @@ int main(int argc, char *argv[])
             }
         }
     }
+
+    if (g_signal_exit_requested != 0) {
+        std::cout << "Signal received, shutting down gracefully..." << std::endl;
+    }
+
+    isp_stop.store(true);
     thread_isp.join();
     return 0;
 }
