@@ -1,5 +1,7 @@
 # 三进程优化功能变更文档
 
+> 260415 更正：本文早期记录中的 `utils/run_face3.sh`、`utils/watchdog_face3.sh` 以及 `face_event -> face_ai -> face_video` 启动建议仅适用于类 Linux / POSIX shell 假设，不适用于 RT-Smart 板端 `msh`。当前板端正确方式是直接在串口按顺序执行 `face_ai.elf &`、`face_video.elf &`、`face_event.elf`，详见本文第 5 节和 [260408 RT-Smart 单串口适配文档](./260408_RTSMART_SINGLE_UART_CHANGELOG.md)。
+
 ## 1. 变更摘要
 
 本次优化的核心目标，是将原本的单进程人脸识别程序拆分为“视频采集显示进程 + AI 推理进程 + 事件/交互进程”三个独立进程，降低采集显示线程被 AI 推理阻塞的风险，并提升系统可维护性、可观测性和异常恢复能力。
@@ -244,27 +246,21 @@ face_event(日志输出/告警输出)
 - 编译产物目录 `k230_bin`
 - 仓库中的辅助脚本目录 `utils`
 
-### 4.3 新增三进程启动脚本
+### 4.3 关于三进程启动脚本的更正
 
-新增 `utils/run_face3.sh`，提供：
+早期曾尝试新增 `utils/run_face3.sh` 与 `utils/watchdog_face3.sh` 来自动启动和守护三进程，但该方案依赖 `/bin/sh` / POSIX shell 能力，例如变量展开、命令替换、shell 函数、循环、`trap`、PID 文件和通用进程管理命令。
 
-- 固定启动顺序：`face_event -> face_ai -> face_video`
-- PID 文件写入
-- 子进程存活检测
-- 任一子进程退出后的整组清理
-- 可选自动重启能力 `RUN_FACE3_RESTART=1`
+RT-Smart 板端实际使用 `msh`，不能按常规 Linux shell 使用这些脚本能力。因此这些脚本不应作为板端启动方式保留，后续已删除，避免误导部署人员。
 
-相比手动逐个启动，脚本降低了三进程运行门槛，也减少了通道创建顺序错误导致的启动失败概率。
+### 4.4 当前板端启动原则
 
-### 4.4 新增看门狗脚本
+三进程启动不再通过脚本自动完成，而是在单串口中手动输入三条命令：
 
-新增 `utils/watchdog_face3.sh`，提供三进程守护能力：
+- 先后台启动 `face_ai.elf`
+- 再后台启动 `face_video.elf`
+- 最后以前台方式启动 `face_event.elf`
 
-- 定期检查三个 PID 是否存活
-- 发现任一进程异常退出后，结束旧进程组并重新拉起
-- 检查逻辑优先依赖 PID 文件和 `/proc`，不强依赖 `ps/grep`
-
-这对裁剪后的板端系统比较友好，提升了长期运行时的可靠性。
+这样 `face_event.elf` 能占用唯一串口作为交互入口，`face_ai.elf` 的事件通道也能在 `face_event.elf` 晚启动后自动恢复。
 
 ## 5. 使用方式变化
 
@@ -276,18 +272,26 @@ face_event(日志输出/告警输出)
 ./face_recognition.elf face_detection_320.kmodel 0.6 0.2 face_recognition.kmodel 75 face_database 0
 ```
 
-或使用仓库原有的：
-
-```bash
-./run.sh
-```
+旧的 `utils/run.sh` 已删除。RT-Smart 板端请直接输入 ELF 命令，不再通过脚本启动。
 
 ### 5.2 三进程模式
 
-三进程模式建议通过启动脚本运行，且启动顺序必须满足：
+RT-Smart 单串口三进程模式必须按以下顺序手动启动：
 
-```text
-face_event -> face_ai -> face_video
+启用活体检测时：
+
+```sh
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.5 0.2 /sharefs/face_recognition.kmodel 70 /sharefs/face_db 0 /sharefs/face_antispoof.kmodel &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
+```
+
+暂不启用活体检测时：
+
+```sh
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.5 0.2 /sharefs/face_recognition.kmodel 70 /sharefs/face_db 0 &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 交互方式也发生了变化：
@@ -308,7 +312,7 @@ face_event -> face_ai -> face_video
 ## 7. 兼容性与注意事项
 
 1. 三进程模式下，交互命令必须在 `face_event` 所在终端输入。
-2. 三进程模式对启动顺序有要求，建议统一使用 `run_face3.sh`。
-3. `build_app.sh` 不再自动把 `utils/` 拷贝进 `k230_bin`，板端部署时需要单独处理脚本和模型文件。
+2. 三进程模式对启动顺序有要求：`face_ai` 后台、`face_video` 后台、`face_event` 前台。
+3. `build_app.sh` 不再自动把 `utils/` 拷贝进 `k230_bin`，板端部署时只需要同步 ELF 和模型文件。
 4. 本次提交保留了单进程实现，因此旧流程理论上仍可回退使用。
 5. `.idea/` 目录在第二次提交中一并进入版本库，但这部分属于开发环境文件，不构成功能层面的核心变更。

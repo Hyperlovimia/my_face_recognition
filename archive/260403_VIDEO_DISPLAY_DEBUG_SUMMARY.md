@@ -1,5 +1,7 @@
 # My Face Recognition 视频显示问题排查与修复总结
 
+> 260419 说明：本文是历史归档，描述的是项目仍在 /rtos_k230 时的方案。当前项目已经迁移到 /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition，本文的内容已不再适用新的 sdk。
+
 ## 1. 问题背景
 
 项目路径：

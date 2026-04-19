@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <vector>
+#include <nncase/tensor.h>
 #include "face_recognition.h"
 #include "setting.h"
 
@@ -90,6 +91,9 @@ cv::Rect bbox_to_osd_rect(const Bbox &bbox, int ref_w, int ref_h, int dst_w, int
 }
 }  // namespace
 
+using namespace nncase::runtime;
+using namespace nncase::runtime::detail;
+
 FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize image_size,int debug_mode) : AIBase(kmodel_file, "FaceRecognition", debug_mode)
 {
 	model_name_ = "FaceRecognition";
@@ -113,6 +117,48 @@ bool FaceRecognition::pre_process(runtime_tensor& input_tensor, float *sparse_po
 	Utils::affine_set(image_size_, input_size_,ai2d_builder_, matrix_dst_);
 	auto r = ai2d_builder_->invoke(input_tensor, ai2d_out_tensor_);
 	return r.is_ok();
+}
+
+bool FaceRecognition::aligned_face_to_bgr(cv::Mat &bgr) const
+{
+    const int C = (int)input_size_.channel;
+    const int H = (int)input_size_.height;
+    const int W = (int)input_size_.width;
+    if (C != 3 || H <= 0 || W <= 0)
+        return false;
+
+    auto th_r = ai2d_out_tensor_.impl()->to_host();
+    if (!th_r.is_ok())
+        return false;
+    nncase::tensor host_tensor = std::move(th_r.unwrap());
+    auto bh_r = host_tensor->buffer().as_host();
+    if (!bh_r.is_ok())
+        return false;
+    auto as_host = std::move(bh_r.unwrap());
+    auto map_r = as_host.map(map_access_::map_read);
+    if (!map_r.is_ok())
+        return false;
+    auto mapped = std::move(map_r.unwrap());
+    auto buf = mapped.buffer();
+    const size_t plane = static_cast<size_t>(H * W);
+    const size_t need = plane * static_cast<size_t>(C);
+    if (buf.size_bytes() < need)
+        return false;
+
+    const uint8_t *chw = reinterpret_cast<const uint8_t *>(buf.data());
+    bgr.create(H, W, CV_8UC3);
+    for (int y = 0; y < H; ++y)
+    {
+        for (int x = 0; x < W; ++x)
+        {
+            const size_t off = static_cast<size_t>(y * W + x);
+            const uint8_t rpx = chw[0 * plane + off];
+            const uint8_t gpx = chw[1 * plane + off];
+            const uint8_t bpx = chw[2 * plane + off];
+            bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(bpx, gpx, rpx);
+        }
+    }
+    return true;
 }
 
 bool FaceRecognition::inference()

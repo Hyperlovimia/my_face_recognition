@@ -3,3 +3,8 @@ build/
 build_codex/
 tmp/
 .idea/
+/.venv/
+/models_src/calib_npy/
+/models_src/nncase_dump/
+/host_test/
+/models_src/prep_debug.npy

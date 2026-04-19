@@ -20,4 +20,9 @@ include_directories(${nncase_sdk_root}/riscv64/nncase/include)
 include_directories(${nncase_sdk_root}/riscv64/nncase/include/nncase/runtime)
 link_directories(${nncase_sdk_root}/riscv64/nncase/lib/)
 
+# nncase 头文件 MODEL_IDENTIFIER = 'KMDL' 会触发 -Wmultichar，属第三方写法，抑制以免编译刷屏
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-multichar)
+endif()
+
 add_subdirectory(src) 

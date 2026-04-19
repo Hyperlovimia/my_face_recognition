@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,17 @@
 using std::cerr;
 using std::cout;
 using std::endl;
+
+static constexpr int k_register_preview_hold_ms = 2000;
+
+static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_bgra)
+{
+    if (preview_bgra.empty())
+        return;
+
+    cv::Rect roi(0, 0, preview_bgra.cols, preview_bgra.rows);
+    preview_bgra.copyTo(draw_frame(roi));
+}
 
 std::atomic<bool> isp_stop(false);
 // 注册人名称
@@ -79,53 +91,6 @@ bool install_exit_signal_handlers()
     }
 
     return true;
-}
-
-void convert_preview_to_osd_argb8888(const cv::Mat &src_preview, cv::Mat &dst_argb)
-{
-    dst_argb.create(src_preview.rows, src_preview.cols, CV_8UC4);
-    for (int y = 0; y < src_preview.rows; ++y) {
-        const cv::Vec3b *src_row = src_preview.ptr<cv::Vec3b>(y);
-        cv::Vec4b *dst_row = dst_argb.ptr<cv::Vec4b>(y);
-        for (int x = 0; x < src_preview.cols; ++x) {
-            // 当前预览图表现为 RGB 语义，因此按 R/G/B 顺序写入 ARGB8888。
-            dst_row[x][0] = 255;            // A
-            dst_row[x][1] = src_row[x][0];  // R
-            dst_row[x][2] = src_row[x][1];  // G
-            dst_row[x][3] = src_row[x][2];  // B
-        }
-    }
-}
-
-void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
-{
-    cv::Mat oriented_preview;
-    if (DISPLAY_ROTATE) {
-        // VO 视频层在竖屏面板上走 K_ROTATION_90，注册预览也保持同方向。
-        cv::rotate(dump_img, oriented_preview, cv::ROTATE_90_CLOCKWISE);
-    } else {
-        oriented_preview = dump_img;
-    }
-
-    const int preview_padding = 16;
-    const int preview_max_width = std::max(1, OSD_WIDTH / 2);
-    const int preview_max_height = std::max(1, OSD_HEIGHT / 2);
-    const double scale_x = static_cast<double>(preview_max_width) / oriented_preview.cols;
-    const double scale_y = static_cast<double>(preview_max_height) / oriented_preview.rows;
-    const double scale = std::min(scale_x, scale_y);
-    const int preview_width = std::max(1, static_cast<int>(oriented_preview.cols * scale));
-    const int preview_height = std::max(1, static_cast<int>(oriented_preview.rows * scale));
-
-    cv::Mat resized_preview;
-    cv::resize(oriented_preview, resized_preview, cv::Size(preview_width, preview_height));
-
-    cv::Mat resized_preview_argb;
-    convert_preview_to_osd_argb8888(resized_preview, resized_preview_argb);
-
-    const int offset_x = preview_padding;
-    const int offset_y = preview_padding;
-    const cv::Rect roi(offset_x, offset_y, preview_width, preview_height);
-    resized_preview_argb.copyTo(draw_frame(roi));
 }
 
 }  // namespace
@@ -217,6 +182,8 @@ try {
     int display_state=0;
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT,AI_FRAME_WIDTH , CV_8UC3);
+    cv::Mat register_preview_bgra;
+    auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
     while(!exit_requested()){
         // 创建一个ScopedTiming对象，用于计算总时间
@@ -273,6 +240,9 @@ try {
         //前处理，推理，后处理
         det_results.clear();
         rec_results.clear();
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool preview_active = !register_preview_bgra.empty() && now < register_preview_deadline;
 
         if(cur_state==-1){
             //不执行任何操作
@@ -452,7 +422,16 @@ try {
         }
         
         if(display_state==2){
-            render_register_preview(draw_frame, dump_img);
+            cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
+            cv::resize(dump_img, register_preview_bgra, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
+            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(preview_active){
+            render_register_preview(draw_frame, register_preview_bgra);
+        }
+        else if(!register_preview_bgra.empty()){
+            register_preview_bgra.release();
         }
         else{
             for (size_t i = 0; i < rec_results.size(); i++) {

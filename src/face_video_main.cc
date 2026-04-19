@@ -1,6 +1,7 @@
 /* RT-Smart: video capture + display process — VICAP/VO/OSD, talks to face_ai via IPC. */
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +100,7 @@ static std::atomic<uint64_t> g_metric_infer_rpc_ok{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_fail{0};
 static std::atomic<uint64_t> g_metric_infer_stale{0};
 static std::atomic<uint64_t> g_metric_infer_applied{0};
+static constexpr int k_register_preview_hold_ms = 2000;
 
 static bool metrics_log_enabled(int debug_mode)
 {
@@ -320,10 +322,11 @@ static void video_ipc_loop(int debug_mode)
     DumpRes dump_res;
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
-    /* display_state 跨迭代保留：注册态（display_state=2）必须一直显示预览，
-     * 直到 state==3 完成注册（或 state==1/4 被打断）才回到 0，
-     * 与单进程 main.cc 的行为保持一致。 */
+    /* display_state=2 进入后，缓存 dump_img 副本并保留 2 秒预览；超时或被 state==1/4 打断才回到 OSD 正常渲染。
+     * 副本保证旋转/缩放每帧从同一源重做，避免与 main.cc 单进程分支行为偏差。 */
     int display_state = 0;
+    cv::Mat register_preview_src;
+    auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
     PipeLine pl(debug_mode);
     if (pl.Create() != 0)
@@ -375,6 +378,8 @@ static void video_ipc_loop(int debug_mode)
         int state = cur_state.load();
         ipc_ai_reply_t ai_reply{};
         memset(&ai_reply, 0, sizeof(ai_reply));
+        const auto now = std::chrono::steady_clock::now();
+        const bool preview_active = !register_preview_src.empty() && now < register_preview_deadline;
 
         uint8_t *frame_ptr = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
         size_t frame_len = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
@@ -453,6 +458,47 @@ static void video_ipc_loop(int debug_mode)
             cur_state = 0;
             display_state = 0;
         }
+        /* 本帧抓拍并提交注册，避免「i」与姓名分开发送时 cur_state 被覆盖导致未抓拍 */
+        else if (state == 5)
+        {
+            draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+            dump_img.setTo(cv::Scalar(0, 0, 0));
+            sensor_bgr.clear();
+            uint8_t *cap = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
+            cv::Mat cap_R(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap);
+            cv::Mat cap_G(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap + AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
+            cv::Mat cap_B(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, cap + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH);
+            sensor_bgr.push_back(cap_B);
+            sensor_bgr.push_back(cap_G);
+            sensor_bgr.push_back(cap_R);
+            cv::merge(sensor_bgr, dump_img);
+
+            std::string name_copy;
+            {
+                std::lock_guard<std::mutex> lk(g_ui);
+                name_copy = register_name;
+            }
+            std::vector<uint8_t> chw_vec;
+            std::vector<cv::Mat> bgrChannels(3);
+            cv::split(dump_img, bgrChannels);
+            for (auto i = 2; i > -1; i--)
+            {
+                std::vector<uint8_t> row = std::vector<uint8_t>(bgrChannels[i].reshape(1, 1));
+                chw_vec.insert(chw_vec.end(), row.begin(), row.end());
+            }
+            uint32_t th = (uint32_t)dump_img.rows;
+            uint32_t tw = (uint32_t)dump_img.cols;
+            uint32_t tc = 3u;
+
+            ipc_ai_reply_t r{};
+            if (rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw, name_copy.c_str(),
+                            &r))
+            {
+                /* result printed in face_ai */
+            }
+            cur_state = 0;
+            display_state = 2;
+        }
         else if (state == 4)
         {
             ipc_ai_reply_t r{};
@@ -464,7 +510,18 @@ static void video_ipc_loop(int debug_mode)
 
         if (display_state == 2)
         {
-            render_register_preview(draw_frame, dump_img);
+            /* 首次进入注册预览：缓存 dump_img 副本，设定 2 秒过期时刻；旋转/缩放每帧按源重做。 */
+            register_preview_src = dump_img.clone();
+            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            render_register_preview(draw_frame, register_preview_src);
+        }
+        else if (preview_active)
+        {
+            render_register_preview(draw_frame, register_preview_src);
+        }
+        else if (!register_preview_src.empty())
+        {
+            register_preview_src.release();
         }
         else
         {
