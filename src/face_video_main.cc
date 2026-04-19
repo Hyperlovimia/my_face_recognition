@@ -1,4 +1,5 @@
 /* RT-Smart: video capture + display process — VICAP/VO/OSD, talks to face_ai via IPC. */
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -17,6 +18,56 @@
 #include "scoped_timing.h"
 #include "video_pipeline.h"
 #include "setting.h"
+
+namespace {
+
+/* 与 main.cc 的单进程分支保持一致：OSD 消费 ARGB8888 字节序，
+ * 且当前视频管线的三通道语义是 RGB 而非 BGR，故逐像素手工重排。 */
+void convert_preview_to_osd_argb8888(const cv::Mat &src_preview, cv::Mat &dst_argb)
+{
+    dst_argb.create(src_preview.rows, src_preview.cols, CV_8UC4);
+    for (int y = 0; y < src_preview.rows; ++y) {
+        const cv::Vec3b *src_row = src_preview.ptr<cv::Vec3b>(y);
+        cv::Vec4b *dst_row = dst_argb.ptr<cv::Vec4b>(y);
+        for (int x = 0; x < src_preview.cols; ++x) {
+            dst_row[x][0] = 255;            // A
+            dst_row[x][1] = src_row[x][0];  // R
+            dst_row[x][2] = src_row[x][1];  // G
+            dst_row[x][3] = src_row[x][2];  // B
+        }
+    }
+}
+
+/* 竖屏模式下 VO 视频层走 K_ROTATION_90；注册预览保持同方向，并限制在角落。 */
+void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
+{
+    cv::Mat oriented_preview;
+    if (DISPLAY_ROTATE) {
+        cv::rotate(dump_img, oriented_preview, cv::ROTATE_90_CLOCKWISE);
+    } else {
+        oriented_preview = dump_img;
+    }
+
+    const int preview_padding = 16;
+    const int preview_max_width = std::max(1, OSD_WIDTH / 2);
+    const int preview_max_height = std::max(1, OSD_HEIGHT / 2);
+    const double scale_x = static_cast<double>(preview_max_width) / oriented_preview.cols;
+    const double scale_y = static_cast<double>(preview_max_height) / oriented_preview.rows;
+    const double scale = std::min(scale_x, scale_y);
+    const int preview_width = std::max(1, static_cast<int>(oriented_preview.cols * scale));
+    const int preview_height = std::max(1, static_cast<int>(oriented_preview.rows * scale));
+
+    cv::Mat resized_preview;
+    cv::resize(oriented_preview, resized_preview, cv::Size(preview_width, preview_height));
+
+    cv::Mat resized_preview_argb;
+    convert_preview_to_osd_argb8888(resized_preview, resized_preview_argb);
+
+    const cv::Rect roi(preview_padding, preview_padding, preview_width, preview_height);
+    resized_preview_argb.copyTo(draw_frame(roi));
+}
+
+}  // namespace
 
 static std::atomic<bool> isp_stop(false);
 static std::atomic<int> cur_state(0);
@@ -245,11 +296,12 @@ static void ai_infer_worker_thread(int ai_ch)
             continue;
         }
         g_metric_infer_rpc_ok.fetch_add(1);
-        /* 推理期间若采集侧已推进 seq，则本结果已过时，丢弃，下一轮 wait 会立即满足 */
+        /* 推理期间若采集侧已推进 seq，仅记指标但仍应用本次结果，
+         * 否则在推理时间 > 采集间隔时 g_last_infer_reply 将永远得不到更新，
+         * 反映在 OSD 上就是“启动后看不到检测框”。 */
         if (snap != g_infer_capture_seq.load())
         {
             g_metric_infer_stale.fetch_add(1);
-            continue;
         }
 
         {
@@ -268,6 +320,10 @@ static void video_ipc_loop(int debug_mode)
     DumpRes dump_res;
     std::vector<cv::Mat> sensor_bgr(3);
     cv::Mat dump_img(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
+    /* display_state 跨迭代保留：注册态（display_state=2）必须一直显示预览，
+     * 直到 state==3 完成注册（或 state==1/4 被打断）才回到 0，
+     * 与单进程 main.cc 的行为保持一致。 */
+    int display_state = 0;
 
     PipeLine pl(debug_mode);
     if (pl.Create() != 0)
@@ -317,7 +373,6 @@ static void video_ipc_loop(int debug_mode)
         }
 
         int state = cur_state.load();
-        int display_state = 0;
         ipc_ai_reply_t ai_reply{};
         memset(&ai_reply, 0, sizeof(ai_reply));
 
@@ -344,7 +399,7 @@ static void video_ipc_loop(int debug_mode)
                 std::lock_guard<std::mutex> lk(g_infer_reply_mu);
                 memcpy(&ai_reply, &g_last_infer_reply, sizeof(ai_reply));
             }
-            ipc_draw_faces_osd(draw_frame, &ai_reply);
+            /* 框/文案在下方 if/else 统一绘制，避免与预览叠加。 */
         }
         else if (state == 1)
         {
@@ -352,6 +407,7 @@ static void video_ipc_loop(int debug_mode)
             if (rpc_ai_sync(ai_ch, IPC_CMD_DB_COUNT, nullptr, 0, 1, 1, 1, nullptr, &r))
                 std::cout << "当前注册人数：" << r.count << " 人。" << std::endl;
             cur_state = 0;
+            display_state = 0;
         }
         else if (state == 2)
         {
@@ -403,15 +459,16 @@ static void video_ipc_loop(int debug_mode)
             if (rpc_ai_sync(ai_ch, IPC_CMD_DB_RESET, nullptr, 0, 1, 1, 1, nullptr, &r))
                 std::cout << "人脸数据库已清空！" << std::endl;
             cur_state = 0;
+            display_state = 0;
         }
 
         if (display_state == 2)
         {
-            cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::Mat resized_dump;
-            cv::resize(dump_img, resized_dump, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
-            cv::Rect roi(0, 0, resized_dump.cols, resized_dump.rows);
-            resized_dump.copyTo(draw_frame(roi));
+            render_register_preview(draw_frame, dump_img);
+        }
+        else
+        {
+            ipc_draw_faces_osd(draw_frame, &ai_reply);
         }
 
         pl.InsertFrame(draw_frame.data);
