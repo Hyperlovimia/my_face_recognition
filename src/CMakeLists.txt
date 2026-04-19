@@ -20,7 +20,7 @@ include_directories(${k230_mpp_root}/include/comm)
 include_directories(${k230_mpp_root}/userapps/sample/sample_vo)
 link_directories(${nncase_sdk_root}/riscv64/rvvlib/)
 
-# 单进程原版（保留）
+# 单进程原版（保留，无活体 FaceAntiSpoof）
 add_executable(face_recognition.elf main.cc video_pipeline.cc ${common_ai_src})
 target_link_libraries(face_recognition.elf ${nncase_link} ${mpp_link} ${opencv_link})
 

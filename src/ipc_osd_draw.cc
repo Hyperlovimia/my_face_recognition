@@ -39,6 +39,13 @@ cv::Rect bbox_to_osd_rect(float bx, float by, float bw, float bh, int ref_w, int
     return cv::Rect(ix, iy, iw, ih);
 }
 
+/* OSD 缓冲按 ARGB8888 消费，OpenCV 这里只是“4 通道原始字节写入”，
+ * 因此颜色常量需要按 A,R,G,B 的字节顺序构造。 */
+cv::Scalar osd_argb(unsigned char a, unsigned char r, unsigned char g, unsigned char b)
+{
+    return cv::Scalar(a, r, g, b);
+}
+
 }  // namespace
 
 void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
@@ -58,7 +65,8 @@ void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
             continue;
 
         const bool spoof = (f.is_live == 0);
-        const cv::Scalar box_color = spoof ? cv::Scalar(0, 0, 255, 255) : cv::Scalar(255, 255, 255, 255);
+        const cv::Scalar box_color = spoof ? osd_argb(255, 255, 0, 0)
+                                           : osd_argb(255, 255, 255, 255);
         cv::rectangle(draw_img, rect, box_color, 2, 2, 0);
 
         char text[112];
@@ -66,18 +74,18 @@ void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
         {
             snprintf(text, sizeof(text), "SPOOF %.2f", f.liveness_real_score);
             cv::putText(draw_img, text, {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 0.9,
-                        cv::Scalar(0, 0, 255, 255), 1, 8, 0);
+                        osd_argb(255, 255, 0, 0), 1, 8, 0);
         }
         else if (f.rec.id == -1)
         {
             cv::putText(draw_img, "unknown", {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
-                        cv::Scalar(255, 0, 255, 255), 1, 8, 0);
+                        osd_argb(255, 255, 0, 255), 1, 8, 0);
         }
         else
         {
             snprintf(text, sizeof(text), "%s:%.2f", f.rec.name, f.rec.score);
             cv::putText(draw_img, text, {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
-                        cv::Scalar(255, 255, 0, 255), 1, 8, 0);
+                        osd_argb(255, 255, 255, 0), 1, 8, 0);
         }
     }
 }
