@@ -4,6 +4,43 @@
 #include <algorithm>
 #include <cstdio>
 
+namespace {
+
+cv::Rect bbox_to_osd_rect(float bx, float by, float bw, float bh, int ref_w, int ref_h, int dst_w, int dst_h)
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float w = 0.0f;
+    float h = 0.0f;
+
+    if (DISPLAY_ROTATE) {
+        x = (ref_h - (by + bh)) / ref_h * dst_w;
+        y = bx / ref_w * dst_h;
+        w = bh / ref_h * dst_w;
+        h = bw / ref_w * dst_h;
+    } else {
+        x = bx / ref_w * dst_w;
+        y = by / ref_h * dst_h;
+        w = bw / ref_w * dst_w;
+        h = bh / ref_h * dst_h;
+    }
+
+    int ix = std::max(0, static_cast<int>(x));
+    int iy = std::max(0, static_cast<int>(y));
+    int iw = std::max(1, static_cast<int>(w));
+    int ih = std::max(1, static_cast<int>(h));
+
+    if (ix >= dst_w || iy >= dst_h) {
+        return cv::Rect(0, 0, 0, 0);
+    }
+
+    iw = std::min(iw, dst_w - ix);
+    ih = std::min(ih, dst_h - iy);
+    return cv::Rect(ix, iy, iw, ih);
+}
+
+}  // namespace
+
 void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
 {
     if (!reply || reply->magic != IPC_MAGIC || reply->status != IPC_STATUS_OK)
@@ -15,24 +52,23 @@ void ipc_draw_faces_osd(cv::Mat &draw_img, const ipc_ai_reply_t *reply)
     for (int i = 0; i < reply->num_faces && i < IPC_MAX_FACES; i++)
     {
         const ipc_face_bundle_t &f = reply->faces[i];
-        float bx = f.bbox.x, by = f.bbox.y, bw = f.bbox.w, bh = f.bbox.h;
-        int x = (int)(bx / ref_w * draw_img.cols);
-        int y = (int)(by / ref_h * draw_img.rows);
-        int w = (int)(bw / ref_w * draw_img.cols);
-        int h = (int)(bh / ref_h * draw_img.rows);
+        cv::Rect rect = bbox_to_osd_rect(f.bbox.x, f.bbox.y, f.bbox.w, f.bbox.h,
+                                         ref_w, ref_h, draw_img.cols, draw_img.rows);
+        if (rect.width <= 0 || rect.height <= 0)
+            continue;
 
-        cv::rectangle(draw_img, cv::Rect(x, y, w, h), cv::Scalar(255, 255, 255, 255), 2, 2, 0);
+        cv::rectangle(draw_img, rect, cv::Scalar(255, 255, 255, 255), 2, 2, 0);
 
         char text[96];
         if (f.rec.id == -1)
         {
-            cv::putText(draw_img, "unknown", {x, std::max(y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
+            cv::putText(draw_img, "unknown", {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
                         cv::Scalar(255, 0, 255, 255), 1, 8, 0);
         }
         else
         {
             snprintf(text, sizeof(text), "%s:%.2f", f.rec.name, f.rec.score);
-            cv::putText(draw_img, text, {x, std::max(y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
+            cv::putText(draw_img, text, {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0,
                         cv::Scalar(255, 255, 0, 255), 1, 8, 0);
         }
     }

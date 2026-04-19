@@ -22,12 +22,14 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <algorithm>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
 #include <vector>
 #include "face_recognition.h"
+#include "setting.h"
 
 namespace {
 // K230 musl 下 std::filesystem::create_directories 可能静默抛异常，
@@ -52,6 +54,39 @@ bool ensure_dir_exists_posix(const char *path)
     }
     std::cerr << "mkdir(" << path << ") failed: errno=" << errno << std::endl;
     return false;
+}
+
+cv::Rect bbox_to_osd_rect(const Bbox &bbox, int ref_w, int ref_h, int dst_w, int dst_h)
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float w = 0.0f;
+    float h = 0.0f;
+
+    if (DISPLAY_ROTATE) {
+        x = (ref_h - (bbox.y + bbox.h)) / ref_h * dst_w;
+        y = bbox.x / ref_w * dst_h;
+        w = bbox.h / ref_h * dst_w;
+        h = bbox.w / ref_w * dst_h;
+    } else {
+        x = bbox.x / ref_w * dst_w;
+        y = bbox.y / ref_h * dst_h;
+        w = bbox.w / ref_w * dst_w;
+        h = bbox.h / ref_h * dst_h;
+    }
+
+    int ix = std::max(0, static_cast<int>(x));
+    int iy = std::max(0, static_cast<int>(y));
+    int iw = std::max(1, static_cast<int>(w));
+    int ih = std::max(1, static_cast<int>(h));
+
+    if (ix >= dst_w || iy >= dst_h) {
+        return cv::Rect(0, 0, 0, 0);
+    }
+
+    iw = std::min(iw, dst_w - ix);
+    ih = std::min(ih, dst_h - iy);
+    return cv::Rect(ix, iy, iw, ih);
 }
 }  // namespace
 
@@ -274,20 +309,21 @@ void FaceRecognition::draw_result(cv::Mat &src_img, Bbox &bbox, FaceRecognitionI
 	int src_w = src_img.cols;
 	int src_h = src_img.rows;
 	char text[30];
-	
-    int x = bbox.x / image_size_.width * src_w;
-    int y = bbox.y / image_size_.height * src_h;
-    int w = bbox.w / image_size_.width * src_w;
-    int h = bbox.h / image_size_.height * src_h;
-    cv::rectangle(src_img, cv::Rect(x, y , w, h), cv::Scalar(255, 255, 255, 255), 2, 2, 0);
+
+    cv::Rect rect = bbox_to_osd_rect(bbox, image_size_.width, image_size_.height, src_w, src_h);
+    if (rect.width <= 0 || rect.height <= 0) {
+        return;
+    }
+
+    cv::rectangle(src_img, rect, cv::Scalar(255, 255, 255, 255), 2, 2, 0);
     if (result.id==-1)
 	{
-        cv::putText(src_img, "unknown", {x, std::max(int(y - 10), 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0, cv::Scalar(255, 0, 255, 255), 1, 8, 0);
+        cv::putText(src_img, "unknown", {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0, cv::Scalar(255, 0, 255, 255), 1, 8, 0);
 	}
 	else
 	{
 		sprintf(text, "%s:%.2f", result.name.c_str(), result.score);
-        cv::putText(src_img, text, {x, std::max(int(y - 10), 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0, cv::Scalar(255, 255, 0, 255), 1, 8, 0);
+        cv::putText(src_img, text, {rect.x, std::max(rect.y - 10, 0)}, cv::FONT_HERSHEY_COMPLEX, 1.0, cv::Scalar(255, 255, 0, 255), 1, 8, 0);
 	}
 }
 
