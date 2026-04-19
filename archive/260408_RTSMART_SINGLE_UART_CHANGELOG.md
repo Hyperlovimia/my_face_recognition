@@ -230,16 +230,16 @@
 
 确认板端已有以下文件：
 
-- `/data/face_ai.elf`
-- `/data/face_video.elf`
-- `/data/face_event.elf`
-- `/data/face_detection_320.kmodel`
-- `/data/face_recognition.kmodel`
+- `/sharefs/face_ai.elf`
+- `/sharefs/face_video.elf`
+- `/sharefs/face_event.elf`
+- `/sharefs/face_detection_320.kmodel`
+- `/sharefs/face_recognition.kmodel`
 
 并确保数据库目录存在：
 
 ```sh
-mkdir /data/face_db
+mkdir /sharefs/face_db
 ```
 
 ### 6.3 正确启动顺序
@@ -247,9 +247,9 @@ mkdir /data/face_db
 请按以下顺序启动：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/face_recognition.kmodel 70 /data/face_db 0 &
-/data/face_video.elf 0 &
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.5 0.2 /sharefs/face_recognition.kmodel 70 /sharefs/face_db 0 &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 说明：

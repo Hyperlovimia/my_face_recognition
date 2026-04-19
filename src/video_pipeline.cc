@@ -221,7 +221,7 @@ int PipeLine::Create()
     printf("AI input private buffer: paddr=%lx vaddr=%p size=%zu\n",
            (unsigned long)ai_buf_paddr_, ai_buf_vaddr_, ai_buf_size_);
 
-    // NV12 → RGB HWC 中间缓冲。实际 VICAP chn1 交付 NV12 时，GetFrame 会在 CPU 侧
+    // YUV420SP → RGB HWC 中间缓冲。当前板端实测更接近 NV21/VU 排布，GetFrame 会在 CPU 侧
     // 先 cvtColor 到这块 H×W×3 的 HWC 图像，再按 R/G/B plane 写入 ai_buf。
     bgr_hwc_scratch_.create(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3);
     if (bgr_hwc_scratch_.empty()) {
@@ -616,17 +616,17 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         // ISP 直出 BGR planar（实际为 RGB CHW 布局）—— 直接搬运到私有缓存
         memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_);
     } else {
-        // NV12 → RGB HWC（cv::cvtColor） → R/G/B plane 解交错写入 ai_buf
+        // YUV420SP(NV21/VU) → RGB HWC（cv::cvtColor） → R/G/B plane 解交错写入 ai_buf
         //
-        // 1. 把 NV12 帧当作 (H*3/2) 行 × W 列的单通道 Mat
-        // 2. cv::COLOR_YUV2RGB_NV12 产出 H×W×3 的 RGB HWC
+        // 1. 把 YUV420SP 帧当作 (H*3/2) 行 × W 列的单通道 Mat
+        // 2. cv::COLOR_YUV2RGB_NV21 产出 H×W×3 的 RGB HWC
         // 3. 手动把 HWC 拆成 R/G/B plane 写入 ai_buf（CHW 布局，uint8）
         //
         // ai_buf 的 plane 次序按 ISP "BGR_888_PLANAR（实际RGB）" 约定：
         //   plane0 = R，plane1 = G，plane2 = B
         // main.cc 的注册路径和 AI tensor shape {3, H, W} 都基于这个约定。
-        cv::Mat nv12_view(AI_FRAME_HEIGHT * 3 / 2, AI_FRAME_WIDTH, CV_8UC1, dump_vaddr);
-        cv::cvtColor(nv12_view, bgr_hwc_scratch_, cv::COLOR_YUV2RGB_NV12);
+        cv::Mat yuv420sp_view(AI_FRAME_HEIGHT * 3 / 2, AI_FRAME_WIDTH, CV_8UC1, dump_vaddr);
+        cv::cvtColor(yuv420sp_view, bgr_hwc_scratch_, cv::COLOR_YUV2RGB_NV21);
 
         uint8_t *const ai_data = static_cast<uint8_t *>(ai_buf_vaddr_);
         uint8_t *const dst_r = ai_data + 0 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;

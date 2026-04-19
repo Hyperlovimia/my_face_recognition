@@ -22,6 +22,7 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -78,6 +79,53 @@ bool install_exit_signal_handlers()
     }
 
     return true;
+}
+
+void convert_preview_to_osd_argb8888(const cv::Mat &src_preview, cv::Mat &dst_argb)
+{
+    dst_argb.create(src_preview.rows, src_preview.cols, CV_8UC4);
+    for (int y = 0; y < src_preview.rows; ++y) {
+        const cv::Vec3b *src_row = src_preview.ptr<cv::Vec3b>(y);
+        cv::Vec4b *dst_row = dst_argb.ptr<cv::Vec4b>(y);
+        for (int x = 0; x < src_preview.cols; ++x) {
+            // 当前预览图表现为 RGB 语义，因此按 R/G/B 顺序写入 ARGB8888。
+            dst_row[x][0] = 255;            // A
+            dst_row[x][1] = src_row[x][0];  // R
+            dst_row[x][2] = src_row[x][1];  // G
+            dst_row[x][3] = src_row[x][2];  // B
+        }
+    }
+}
+
+void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
+{
+    cv::Mat oriented_preview;
+    if (DISPLAY_ROTATE) {
+        // VO 视频层在竖屏面板上走 K_ROTATION_90，注册预览也保持同方向。
+        cv::rotate(dump_img, oriented_preview, cv::ROTATE_90_CLOCKWISE);
+    } else {
+        oriented_preview = dump_img;
+    }
+
+    const int preview_padding = 16;
+    const int preview_max_width = std::max(1, OSD_WIDTH / 2);
+    const int preview_max_height = std::max(1, OSD_HEIGHT / 2);
+    const double scale_x = static_cast<double>(preview_max_width) / oriented_preview.cols;
+    const double scale_y = static_cast<double>(preview_max_height) / oriented_preview.rows;
+    const double scale = std::min(scale_x, scale_y);
+    const int preview_width = std::max(1, static_cast<int>(oriented_preview.cols * scale));
+    const int preview_height = std::max(1, static_cast<int>(oriented_preview.rows * scale));
+
+    cv::Mat resized_preview;
+    cv::resize(oriented_preview, resized_preview, cv::Size(preview_width, preview_height));
+
+    cv::Mat resized_preview_argb;
+    convert_preview_to_osd_argb8888(resized_preview, resized_preview_argb);
+
+    const int offset_x = preview_padding;
+    const int offset_y = preview_padding;
+    const cv::Rect roi(offset_x, offset_y, preview_width, preview_height);
+    resized_preview_argb.copyTo(draw_frame(roi));
 }
 
 }  // namespace
@@ -404,11 +452,7 @@ try {
         }
         
         if(display_state==2){
-            cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::Mat resized_dump;
-            cv::resize(dump_img, resized_dump, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
-            cv::Rect roi(0, 0, resized_dump.cols, resized_dump.rows);
-            resized_dump.copyTo(draw_frame(roi));
+            render_register_preview(draw_frame, dump_img);
         }
         else{
             for (size_t i = 0; i < rec_results.size(); i++) {
