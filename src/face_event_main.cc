@@ -198,7 +198,7 @@ int main(int argc, char **argv)
     print_help();
     std::cout << "输入 h/help 查看说明。\n";
 
-    std::string last_input;
+    bool awaiting_register_name = false;
     for (;;)
     {
         std::string input;
@@ -209,10 +209,13 @@ int main(int argc, char **argv)
         }
 
         if (input == "h" || input == "help")
+        {
+            awaiting_register_name = false;
             print_help();
+        }
         else if (input == "i")
         {
-            last_input = "i";
+            awaiting_register_name = true;
             send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 2, nullptr);
         }
         else if (input.size() >= 2 && input[0] == 'i' && (input[1] == ' ' || input[1] == '\t'))
@@ -224,30 +227,41 @@ int main(int argc, char **argv)
                 std::cout << "用法: i <姓名> — 使用当前画面一键注册\n";
             else
             {
-                last_input.clear();
+                awaiting_register_name = false;
                 send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 5, rest.c_str());
             }
         }
         else if (input == "d")
+        {
+            awaiting_register_name = false;
             send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 4, nullptr);
+        }
         else if (input == "n")
+        {
+            awaiting_register_name = false;
             send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 1, nullptr);
+        }
         else if (input == "q")
         {
             usleep(100000);
+            awaiting_register_name = false;
             send_video_ctrl(IPC_VIDEO_CTRL_OP_QUIT, 0, nullptr);
             break;
         }
-            else
+        else if (awaiting_register_name)
+        {
+            if (input.empty())
             {
-                if (last_input == "i")
-                {
-                    send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 3, input.c_str());
-                    last_input.clear();
-                }
-                else
-                    std::cout << "陌生人现场注册: 输入 i（抓拍后再输姓名），或 i <姓名> 一键注册。\n";
+                std::cout << "请输入姓名后再回车，或输入其他命令取消当前注册。\n";
+                continue;
             }
+            send_video_ctrl(IPC_VIDEO_CTRL_OP_SET, 3, input.c_str());
+            awaiting_register_name = false;
+        }
+        else if (!input.empty())
+        {
+            std::cout << "陌生人现场注册: 输入 i（抓拍后再输姓名），或 i <姓名> 一键注册。\n";
+        }
     }
 
     shutdown_event_process(evt_ch, fp);

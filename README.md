@@ -32,7 +32,7 @@ cd src/reference/ai_poc/my_face_recognition
 - `face_video.elf`
 - `face_event.elf`
 - `face_detection_320.kmodel`
-- `face_recognition.kmodel`
+- `GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel`
 - `face_antispoof.kmodel`，仅启用活体检测时需要
 
 ## RT-Smart 板端启动
@@ -42,13 +42,13 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 启用活体检测时，先后台启动 `face_ai.elf`，最后一个参数传入活体模型：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/face_recognition.kmodel 70 /data/face_db 0 /data/face_antispoof.kmodel &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 /data/face_antispoof.kmodel &
 ```
 
 暂不启用活体检测时，使用 8 参数启动 `face_ai.elf`：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/face_recognition.kmodel 70 /data/face_db 0 &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 &
 ```
 
 然后后台启动视频进程：
@@ -86,7 +86,7 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 | det_thres   | 人脸检测阈值，推荐 `0.5`          | 0.0~1.0      |
 | nms_thres   | 人脸检测 NMS 阈值，推荐 `0.2`    | 0.0~1.0      |
 | kmodel_recg | 人脸识别kmodel路径               | kmodel 路径         |
-| recg_thres  | 人脸识别阈值，推荐 `70`          | 0~100    |
+| recg_thres  | 人脸识别阈值，推荐 `60`          | 0~100    |
 | db_dir      | 数据库目录，推荐 `/data/face_db` | 数据库目录路径         |
 | debug_mode  | 是否需要调试，0、1、2分别表示不调试、简单调试、详细调试 | 0、1、2 |
 | face_antispoof.kmodel | 可选活体模型路径，存在且加载成功时启用活体 | kmodel 路径 |
@@ -98,7 +98,7 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 | 打印帮助说明       | ✔        |h/help|
 | dump注册帧       | ✔        |i|
 | 清空人脸数据库   | ✔        |d|
-| 人脸注册         | ✔        |输入人脸名称|
+| 人脸注册         | ✔        |i 后输入姓名 / i <姓名>|
 | 注册人数查询     | ✔        |n|
 | 退出程序         | ✔        |q / Ctrl+C|
 
