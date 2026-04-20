@@ -1,1 +1,1 @@
-./face_recognition.elf face_detection_320.kmodel 0.6 0.2 face_recognition.kmodel 75 face_db 0
+./face_recognition.elf face_detection_320.kmodel 0.6 0.2 GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 face_db 0

@@ -44,13 +44,52 @@ using std::endl;
 
 static constexpr int k_register_preview_hold_ms = 2000;
 
-static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_bgra)
+static void convert_preview_to_osd_argb8888(const cv::Mat &src_preview, cv::Mat &dst_argb)
 {
-    if (preview_bgra.empty())
+    dst_argb.create(src_preview.rows, src_preview.cols, CV_8UC4);
+    for (int y = 0; y < src_preview.rows; ++y) {
+        const cv::Vec3b *src_row = src_preview.ptr<cv::Vec3b>(y);
+        cv::Vec4b *dst_row = dst_argb.ptr<cv::Vec4b>(y);
+        for (int x = 0; x < src_preview.cols; ++x) {
+            // OSD 消费 ARGB8888；当前预览图通道语义按板端验证保持为 RGB。
+            dst_row[x][0] = 255;
+            dst_row[x][1] = src_row[x][0];
+            dst_row[x][2] = src_row[x][1];
+            dst_row[x][3] = src_row[x][2];
+        }
+    }
+}
+
+static void build_register_preview(const cv::Mat &dump_img, cv::Mat &preview_argb)
+{
+    cv::Mat oriented_preview;
+    if (DISPLAY_ROTATE) {
+        cv::rotate(dump_img, oriented_preview, cv::ROTATE_90_CLOCKWISE);
+    } else {
+        oriented_preview = dump_img;
+    }
+
+    const int preview_max_width = std::max(1, OSD_WIDTH / 2);
+    const int preview_max_height = std::max(1, OSD_HEIGHT / 2);
+    const double scale_x = static_cast<double>(preview_max_width) / oriented_preview.cols;
+    const double scale_y = static_cast<double>(preview_max_height) / oriented_preview.rows;
+    const double scale = std::min(scale_x, scale_y);
+    const int preview_width = std::max(1, static_cast<int>(oriented_preview.cols * scale));
+    const int preview_height = std::max(1, static_cast<int>(oriented_preview.rows * scale));
+
+    cv::Mat resized_preview;
+    cv::resize(oriented_preview, resized_preview, cv::Size(preview_width, preview_height));
+    convert_preview_to_osd_argb8888(resized_preview, preview_argb);
+}
+
+static void render_register_preview(cv::Mat &draw_frame, const cv::Mat &preview_argb)
+{
+    if (preview_argb.empty())
         return;
 
-    cv::Rect roi(0, 0, preview_bgra.cols, preview_bgra.rows);
-    preview_bgra.copyTo(draw_frame(roi));
+    const int preview_padding = 16;
+    cv::Rect roi(preview_padding, preview_padding, preview_argb.cols, preview_argb.rows);
+    preview_argb.copyTo(draw_frame(roi));
 }
 
 std::atomic<bool> isp_stop(false);
@@ -449,8 +488,7 @@ try {
         }
         
         if(display_state==2){
-            cv::cvtColor(dump_img, dump_img, cv::COLOR_BGR2BGRA);
-            cv::resize(dump_img, register_preview_bgra, cv::Size(OSD_WIDTH / 2, OSD_HEIGHT / 2));
+            build_register_preview(dump_img, register_preview_bgra);
             register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
             render_register_preview(draw_frame, register_preview_bgra);
         }
