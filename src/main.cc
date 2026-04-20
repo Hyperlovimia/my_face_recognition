@@ -276,19 +276,46 @@ try {
                 first_frame_logged = true;
             }
             face_det.post_process(image_size,det_results);
+            if (debug_mode > 0 && !det_results.empty()) {
+                std::cerr << "[stage] face_det.post_process produced " << det_results.size()
+                          << " face(s)" << std::endl;
+                std::cerr.flush();
+            }
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
             for (int i = 0; i < det_results.size(); ++i)
             {
+                if (debug_mode > 0) {
+                    const auto &bbox = det_results[i].bbox;
+                    std::cerr << "[stage] face[" << i << "] enter face_recg.pre_process bbox=("
+                              << bbox.x << "," << bbox.y << "," << bbox.w << "," << bbox.h << ")"
+                              << std::endl;
+                    std::cerr.flush();
+                }
                 if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points)) {
                     std::cout << "FaceRecognition pre_process failed, skip current face" << std::endl;
                     continue;
+                }
+                if (debug_mode > 0) {
+                    std::cerr << "[stage] face[" << i << "] face_recg.pre_process OK, entering inference"
+                              << std::endl;
+                    std::cerr.flush();
                 }
                 if (!face_recg.inference()) {
                     std::cout << "FaceRecognition inference failed, skip current face" << std::endl;
                     continue;
                 }
+                if (debug_mode > 0) {
+                    std::cerr << "[stage] face[" << i << "] face_recg.inference OK, entering database_search"
+                              << std::endl;
+                    std::cerr.flush();
+                }
                 FaceRecognitionInfo recg_result;
                 face_recg.database_search(recg_result);
+                if (debug_mode > 0) {
+                    std::cerr << "[stage] face[" << i << "] database_search OK, name="
+                              << recg_result.name << " score=" << recg_result.score << std::endl;
+                    std::cerr.flush();
+                }
                 rec_results.push_back(recg_result);
             }
         }

@@ -24,6 +24,7 @@
  */
 #include <algorithm>
 #include <dirent.h>
+#include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -89,6 +90,34 @@ cv::Rect bbox_to_osd_rect(const Bbox &bbox, int ref_w, int ref_h, int dst_w, int
     ih = std::min(ih, dst_h - iy);
     return cv::Rect(ix, iy, iw, ih);
 }
+
+std::string shape_to_string(const std::vector<int> &shape)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i)
+    {
+        if (i)
+            oss << ",";
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string sparse_points_to_string(const float *sparse_points)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < 10; ++i)
+    {
+        if (i)
+            oss << ",";
+        oss << sparse_points[i];
+    }
+    oss << "]";
+    return oss.str();
+}
 }  // namespace
 
 using namespace nncase::runtime;
@@ -100,9 +129,38 @@ FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize i
 	obj_thresh_ = thresh;
 	valid_register_face_ = 0;
 	image_size_ = image_size;
-	input_size_={input_shapes_[0][1],input_shapes_[0][2],input_shapes_[0][3]};
+    const std::vector<int> &raw_input_shape = input_shapes_[0];
+    input_is_nhwc_ = raw_input_shape.size() == 4 && raw_input_shape[1] != 3 && raw_input_shape[3] == 3;
+    if (input_is_nhwc_)
+    {
+        input_size_ = {static_cast<size_t>(raw_input_shape[3]), static_cast<size_t>(raw_input_shape[1]),
+                       static_cast<size_t>(raw_input_shape[2])};
+    }
+    else
+    {
+	    input_size_={input_shapes_[0][1],input_shapes_[0][2],input_shapes_[0][3]};
+    }
 	feature_num_ = output_shapes_[0][1];
 	ai2d_out_tensor_ = get_input_tensor(0);
+
+    if (debug_mode_ > 0)
+    {
+        std::cerr << "[recg_ctor] raw input shape=" << shape_to_string(raw_input_shape)
+                  << ", code assumes NCHW and interprets input_size as C="
+                  << input_size_.channel << " H=" << input_size_.height
+                  << " W=" << input_size_.width << std::endl;
+        if (raw_input_shape.size() == 4 && raw_input_shape[1] != 3 && raw_input_shape[3] == 3)
+        {
+            std::cerr << "[recg_ctor] WARNING: model input looks NHWC; if so, expected logical CHW would be C=3 H="
+                      << raw_input_shape[1] << " W=" << raw_input_shape[2]
+                      << ", runtime will switch to RGB_packed/NHWC affine output for this model." << std::endl;
+        }
+        if (!output_shapes_.empty())
+        {
+            std::cerr << "[recg_ctor] output[0] shape=" << shape_to_string(output_shapes_[0]) << std::endl;
+        }
+        std::cerr.flush();
+    }
 }
 
 FaceRecognition::~FaceRecognition()
@@ -113,9 +171,36 @@ FaceRecognition::~FaceRecognition()
 bool FaceRecognition::pre_process(runtime_tensor& input_tensor, float *sparse_points)
 {
 	ScopedTiming st(model_name_ + " pre_process", debug_mode_);
+    if (debug_mode_ > 0)
+    {
+        std::cerr << "[recg_pre] preparing affine for model input C=" << input_size_.channel
+                  << " H=" << input_size_.height << " W=" << input_size_.width
+                  << ", sparse_points=" << sparse_points_to_string(sparse_points) << std::endl;
+        std::cerr.flush();
+    }
 	get_affine_matrix(sparse_points);
-	Utils::affine_set(image_size_, input_size_,ai2d_builder_, matrix_dst_);
+    if (debug_mode_ > 0)
+    {
+        std::cerr << "[recg_pre] affine matrix=["
+                  << matrix_dst_[0] << "," << matrix_dst_[1] << "," << matrix_dst_[2] << ","
+                  << matrix_dst_[3] << "," << matrix_dst_[4] << "," << matrix_dst_[5] << "]"
+                  << std::endl;
+        std::cerr.flush();
+    }
+	Utils::affine_set(image_size_, input_size_, ai2d_builder_, matrix_dst_, input_is_nhwc_);
+    if (debug_mode_ > 0)
+    {
+        std::cerr << "[recg_pre] ai2d builder ready, invoking affine warp now"
+                  << " (output_layout=" << (input_is_nhwc_ ? "NHWC/RGB_packed" : "NCHW/RGB_planar") << ")"
+                  << std::endl;
+        std::cerr.flush();
+    }
 	auto r = ai2d_builder_->invoke(input_tensor, ai2d_out_tensor_);
+    if (debug_mode_ > 0)
+    {
+        std::cerr << "[recg_pre] ai2d invoke result=" << (r.is_ok() ? "ok" : "fail") << std::endl;
+        std::cerr.flush();
+    }
 	return r.is_ok();
 }
 
@@ -145,16 +230,33 @@ bool FaceRecognition::aligned_face_to_bgr(cv::Mat &bgr) const
     if (buf.size_bytes() < need)
         return false;
 
-    const uint8_t *chw = reinterpret_cast<const uint8_t *>(buf.data());
     bgr.create(H, W, CV_8UC3);
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(buf.data());
+
+    if (input_is_nhwc_)
+    {
+        for (int y = 0; y < H; ++y)
+        {
+            for (int x = 0; x < W; ++x)
+            {
+                const size_t off = static_cast<size_t>((y * W + x) * C);
+                const uint8_t rpx = src[off + 0];
+                const uint8_t gpx = src[off + 1];
+                const uint8_t bpx = src[off + 2];
+                bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(bpx, gpx, rpx);
+            }
+        }
+        return true;
+    }
+
     for (int y = 0; y < H; ++y)
     {
         for (int x = 0; x < W; ++x)
         {
             const size_t off = static_cast<size_t>(y * W + x);
-            const uint8_t rpx = chw[0 * plane + off];
-            const uint8_t gpx = chw[1 * plane + off];
-            const uint8_t bpx = chw[2 * plane + off];
+            const uint8_t rpx = src[0 * plane + off];
+            const uint8_t gpx = src[1 * plane + off];
+            const uint8_t bpx = src[2 * plane + off];
             bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(bpx, gpx, rpx);
         }
     }

@@ -210,8 +210,10 @@ void Utils::ratio_resize_set(FrameCHWSize input_shape, int max_size, std::unique
     builder->build_schedule();
 }
 
-void Utils::affine_set(FrameCHWSize input_shape, FrameCHWSize output_shape, std::unique_ptr<ai2d_builder> &builder,float *affine_matrix){
-    ai2d_datatype_t ai2d_dtype{ai2d_format::NCHW_FMT, ai2d_format::NCHW_FMT, typecode_t::dt_uint8, typecode_t::dt_uint8};
+void Utils::affine_set(FrameCHWSize input_shape, FrameCHWSize output_shape, std::unique_ptr<ai2d_builder> &builder,
+                       float *affine_matrix, bool output_nhwc){
+    ai2d_datatype_t ai2d_dtype{ai2d_format::NCHW_FMT, output_nhwc ? ai2d_format::RGB_packed : ai2d_format::NCHW_FMT,
+                               typecode_t::dt_uint8, typecode_t::dt_uint8};
     ai2d_crop_param_t crop_param{false, 0, 0, 0, 0};
     ai2d_shift_param_t shift_param{false, 0};
     ai2d_pad_param_t pad_param{false, {{0, 0}, {0, 0}, {0, 0}, {10, 0}}, ai2d_pad_mode::constant, {255, 10, 5}};
@@ -219,7 +221,9 @@ void Utils::affine_set(FrameCHWSize input_shape, FrameCHWSize output_shape, std:
     ai2d_affine_param_t affine_param{true, ai2d_interp_method::cv2_bilinear, 0, 0, 127, 1, {affine_matrix[0], affine_matrix[1], affine_matrix[2], affine_matrix[3], affine_matrix[4], affine_matrix[5]}};
 
     dims_t in_shape = {1,3,input_shape.height,input_shape.width};
-    dims_t out_shape = {1,3,output_shape.height,output_shape.width};
+    dims_t out_shape = output_nhwc
+                           ? dims_t{1, output_shape.height, output_shape.width, output_shape.channel}
+                           : dims_t{1, output_shape.channel, output_shape.height, output_shape.width};
     builder.reset(new ai2d_builder(in_shape, out_shape, ai2d_dtype, crop_param, shift_param, pad_param, resize_param, affine_param));
     builder->build_schedule();
 }

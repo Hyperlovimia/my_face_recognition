@@ -188,6 +188,7 @@ private:
     
     FrameCHWSize image_size_;                     
     FrameCHWSize input_size_;
+    bool input_is_nhwc_ = false;
     float matrix_dst_[10];                       // 人脸affine的变换矩阵
     int feature_num_;                             // 人脸识别提取特征长度
     float obj_thresh_;                            // 人脸识别阈值

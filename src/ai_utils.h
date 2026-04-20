@@ -251,7 +251,8 @@ public:
 
     static void ratio_resize_set(FrameCHWSize input_shape, int max_size, std::unique_ptr<ai2d_builder> &builder);
 
-    static void affine_set(FrameCHWSize input_shape, FrameCHWSize output_shape,  std::unique_ptr<ai2d_builder> &builder,float *affine_matrix);
+    static void affine_set(FrameCHWSize input_shape, FrameCHWSize output_shape, std::unique_ptr<ai2d_builder> &builder,
+                           float *affine_matrix, bool output_nhwc = false);
 
     //------------------------------cv::Mat处理---------------------------------------------------------------
     static cv::Mat padding_resize(cv::Mat &img, FrameCHWSize &frame_size, cv::Scalar &padding_value);
