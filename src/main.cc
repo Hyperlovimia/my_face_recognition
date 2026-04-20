@@ -540,7 +540,7 @@ int main(int argc, char *argv[])
 
     std::thread thread_isp(video_proc, argv);
     // 命令行输入处理主循环
-    std::string last_input = "";
+    bool awaiting_register_name = false;
     sleep(2);
     // 输入提示信息
     std::cout << "输入 'h' 或 'help' 并回车 查看命令说明" << std::endl;
@@ -574,34 +574,37 @@ int main(int argc, char *argv[])
         else if (input == "i") {
             // 进入注册模式
             cur_state = 2; 
-            last_input="i";
+            awaiting_register_name = true;
         }
         else if (input == "d") {
             // 清空人脸数据库
             cur_state = 4;      
-            last_input = "d";
+            awaiting_register_name = false;
         }
         else if (input == "n") {
             // 查询已注册人数
             cur_state = 1;
-            last_input = "n";
+            awaiting_register_name = false;
         }
         else if (input == "q") {
             usleep(100000);     
+            awaiting_register_name = false;
             isp_stop.store(true);      
             break;
         }
-        else {
-            // 其他输入处理
-            if (last_input == "i") {
-                // 上一次为注册命令，现在应是用户输入姓名
-                register_name = input;
-                cur_state = 3;   // 注册确认阶段
+        else if (awaiting_register_name) {
+            // 进入注册模式后，下一行非空输入作为姓名提交。
+            if (input.empty()) {
+                std::cout << "请输入姓名后再回车，或输入其他命令取消当前注册。" << std::endl;
+                continue;
             }
-            else {
-                // 未进入注册模式却输入姓名
-                std::cout << "请先输入 'i' 并回车以进入注册模式！" << std::endl;
-            }
+            register_name = input;
+            cur_state = 3;   // 注册确认阶段
+            awaiting_register_name = false;
+        }
+        else if (!input.empty()) {
+            // 未进入注册模式却输入姓名
+            std::cout << "请先输入 'i' 并回车以进入注册模式！" << std::endl;
         }
     }
 
