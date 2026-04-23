@@ -12,6 +12,15 @@
 
 ## 编译
 
+若 `make prepare_sourcecode` 报 `gzip: stdin: unexpected end of file`，是 **网络把压缩包下断了**；官方用 `wget | tar` 流式解压，容易失败。可改用本目录脚本 **分步下载再解压**（与 Makefile 中 kmodel / nncase / utils 地址一致，支持续传到 `k230_sdk/.k230_download_cache/`）：
+
+```bash
+cd src/reference/ai_poc/my_face_recognition
+chmod +x download_prepare_bundles.sh
+./download_prepare_bundles.sh
+./build_app.sh
+```
+
 在开发机 SDK 环境中执行：
 
 ```bash
@@ -25,6 +34,28 @@ cd src/reference/ai_poc/my_face_recognition
 ```
 
 项目必须位于 `k230_sdk/src/reference/ai_poc/my_face_recognition`。
+
+## 小核 Linux 网关（可选）
+
+小核（Buildroot）上跑的 HTTP 服务 **`face_gateway`** 与本人脸工程放在**同一仓库**，源码目录为：
+
+- `src/little/`（`CMakeLists.txt`、HTTP + IPCMSG 客户端）
+
+在完整 SDK 中通过 **Buildroot 包** `src/little/buildroot-ext/package/face_gateway` 编进小核根文件系统；业务路径已指向上述 `src/little`，无需再维护独立的 `face_gateway` 工程目录。
+
+- 上板/联调/与大核 `face_ctrl` 规划：见 `archive/260423_FACE_GATEWAY_USAGE_AND_REMOTE_TEST_PLAN.md`
+- 小核侧说明与接口列表：见 `src/little/README.md`
+
+```bash
+# 小核上仅测 HTTP、无大核 IPC 时
+face_gateway --no-ipc
+# 无板子时联调 API 与网页（模拟 IPC 发送，不访问 /dev/ipcm_user）
+face_gateway --mock
+```
+
+大核三进程（`face_ai` / `face_video` / `face_event`）仍由下面的 `./build_app.sh` 与 RT-Smart 侧启动，与小核为**不同 CPU/系统**；通过 `/sharefs` 与后续 IPCMSG 协作。
+
+## 大核 RT-Smart 产物
 
 生成的编译产物在 `k230_bin` 目录中。将以下文件按需同步到板端 `/data`：
 
