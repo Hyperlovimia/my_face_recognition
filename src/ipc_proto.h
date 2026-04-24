@@ -13,7 +13,7 @@
 #define IPC_FACE_VIDEO_REPLY "face_video_reply"
 
 #define IPC_FACE_BRIDGE_SERVICE "face_bridge"
-#define IPC_FACE_BRIDGE_PORT 2301u
+#define IPC_FACE_BRIDGE_PORT 301u
 #define IPC_FACE_BRIDGE_MODULE 1u
 
 #define IPC_MAX_FACES 8

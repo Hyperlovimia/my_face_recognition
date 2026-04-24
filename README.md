@@ -130,7 +130,7 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 `face_event.elf` 现在除了保留串口入口，还会启动一个 `IPCMSG` 服务：
 
 - 服务名：`face_bridge`
-- 端口：`2301`
+- 端口：`301`
 - 连接方：Linux 小核 `face_netd`
 
 远程命令固定为：
