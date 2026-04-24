@@ -1,7 +1,11 @@
 PROJECT_ROOT := $(abspath ..)
 SDK_ROOT ?= $(abspath $(PROJECT_ROOT)/../../../../)
-TOOLCHAIN_ROOT ?= $(SDK_ROOT)/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin
-CROSS_COMPILE ?= $(TOOLCHAIN_ROOT)/riscv64-unknown-linux-musl-
+TOOLCHAIN_ROOT ?= $(SDK_ROOT)/toolchain/Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V2.6.0/bin
+CROSS_COMPILE ?= $(TOOLCHAIN_ROOT)/riscv64-unknown-linux-gnu-
+STATIC ?= 0
+DEBUG ?= 0
+DO_STRIP ?= 1
+
 CC := $(CROSS_COMPILE)gcc
 CXX := $(CROSS_COMPILE)g++
 AR := $(CROSS_COMPILE)ar
@@ -14,7 +18,14 @@ MPP_INCLUDE := $(SDK_ROOT)/src/big/mpp/include
 OUT_DIR := $(PROJECT_ROOT)/linux_bridge/out
 TARGET := $(OUT_DIR)/face_netd
 
-CFLAGS := -O2 -pipe -static -ffunction-sections -fdata-sections
+ifeq ($(DEBUG),1)
+OPT_FLAGS := -O0 -g3 -fno-omit-frame-pointer
+DO_STRIP := 0
+else
+OPT_FLAGS := -O2
+endif
+
+CFLAGS := $(OPT_FLAGS) -pipe -ffunction-sections -fdata-sections
 CXXFLAGS := $(CFLAGS) -std=c++17
 CPPFLAGS := \
 	-I$(PROJECT_ROOT)/src \
@@ -22,8 +33,13 @@ CPPFLAGS := \
 	-I$(PROJECT_ROOT)/linux_bridge/third_party/mongoose \
 	-I$(IPCMSG_ROOT)/include \
 	-I$(MPP_INCLUDE)
-LDFLAGS := -static -Wl,--gc-sections
+LDFLAGS := -Wl,--gc-sections
 LDLIBS := $(IPCMSG_LIB) -lpthread -latomic
+
+ifeq ($(STATIC),1)
+CFLAGS += -static
+LDFLAGS += -static
+endif
 
 OBJS := $(OUT_DIR)/main.o $(OUT_DIR)/mongoose.o
 
@@ -42,7 +58,10 @@ $(OUT_DIR)/mongoose.o: $(PROJECT_ROOT)/linux_bridge/third_party/mongoose/mongoos
 
 $(TARGET): $(OBJS) $(IPCMSG_LIB)
 	$(CXX) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
+
+ifneq ($(DO_STRIP),0)
 	$(STRIP) $@
+endif
 
 clean:
 	rm -rf $(OUT_DIR)

@@ -153,6 +153,12 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_br
 ./build_face_netd.sh
 ```
 
+说明：
+
+- 默认是动态链接构建（`STATIC=0`）。
+- 如果需要静态链接：`STATIC=1 ./build_face_netd.sh`
+- 如果需要调试符号并保留符号表：`DEBUG=1 DO_STRIP=0 ./build_face_netd.sh`
+
 将以下文件复制到板端 `/sharefs/face_bridge/`：
 
 - `linux_bridge/out/face_netd`
