@@ -1,6 +1,14 @@
-# 项目 build 流程
+# CLAUDE.md
 
-当项目使用 k230_sdk 时，采取以下方法编译项目
+## K230 SDK 参考文档
+
+执行 K230 SDK 相关任务前优先查阅文档
+[K230 SDK 官方文档](https://www.kendryte.com/k230/zh/main/index.html)
+[K230核间通讯API参考](https://www.kendryte.com/k230/zh/main/01_software/board/cdk/K230_%E6%A0%B8%E9%97%B4%E9%80%9A%E8%AE%AF_API%E5%8F%82%E8%80%83.html)
+
+# 项目构建流程
+
+本项目需要使用 Docker 环境编译项目，具体方法如下
 
 ## 进入 Kmodel 模型转换环境
 ```sh
