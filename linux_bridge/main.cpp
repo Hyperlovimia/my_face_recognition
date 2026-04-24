@@ -29,6 +29,7 @@ namespace {
 constexpr const char *kSchema = "k230.face.bridge.v1";
 constexpr int kIpcRemoteIdLinux = 1;
 constexpr int kMqttPollMs = 200;
+constexpr int kMqttConnectTimeoutMs = 10000;
 constexpr size_t kMaxQueueDepth = 512;
 
 struct Config {
@@ -67,6 +68,10 @@ struct Runtime {
     std::atomic<int> ipc_id{-1};
     std::atomic<int> db_count{-1};
     std::atomic<uint64_t> last_rt_seen_ms{0};
+    std::atomic<uint64_t> mqtt_dial_start_ms{0};
+    std::atomic<uint64_t> mqtt_last_progress_ms{0};
+    std::atomic<uint64_t> mqtt_last_pending_log_ms{0};
+    std::atomic<uint32_t> mqtt_connect_attempts{0};
 
     std::mutex out_mu;
     std::deque<PublishItem> outbox;
@@ -685,51 +690,9 @@ void parse_and_enqueue_command(mg_str json)
     enqueue_command(PendingCmd{request_id_s, bridge_cmd, name_s});
 }
 
-void mqtt_event_handler(mg_connection *c, int ev, void *ev_data)
+void mqtt_send_login(mg_connection *c)
 {
-    switch (ev)
-    {
-    case MG_EV_OPEN:
-        break;
-    case MG_EV_ERROR:
-        std::cerr << "face_netd: mqtt error: " << (ev_data ? static_cast<char *>(ev_data) : "unknown") << std::endl;
-        break;
-    case MG_EV_CLOSE:
-        g_rt.mqtt_connected.store(false);
-        if (g_mqtt == c)
-            g_mqtt = nullptr;
-        break;
-    case MG_EV_MQTT_OPEN:
-    {
-        g_rt.mqtt_connected.store(true);
-        g_mqtt = c;
-        mg_mqtt_opts sub{};
-        const std::string down_topic = topic_down_cmd();
-        sub.topic = mg_str(down_topic.c_str());
-        sub.qos = 1;
-        mg_mqtt_sub(c, &sub);
-        enqueue_status_publish(true, true);
-        std::cout << "face_netd: mqtt connected " << g_rt.cfg.mqtt_url << std::endl;
-        break;
-    }
-    case MG_EV_MQTT_MSG:
-    {
-        mg_mqtt_message *mm = static_cast<mg_mqtt_message *>(ev_data);
-        if (!mm)
-            break;
-        if (mg_strcmp(mm->topic, mg_str(topic_down_cmd().c_str())) != 0)
-            break;
-        parse_and_enqueue_command(mm->data);
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-void maybe_connect_mqtt()
-{
-    if (g_mqtt || g_rt.stop.load())
+    if (!c)
         return;
 
     mg_mqtt_opts opts{};
@@ -746,7 +709,191 @@ void maybe_connect_mqtt()
     opts.topic = mg_str(will_topic.c_str());
     opts.message = mg_str(will_payload.c_str());
 
-    g_mqtt = mg_mqtt_connect(&g_mgr, g_rt.cfg.mqtt_url.c_str(), &opts, mqtt_event_handler, nullptr);
+    g_rt.mqtt_last_progress_ms.store(now_ms());
+    std::cout << "face_netd: mqtt event CONNECT id=" << c->id << " send CONNECT client_id=" << g_rt.cfg.mqtt_client_id
+              << " keepalive=" << g_rt.cfg.mqtt_keepalive_s << "s will_topic=" << will_topic << std::endl;
+    mg_mqtt_login(c, &opts);
+}
+
+void mqtt_handle_read(mg_connection *c)
+{
+    if (!c)
+        return;
+
+    for (;;)
+    {
+        mg_mqtt_message mm{};
+        const int rc = mg_mqtt_parse(c->recv.buf, c->recv.len, 4, &mm);
+        if (rc == MQTT_MALFORMED)
+        {
+            std::cerr << "face_netd: mqtt malformed packet, closing connection" << std::endl;
+            c->is_closing = 1;
+            break;
+        }
+        if (rc != MQTT_OK)
+            break;
+
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        std::cout << "face_netd: mqtt packet cmd=" << static_cast<int>(mm.cmd) << " len=" << mm.dgram.len << std::endl;
+
+        switch (mm.cmd)
+        {
+        case MQTT_CMD_CONNACK:
+            if (mm.ack != 0)
+            {
+                std::cerr << "face_netd: mqtt connack failed code=" << static_cast<int>(mm.ack) << std::endl;
+                c->is_closing = 1;
+                break;
+            }
+
+            g_rt.mqtt_connected.store(true);
+            g_mqtt = c;
+            {
+                mg_mqtt_opts sub{};
+                const std::string down_topic = topic_down_cmd();
+                sub.topic = mg_str(down_topic.c_str());
+                sub.qos = 1;
+                mg_mqtt_sub(c, &sub);
+            }
+            enqueue_status_publish(true, true);
+            std::cout << "face_netd: mqtt connected " << g_rt.cfg.mqtt_url << std::endl;
+            break;
+
+        case MQTT_CMD_PUBLISH:
+            if (mm.qos > 0)
+            {
+                uint16_t id = mg_ntohs(mm.id);
+                mg_mqtt_send_header(c, MQTT_CMD_PUBACK, 0, sizeof(id));
+                mg_send(c, &id, sizeof(id));
+            }
+            if (mg_strcmp(mm.topic, mg_str(topic_down_cmd().c_str())) == 0)
+                parse_and_enqueue_command(mm.data);
+            break;
+
+        case MQTT_CMD_PUBREC:
+        {
+            uint16_t id = mg_ntohs(mm.id);
+            mg_mqtt_send_header(c, MQTT_CMD_PUBREL, 2, sizeof(id));
+            mg_send(c, &id, sizeof(id));
+            break;
+        }
+
+        case MQTT_CMD_PUBREL:
+        {
+            uint16_t id = mg_ntohs(mm.id);
+            mg_mqtt_send_header(c, MQTT_CMD_PUBCOMP, 0, sizeof(id));
+            mg_send(c, &id, sizeof(id));
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        mg_iobuf_del(&c->recv, 0, mm.dgram.len);
+    }
+}
+
+void mqtt_event_handler(mg_connection *c, int ev, void *ev_data)
+{
+    switch (ev)
+    {
+    case MG_EV_OPEN:
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        std::cout << "face_netd: mqtt event OPEN id=" << c->id << " url=" << g_rt.cfg.mqtt_url << std::endl;
+        break;
+    case MG_EV_RESOLVE:
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        std::cout << "face_netd: mqtt event RESOLVE id=" << c->id << std::endl;
+        break;
+    case MG_EV_CONNECT:
+        mqtt_send_login(c);
+        break;
+    case MG_EV_READ:
+    {
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        long *n = static_cast<long *>(ev_data);
+        std::cout << "face_netd: mqtt event READ id=" << c->id << " bytes=" << (n ? *n : -1)
+                  << " recv_len=" << c->recv.len << std::endl;
+        mqtt_handle_read(c);
+        break;
+    }
+    case MG_EV_WRITE:
+    {
+        if (!g_rt.mqtt_connected.load())
+        {
+            g_rt.mqtt_last_progress_ms.store(now_ms());
+            long *n = static_cast<long *>(ev_data);
+            std::cout << "face_netd: mqtt event WRITE id=" << c->id << " bytes=" << (n ? *n : -1)
+                      << " send_pending=" << c->send.len << std::endl;
+        }
+        break;
+    }
+    case MG_EV_ERROR:
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        std::cerr << "face_netd: mqtt error: " << (ev_data ? static_cast<char *>(ev_data) : "unknown") << std::endl;
+        break;
+    case MG_EV_CLOSE:
+        g_rt.mqtt_connected.store(false);
+        if (g_mqtt == c)
+            g_mqtt = nullptr;
+        g_rt.mqtt_last_progress_ms.store(now_ms());
+        std::cout << "face_netd: mqtt event CLOSE id=" << c->id << " connected=" << g_rt.mqtt_connected.load()
+                  << " state(resolving=" << c->is_resolving << ",connecting=" << c->is_connecting
+                  << ",send=" << c->send.len << ",recv=" << c->recv.len << ")" << std::endl;
+        break;
+    default:
+        break;
+    }
+}
+
+void maybe_log_mqtt_pending()
+{
+    mg_connection *c = g_mqtt;
+    if (!c || g_rt.mqtt_connected.load())
+        return;
+
+    const uint64_t now = now_ms();
+    const uint64_t last = g_rt.mqtt_last_pending_log_ms.load();
+    if (last != 0 && (now - last) < 3000)
+        return;
+
+    g_rt.mqtt_last_pending_log_ms.store(now);
+    std::cout << "face_netd: mqtt pending id=" << c->id << " url=" << g_rt.cfg.mqtt_url
+              << " elapsed=" << (now - g_rt.mqtt_dial_start_ms.load()) << "ms"
+              << " since_progress=" << (now - g_rt.mqtt_last_progress_ms.load()) << "ms"
+              << " resolving=" << c->is_resolving << " connecting=" << c->is_connecting
+              << " writable=" << c->is_writable << " readable=" << c->is_readable << " send=" << c->send.len
+              << " recv=" << c->recv.len << std::endl;
+}
+
+void maybe_timeout_mqtt_pending()
+{
+    mg_connection *c = g_mqtt;
+    if (!c || g_rt.mqtt_connected.load())
+        return;
+
+    const uint64_t elapsed = now_ms() - g_rt.mqtt_dial_start_ms.load();
+    if (!c->is_connecting || elapsed < static_cast<uint64_t>(kMqttConnectTimeoutMs))
+        return;
+
+    std::cerr << "face_netd: mqtt connect timeout after " << elapsed << "ms to " << g_rt.cfg.mqtt_url
+              << ", closing and retrying" << std::endl;
+    c->is_closing = 1;
+}
+
+void maybe_connect_mqtt()
+{
+    if (g_mqtt || g_rt.stop.load())
+        return;
+
+    const uint32_t attempt = g_rt.mqtt_connect_attempts.fetch_add(1) + 1;
+    const uint64_t now = now_ms();
+    g_rt.mqtt_dial_start_ms.store(now);
+    g_rt.mqtt_last_progress_ms.store(now);
+    g_rt.mqtt_last_pending_log_ms.store(0);
+    std::cout << "face_netd: mqtt dial attempt=" << attempt << " url=" << g_rt.cfg.mqtt_url << std::endl;
+    g_mqtt = mg_connect(&g_mgr, g_rt.cfg.mqtt_url.c_str(), mqtt_event_handler, nullptr);
     if (!g_mqtt)
         std::cerr << "face_netd: mqtt connect request failed " << g_rt.cfg.mqtt_url << std::endl;
 }
@@ -811,11 +958,12 @@ int main(int argc, char **argv)
     {
         maybe_connect_mqtt();
         mg_mgr_poll(&g_mgr, kMqttPollMs);
+        maybe_log_mqtt_pending();
+        maybe_timeout_mqtt_pending();
         if (g_rt.mqtt_connected.load())
         {
+            enqueue_status_publish(true, false);
             drain_publish_queue();
-            if (g_rt.status_dirty.load())
-                enqueue_status_publish(true, false);
             if (g_rt.shutdown_after_flush.load() && publish_queue_empty())
             {
                 g_rt.stop.store(true);
