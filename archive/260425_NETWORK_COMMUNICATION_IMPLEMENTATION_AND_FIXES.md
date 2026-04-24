@@ -59,6 +59,13 @@ f56eb06 fix: 端口设置必须在 [0, 512)
 - `fix: segmentation fault` 是 Linux 小核运行期稳定性修复
 - `fix: 端口设置必须在 [0, 512)` 是 IPCMSG 端口范围修复
 
+后续在板端与电脑端联调期间，又额外定位并修复了：
+
+- IPCMSG 建连后立即断开的竞态问题
+- WSL / Docker 环境下 Windows 未对外暴露 `1883/8000` 导致的 MQTT 不通问题
+
+这两项修复当前已体现在工作区代码与文档中。
+
 ## 3. 第一次落地实现：网络通信完整链路
 
 ### 3.1 RT-Smart 侧协议扩展
@@ -542,6 +549,91 @@ RT-Smart 串口则周期性出现：
 - 板端日志从反复的 `connected -> disconnected` 切换为稳定保持连接
 - 之前联调清单中“IPCMSG 连接是否稳定”这一项已经得到实质性修复
 
+### 5.5 Bug 5：WSL / Docker 环境下板子无法连通 MQTT
+
+#### 现象
+
+在 RT-Smart 与 Linux 小核的 IPCMSG 都已经正常后，网页仍长期显示“暂无设备”。
+
+板端 `face_netd` 日志表现为：
+
+```text
+face_netd: mqtt dial attempt=1 url=mqtt://192.168.160.8:1883
+face_netd: mqtt event OPEN id=1 url=mqtt://192.168.160.8:1883
+face_netd: mqtt event RESOLVE id=1
+face_netd: mqtt pending id=1 url=mqtt://192.168.160.8:1883 elapsed=...
+  resolving=0 connecting=1 writable=0 readable=0 send=0 recv=0
+```
+
+而电脑端 `face-web` 已经能够被浏览器访问，但 `mosquitto` 中看不到来自板子的稳定 MQTT 连接。
+
+#### 根因
+
+根因最终定位为电脑端部署环境问题：
+
+- `server_pc` 运行在 WSL + Docker 中
+- WSL 内部虽然显示 `1883` / `8000` 监听在 `0.0.0.0`
+- 但 Windows 主机侧实际只监听在 `127.0.0.1` / `::1`
+- Windows 局域网地址 `192.168.160.8` 上没有对外暴露 `1883` / `8000`
+- 系统也没有配置 `netsh interface portproxy`
+
+因此板子访问：
+
+```text
+mqtt://192.168.160.8:1883
+```
+
+时，TCP 握手会长期卡在 `connecting=1`，从而无法进入真正的 MQTT `CONNECT / CONNACK` 阶段。
+
+网页端之所以一直“暂无设备”，是因为 `face-web` 只有在收到 `k230/<device_id>/up/status` 等上行消息后，才会创建设备记录。
+
+#### 修复内容
+
+本次修复包含两部分：
+
+1. 部署环境修复
+
+- 在 Windows 管理员 PowerShell 中添加 `portproxy`：
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=127.0.0.1 connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=127.0.0.1 connectport=8000
+```
+
+- 同时放通 Windows 防火墙：
+
+```powershell
+New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
+New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
+```
+
+2. 代码与可观测性修复
+
+- `face_netd` 的 MQTT 建连路径改为显式记录 `OPEN / RESOLVE / CONNECT / READ / WRITE`
+- 增加 `pending` 日志和建连超时自动重试
+- 完整记录 `CONNECT`、`CONNACK` 与后续包收发过程
+
+修复文件：
+
+- `linux_bridge/main.cpp`
+- `README.md`
+- `linux_bridge/README.md`
+- `AGENTS.md`
+- `CLAUDE.md`
+- `archive/260425_WSL_PORTPROXY_AND_MQTT_CONNECTIVITY_FIX.md`
+
+#### 结果
+
+修复后，板端日志恢复为：
+
+```text
+face_netd: mqtt event CONNECT id=1 send CONNECT ...
+face_netd: mqtt packet cmd=2 len=4
+face_netd: mqtt connected mqtt://192.168.160.8:1883
+```
+
+最终网页端可以正常看到设备上线、状态心跳、事件和命令结果。
+
 ## 6. 本轮最终结果
 
 到本次会话结束时，这套网络通信链路已经具备以下落地成果：
@@ -582,6 +674,8 @@ Linux 小核已经具备：
 - 可配置构建策略
 - 更符合板端环境的 glibc 动态链接默认构建方式
 - 更明确的 IPC 驱动与连接诊断日志
+- MQTT 建连过程的细粒度调试日志
+- MQTT 建连超时自动重试
 
 ### 6.4 电脑端能力
 
@@ -592,6 +686,7 @@ Linux 小核已经具备：
 - WebSocket 实时推送
 - SQLite 持久化设备状态与事件
 - 单页网页控制台
+- 面向 WSL / Docker 环境的 Windows `portproxy` 启动说明
 
 ## 7. 本轮修改文件总览
 
@@ -629,6 +724,7 @@ Linux 小核已经具备：
 ### 7.4 文档与配置
 
 - `archive/260425_NETWORK_COMMUNICATION_IMPLEMENTATION_AND_FIXES.md`
+- `archive/260425_WSL_PORTPROXY_AND_MQTT_CONNECTIVITY_FIX.md`
 - `.gitignore`
 - `README.md`
 - `AGENTS.md`
@@ -705,6 +801,7 @@ http://<电脑IP>:8000
 - Linux 小核静态链接导致的运行时段错误风险
 - IPCMSG 端口超范围问题
 - IPCMSG 建连后立即断开的竞态问题
+- WSL / Docker 环境下 Windows 未对外暴露 `1883/8000` 导致的 MQTT 不通问题
 
 ### 9.2 仍需板端联调确认
 
@@ -715,14 +812,16 @@ http://<电脑IP>:8000
 3. `shutdown` 后网页离线状态回写是否符合预期
 4. 断网重连、Broker 重启后的自动恢复是否符合预期
 5. `face_netd.ini` 中 MQTT 地址、端口、设备 ID 是否与局域网环境一致
+6. 若电脑端运行在 WSL / Docker 中，Windows `portproxy` 与防火墙规则是否已正确配置
 
 ## 10. 总结
 
-本次会话已经把“电脑服务器 + 网页 + 反向控制开发板”的 v1 方案完整落到了代码里，并在此基础上由用户继续修复了 4 个关键问题：
+本次会话已经把“电脑服务器 + 网页 + 反向控制开发板”的 v1 方案完整落到了代码里，并在此基础上由用户继续修复了 5 个关键问题：
 
 1. Linux 小核交叉编译工具链应切换为 Xuantie glibc 工具链
 2. `face_netd` 默认构建策略应从静态链接调整为更稳妥的动态链接
 3. IPCMSG 服务端口必须满足 `[0, 512)`，因此桥接端口最终调整为 `301`
 4. `face_netd` 的 IPC 监督线程存在启动竞态，导致桥接连接建立后立即断开，需要前移 `runner_alive` 的置位时机
+5. 当电脑端服务运行在 WSL / Docker 中时，还必须额外配置 Windows `portproxy` 与防火墙，否则板子无法通过 Windows 局域网地址接入 MQTT
 
 至此，这套功能已经从“方案设计”推进到“工程落地 + 初步可运行 + 已修复关键运行问题”的阶段。

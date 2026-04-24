@@ -28,6 +28,27 @@ chmod +x ./face_netd
 ./face_netd --config ./face_netd.ini
 ```
 
+`face_netd.ini` 中的 `mqtt_url` 必须填写电脑主机在局域网中的真实 IPv4。
+
+如果 `server_pc` 运行在 WSL / Docker 中：
+
+- 应填写 Windows `Wi-Fi` / `Ethernet` 网卡地址，例如 `192.168.160.8`
+- 不应填写 `vEthernet (WSL)` 的 `172.23.x.x`
+- 还必须在 Windows 管理员 PowerShell 中配置端口映射：
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=127.0.0.1 connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=127.0.0.1 connectport=8000
+New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
+New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
+```
+
+若配置正确，板端启动后应最终看到：
+
+```text
+face_netd: mqtt connected mqtt://<电脑IP>:1883
+```
+
 ## MQTT 约定
 
 - 下行命令：`k230/<device_id>/down/cmd`
