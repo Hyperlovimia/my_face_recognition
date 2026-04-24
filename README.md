@@ -172,6 +172,9 @@ chmod +x ./face_netd
 ./face_netd --config ./face_netd.ini
 ```
 
+如果启动后看到 `[IPCMSG]:ioctl connect fail`，通常表示 Linux 小核正在等待 RT-Smart 侧 `face_event.elf` 提供 `face_bridge` 服务。
+此时请先确认 RT 控制台已经出现 `face_event: bridge service face_bridge port=301 ready for little-core face_netd`，并确认板端 `/data/face_event.elf` 是本项目当前版本的新二进制。
+
 `face_netd.ini` 里至少需要修改：
 
 - `device_id`

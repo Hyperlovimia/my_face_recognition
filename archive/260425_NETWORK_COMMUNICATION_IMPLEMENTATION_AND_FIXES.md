@@ -477,6 +477,71 @@ face_netd: stopped
 f56eb06 fix: 端口设置必须在 [0, 512)
 ```
 
+### 5.4 Bug 4：IPCMSG 建连后立即断开
+
+#### 现象
+
+在 RT-Smart 侧 `face_event.elf` 已经成功打印：
+
+```text
+face_event: bridge service face_bridge port=301 ready for little-core face_netd
+```
+
+且 Linux 小核侧 `face_netd` 也已经能够连接上的情况下，现场日志仍反复表现为：
+
+```text
+face_netd: connected to RT bridge service=face_bridge id=5
+face_netd: RT bridge disconnected, waiting for reconnect
+face_netd: connected to RT bridge service=face_bridge id=5
+face_netd: RT bridge disconnected, waiting for reconnect
+...
+```
+
+RT-Smart 串口则周期性出现：
+
+```text
+[IPCMSG]:ioctl connect fail
+```
+
+这说明问题已经不再是“端口非法”或“完全无法连接”，而是“连接建立后被立即断开”。
+
+#### 根因
+
+根因位于 `linux_bridge/main.cpp` 的 IPC 监督线程：
+
+- `face_netd` 建连成功后会启动一个后台线程执行 `kd_ipcmsg_run(ipc_id)`
+- 主线程则立即轮询 `g_rt.runner_alive`
+- 但初版代码里，`g_rt.runner_alive = true` 是在子线程入口 `run_thread_body()` 内部才设置的
+- 当主线程调度更快时，会先读到 `false`
+- 于是 supervisor 误判接收线程未运行，立刻执行 `kd_ipcmsg_disconnect(ipc_id)`
+
+因此这其实是一个“连接线程启动时序”的竞态问题，而不是 IPCMSG 协议或端口配置错误。
+
+#### 修复内容
+
+本次将 `runner_alive` 的置位时机前移到启动线程之前：
+
+- 在 `std::thread runner(run_thread_body, ipc_id);` 之前先执行 `g_rt.runner_alive.store(true);`
+- `run_thread_body()` 中不再重复置位，只在 `kd_ipcmsg_run()` 返回后负责置回 `false`
+
+同时顺手补充了两类诊断信息：
+
+- 启动前检查 `/dev/ipcm_user` 是否存在，提前提示 IPC 驱动未就绪
+- `kd_ipcmsg_try_connect()` 重试时输出更明确的等待日志，提示应先确认 RT 侧 `face_event.elf` 已打印 bridge ready
+
+修复文件：
+
+- `linux_bridge/main.cpp`
+- `README.md`
+
+#### 结果
+
+修复后：
+
+- `face_netd` 与 `face_event.elf` 的 IPCMSG 连接不再出现“刚连上就断开”的循环
+- 板端日志从反复的 `connected -> disconnected` 切换为稳定保持连接
+- 之前联调清单中“IPCMSG 连接是否稳定”这一项已经得到实质性修复
+
 ## 6. 本轮最终结果
 
 到本次会话结束时，这套网络通信链路已经具备以下落地成果：
@@ -510,11 +575,13 @@ Linux 小核已经具备：
 
 - MQTT 客户端
 - IPCMSG 桥接客户端/服务管理
+- IPCMSG 连接稳定保持
 - 设备在线状态上报
 - 远程命令转发
 - 事件与结果上送
 - 可配置构建策略
 - 更符合板端环境的 glibc 动态链接默认构建方式
+- 更明确的 IPC 驱动与连接诊断日志
 
 ### 6.4 电脑端能力
 
@@ -561,6 +628,7 @@ Linux 小核已经具备：
 
 ### 7.4 文档与配置
 
+- `archive/260425_NETWORK_COMMUNICATION_IMPLEMENTATION_AND_FIXES.md`
 - `.gitignore`
 - `README.md`
 - `AGENTS.md`
@@ -636,12 +704,13 @@ http://<电脑IP>:8000
 - Linux 小核工具链配置错误
 - Linux 小核静态链接导致的运行时段错误风险
 - IPCMSG 端口超范围问题
+- IPCMSG 建连后立即断开的竞态问题
 
 ### 9.2 仍需板端联调确认
 
 虽然这轮已经完成实现与多处构建验证，但仍建议继续在真实板端检查：
 
-1. `face_event.elf` 与 Linux 小核 `face_netd` 的 IPCMSG 连接是否稳定
+1. `face_event.elf` 与 Linux 小核 `face_netd` 长时间运行下的 IPCMSG 连接是否持续稳定
 2. `register_current` 在单人/多人/活体失败场景下的网页提示是否符合预期
 3. `shutdown` 后网页离线状态回写是否符合预期
 4. 断网重连、Broker 重启后的自动恢复是否符合预期
@@ -649,10 +718,11 @@ http://<电脑IP>:8000
 
 ## 10. 总结
 
-本次会话已经把“电脑服务器 + 网页 + 反向控制开发板”的 v1 方案完整落到了代码里，并在此基础上由用户继续修复了 3 个关键问题：
+本次会话已经把“电脑服务器 + 网页 + 反向控制开发板”的 v1 方案完整落到了代码里，并在此基础上由用户继续修复了 4 个关键问题：
 
 1. Linux 小核交叉编译工具链应切换为 Xuantie glibc 工具链
 2. `face_netd` 默认构建策略应从静态链接调整为更稳妥的动态链接
 3. IPCMSG 服务端口必须满足 `[0, 512)`，因此桥接端口最终调整为 `301`
+4. `face_netd` 的 IPC 监督线程存在启动竞态，导致桥接连接建立后立即断开，需要前移 `runner_alive` 的置位时机
 
 至此，这套功能已经从“方案设计”推进到“工程落地 + 初步可运行 + 已修复关键运行问题”的阶段。

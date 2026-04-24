@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 extern "C" {
@@ -458,41 +459,66 @@ void bridge_ipc_handler(k_s32, k_ipcmsg_message_t *msg)
 
 void run_thread_body(int ipc_id)
 {
-    g_rt.runner_alive.store(true);
     kd_ipcmsg_run(ipc_id);
     g_rt.runner_alive.store(false);
 }
 
 void ipc_supervisor_thread()
 {
-    k_ipcmsg_connect_t attr{};
-    attr.u32RemoteId = kIpcRemoteIdLinux;
-    attr.u32Port = IPC_FACE_BRIDGE_PORT;
-    attr.u32Priority = 0;
-
-    if (kd_ipcmsg_add_service(IPC_FACE_BRIDGE_SERVICE, &attr) != K_SUCCESS)
+    if (access("/dev/ipcm_user", F_OK) != 0)
     {
-        std::cerr << "face_netd: kd_ipcmsg_add_service(" << IPC_FACE_BRIDGE_SERVICE << ") failed" << std::endl;
+        std::cerr << "face_netd: cannot open /dev/ipcm_user (ipcmsg driver not ready?). "
+                  << "Expected k_ipcm.ko to be loaded." << std::endl;
         g_rt.stop.store(true);
         g_rt.cmd_cv.notify_all();
         return;
     }
 
+    k_ipcmsg_connect_t attr{};
+    attr.u32RemoteId = kIpcRemoteIdLinux;
+    attr.u32Port = IPC_FACE_BRIDGE_PORT;
+    attr.u32Priority = 0;
+
+    const k_s32 add_ret = kd_ipcmsg_add_service(IPC_FACE_BRIDGE_SERVICE, &attr);
+    if (add_ret != K_SUCCESS)
+    {
+        std::cerr << "face_netd: kd_ipcmsg_add_service(" << IPC_FACE_BRIDGE_SERVICE << ") failed ret=" << add_ret
+                  << std::endl;
+        g_rt.stop.store(true);
+        g_rt.cmd_cv.notify_all();
+        return;
+    }
+
+    unsigned retry_count = 0;
     while (!g_rt.stop.load())
     {
         k_s32 ipc_id = -1;
-        if (kd_ipcmsg_try_connect(&ipc_id, IPC_FACE_BRIDGE_SERVICE, bridge_ipc_handler) != K_SUCCESS)
+        const k_s32 conn_ret = kd_ipcmsg_try_connect(&ipc_id, IPC_FACE_BRIDGE_SERVICE, bridge_ipc_handler);
+        if (conn_ret != K_SUCCESS)
         {
+            if ((retry_count++ % 10) == 0)
+            {
+                std::cerr << "face_netd: waiting for RT bridge service " << IPC_FACE_BRIDGE_SERVICE
+                          << " port=" << IPC_FACE_BRIDGE_PORT << " ret=" << conn_ret
+                          << ". Make sure RT-Smart face_event.elf is already running and prints "
+                          << "\"bridge service " << IPC_FACE_BRIDGE_SERVICE << " port=" << IPC_FACE_BRIDGE_PORT
+                          << " ready\"" << std::endl;
+            }
             sleep_ms(g_rt.cfg.ipc_connect_retry_ms);
             continue;
         }
 
+        retry_count = 0;
         g_rt.ipc_id.store(ipc_id);
         g_rt.rt_connected.store(true);
         mark_rt_seen();
         std::cout << "face_netd: connected to RT bridge service=" << IPC_FACE_BRIDGE_SERVICE << " id=" << ipc_id
                   << std::endl;
 
+        // Mark the runner alive before the thread starts so the supervisor
+        // does not observe a false value and tear the connection down
+        // immediately due to scheduling order.
+        g_rt.runner_alive.store(true);
         std::thread runner(run_thread_body, ipc_id);
 
         while (!g_rt.stop.load())
