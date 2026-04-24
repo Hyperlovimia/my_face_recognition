@@ -4,9 +4,8 @@
 #include <stdint.h>
 
 /*
- * 与大核待实现的 face_ctrl（IPCMSG）对齐的建议协议头。
- * 唯一维护：my_face_recognition/src/little — 大核工程若实现 face_ctrl 时应与此处一致或生成绑定。
- * 当前小核网关已可用 HTTP + IPCMSG 发送这些 command/module。
+ * 与大核 face_ctrl（IPCMSG，见 src/face_ctrl_main.cc）对齐的协议头。
+ * 唯一维护：my_face_recognition/src/little；调试：小核 FACE_DEBUG=1/--debug，大核 FACE_DEBUG=1。
  */
 
 typedef enum {

@@ -43,17 +43,20 @@ cd src/reference/ai_poc/my_face_recognition
 
 在完整 SDK 中通过 **Buildroot 包** `src/little/buildroot-ext/package/face_gateway` 编进小核根文件系统；业务路径已指向上述 `src/little`，无需再维护独立的 `face_gateway` 工程目录。
 
-- 上板/联调/与大核 `face_ctrl` 规划：见 `archive/260423_FACE_GATEWAY_USAGE_AND_REMOTE_TEST_PLAN.md`
+- **大小核、face_gateway、队友/AI 搭环境、上板/联调（唯一入口）**：`archive/BIG_LITTLE_GUIDE.md`
+- **k230_sdk 里除本目录外，与构建/小核包相关的落点**（工具链、MPP、ipcmsg、Buildroot 包、`door_lock` 对比）：`archive/OUTSIDE_MY_FACE_RECOGNITION_IN_SDK.md`
 - 小核侧说明与接口列表：见 `src/little/README.md`
 
 ```bash
-# 小核上仅测 HTTP、无大核 IPC 时
+# 板端小核：仅测 HTTP、暂不连大核 IPC
 face_gateway --no-ipc
-# 无板子时联调 API 与网页（模拟 IPC 发送，不访问 /dev/ipcm_user）
-face_gateway --mock
+# 与大核 face_ctrl 对接后（先起 face_ai、face_video、face_ctrl，再起小核网关）：
+face_gateway --ipc-service face_ctrl --ipc-port 110
 ```
 
-大核三进程（`face_ai` / `face_video` / `face_event`）仍由下面的 `./build_app.sh` 与 RT-Smart 侧启动，与小核为**不同 CPU/系统**；通过 `/sharefs` 与后续 IPCMSG 协作。
+大核侧已提供 **`face_ctrl.elf`**（IPCMSG 服务名 `face_ctrl`，与 `face_event` 一样经 `IPC_FACE_VIDEO_CTRL` 驱动 `face_video`）。与串口 **`face_event` 二选一**作交互入口，避免两条线同时发控制。小核与大核通过 **IPCMSG** 协作；细节见 `archive/BIG_LITTLE_GUIDE.md`。
+
+联调时可在**板端**加 **`FACE_DEBUG=1`**：小核 `face_gateway` 打 stderr，大核 `face_ctrl.elf` 打 stdout；小核另支持 **`--debug`**。详见 `src/little/README.md`。
 
 ## 大核 RT-Smart 产物
 
@@ -61,7 +64,8 @@ face_gateway --mock
 
 - `face_ai.elf`
 - `face_video.elf`
-- `face_event.elf`
+- `face_event.elf`（串口交互；与小核控板二选一时可不用）
+- `face_ctrl.elf`（小核/HTTP 经 IPCMSG 控板时于大核运行，默认与 `face_gateway` 服务名、端口一致）
 - `face_detection_320.kmodel`
 - `face_recognition.kmodel`
 - `face_antispoof.kmodel`，仅启用活体检测时需要
@@ -88,13 +92,21 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 /data/face_video.elf 0 &
 ```
 
-最后以前台方式启动交互入口：
+**方式 A — 串口交互（原方式）** 以前台启动：
 
 ```sh
 /data/face_event.elf /tmp/attendance.log
 ```
 
-启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/data/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
+启动后，命令在 `face_event.elf` 所在串口输入。
+
+**方式 B — 小核 HTTP 控板** 请**不要**再开 `face_event`，改为在 `face_ai`、`face_video` 已后台运行后启动：
+
+```sh
+/data/face_ctrl.elf
+```
+
+再在**小核 Linux** 上启动 `face_gateway`（见上文与 `src/little/README.md`）。`/data/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
 
 程序支持两种退出方式：
 

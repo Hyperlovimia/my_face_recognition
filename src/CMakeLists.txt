@@ -36,4 +36,11 @@ target_link_libraries(face_ai.elf ${nncase_link} ${opencv_link})
 add_executable(face_event.elf face_event_main.cc ipc_shm.cc ipc_lwp_syscall.c)
 target_link_libraries(face_event.elf sys atomic)
 
-install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)
+# 小核 HTTP 经 IPCMSG 控板：与 face_event 相同走 IPC_FACE_VIDEO_CTRL
+set(k230_cdk_ipcmsg "${PROJECT_SOURCE_DIR}/../../../common/cdk/user/component/ipcmsg")
+add_executable(face_ctrl.elf face_ctrl_main.cc ipc_shm.cc ipc_lwp_syscall.c)
+target_include_directories(face_ctrl.elf PRIVATE ${k230_cdk_ipcmsg}/include)
+target_link_directories(face_ctrl.elf PRIVATE ${k230_cdk_ipcmsg}/host/lib)
+target_link_libraries(face_ctrl.elf pthread ipcmsg sys atomic)
+
+install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf face_ctrl.elf DESTINATION bin)

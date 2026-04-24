@@ -1,6 +1,6 @@
 # face_gateway（小核 Linux 网关）
 
-与本仓库大核三进程（`face_ai` / `face_video` / `face_event`）配套的**小核**程序：在 Buildroot Linux 上跑 HTTP，便于局域网调试；后续通过 **IPCMSG** 与（待实现的）大核 `face_ctrl` 服务通信。
+与本仓库大核三进程（`face_ai` / `face_video` / `face_event` 或 `face_ctrl`）配套的**小核**程序：在 Buildroot Linux 上跑 HTTP，经 **IPCMSG** 与 `face_ctrl.elf` 联调时控板。
 
 ## 源码位置（唯一维护点）
 
@@ -15,7 +15,7 @@
 
 - 小核上提供 HTTP 服务（默认 `8080`）
 - 上报本机网络接口、系统信息
-- IPCMSG 客户端骨架，默认连接服务名 `face_ctrl`（大核侧需后续实现）
+- IPCMSG 客户端，默认连接服务名 `face_ctrl`（大核起 `face_ctrl.elf`）
 - 首页带简单按钮，便于浏览器联调
 
 ## 编进小核镜像
@@ -31,25 +31,38 @@
 
 - `/usr/bin/face_gateway`
 
-## 运行示例
-
-```sh
-face_gateway
-```
+## 运行示例（均在**板子小核 Linux**上执行）
 
 默认：`0.0.0.0:8080`，IPC 目标 `face_ctrl`，port `110`。
 
 ```sh
+face_gateway
 face_gateway --port 8080
 face_gateway --ipc-service face_ctrl --ipc-port 110
+```
+
+**仅验 HTTP、暂不连大核 IPC**（例如大核程序未就绪时，在板端小核上先 `curl` 通网口）：
+
+```sh
 face_gateway --no-ipc
 ```
 
-无板子时仅调 HTTP/网页，可用 **mock**（不访问 `/dev/ipcm_user`，并模拟 IPC 侧数据）：
+**跨核控板**（先在大核按主 `README` 起 `face_ai`、`face_video`、`face_ctrl.elf`，再在小核执行）：
 
 ```sh
-face_gateway --mock
+face_gateway --ipc-service face_ctrl --ipc-port 110
 ```
+
+**调试**：`FACE_DEBUG=1` 与 `--debug` 等价。小核 **stderr** 打 `[face_gateway]` 前缀日志；大核 `FACE_DEBUG=1` 时 `face_ctrl.elf` 在 **stdout** 打细日志。
+
+**板上自测示例**（终端 1 起 `face_gateway`，终端 2 或同网 PC）：
+
+```sh
+curl "http://127.0.0.1:8080/api/ping"
+curl "http://127.0.0.1:8080/api/ipc/send?cmd=PING"
+```
+
+同网电脑访问时把 `127.0.0.1` 换成小核网口 IP（板端 `ip a` 查看）。
 
 ## HTTP 接口
 
@@ -62,18 +75,12 @@ face_gateway --mock
 - `GET /api/ipc/send?cmd=GET_STATUS`
 - `GET /api/ipc/send?cmd=GET_DB_COUNT`
 - `GET /api/ipc/send?cmd=DB_RESET`
+- `GET /api/face/db_count`（等同 `.../api/ipc/send?cmd=GET_DB_COUNT`）
+- `GET /api/face/db_reset`（等同 `.../api/ipc/send?cmd=DB_RESET`）
 - `GET /api/ipc/send?cmd=0x1001&module=0x1&payload=hello`
 - `GET /api/help`
 
-## 本机快速验证（小核上或带端口的测试环境）
-
-```sh
-curl http://127.0.0.1:8080/api/ping
-curl http://127.0.0.1:8080/api/status
-curl http://127.0.0.1:8080/api/network
-```
-
 ## 说明
 
-- 大核 ↔ 小核跨核通信依赖 IPCMSG 与**大核 `face_ctrl` 服务**；当前大核三进程仍使用 `rt_channel` 内部通信，与 `face_ctrl` 的对接见仓库 `archive/260423_FACE_GATEWAY_USAGE_AND_REMOTE_TEST_PLAN.md`。
+- 大核 ↔ 小核跨核通信依赖 IPCMSG 与**大核 `face_ctrl` 服务**；与 `face_ctrl` 的对接与分阶段验收见 `archive/BIG_LITTLE_GUIDE.md`。
 - 勿将 `door_lock` 等无关服务当长期替代，除非你明确在做调试并清楚副作用。

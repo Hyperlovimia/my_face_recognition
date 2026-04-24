@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,8 +46,8 @@ struct GatewayConfig {
     std::string bind_address = kLoopbackAddress;
     uint16_t http_port = kDefaultHttpPort;
     bool enable_ipc = true;
-    /** 无板/无 ipcm 时调 HTTP 与 /api/ipc/* 契约；不连真实 IPCMSG */
-    bool mock_mode = false;
+    /** 环境变量 FACE_DEBUG=1 或 --debug：在 stderr 打印跨核/HTTP 与 IPC 细日志。 */
+    bool debug = false;
     std::string ipc_service = kDefaultIpcService;
     uint32_t ipc_remote_id = kDefaultIpcRemoteId;
     uint32_t ipc_port = kDefaultIpcPort;
@@ -394,17 +395,46 @@ uint32_t resolve_named_module(const std::string &value)
     return FACE_CTRL_MODULE_WEB;
 }
 
+const char *cmd_name_for_log(uint32_t cmd)
+{
+    switch (cmd) {
+    case FACE_CTRL_CMD_PING:
+        return "PING";
+    case FACE_CTRL_CMD_GET_STATUS:
+        return "GET_STATUS";
+    case FACE_CTRL_CMD_GET_DB_COUNT:
+        return "GET_DB_COUNT";
+    case FACE_CTRL_CMD_DB_RESET:
+        return "DB_RESET";
+    case FACE_CTRL_CMD_REGISTER_START:
+        return "REGISTER_START";
+    case FACE_CTRL_CMD_REGISTER_COMMIT:
+        return "REGISTER_COMMIT";
+    case FACE_CTRL_CMD_SHUTDOWN:
+        return "SHUTDOWN";
+    default:
+        return nullptr;
+    }
+}
+
+void gw_dlog(const GatewayConfig &config, const char *fmt, ...)
+{
+    if (!config.debug)
+        return;
+    std::fputs("[face_gateway] ", stderr);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    std::fflush(stderr);
+}
+
 class IpcClient {
 public:
     explicit IpcClient(const GatewayConfig &config)
         : config_(config)
     {
-        snapshot_.enabled = config.enable_ipc || config.mock_mode;
-        if (config_.mock_mode) {
-            snapshot_.service_added = true;
-            snapshot_.connected = true;
-            snapshot_.last_error.clear();
-        }
+        snapshot_.enabled = config.enable_ipc;
     }
 
     ~IpcClient()
@@ -414,7 +444,7 @@ public:
 
     void start()
     {
-        if (config_.mock_mode || !config_.enable_ipc)
+        if (!config_.enable_ipc)
             return;
 
         worker_ = std::thread(&IpcClient::worker_loop, this);
@@ -431,7 +461,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         IpcSnapshot copy = snapshot_;
-        if (!config_.mock_mode && handle_ >= 0)
+        if (handle_ >= 0)
             copy.connected = kd_ipcmsg_is_connect(handle_);
         return copy;
     }
@@ -441,22 +471,8 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (config_.mock_mode) {
-            snapshot_.sent_count++;
-            snapshot_.last_cmd = cmd;
-            snapshot_.last_module = module;
-            snapshot_.last_ret = 0;
-            snapshot_.last_is_resp = false;
-            snapshot_.last_payload = payload;
-            snapshot_.last_event_time = now_local_iso8601();
-            snapshot_.last_error.clear();
-            snapshot_.connected = true;
-            if (error_out != nullptr)
-                error_out->clear();
-            return true;
-        }
-
         if (!config_.enable_ipc) {
+            gw_dlog(config_, "send_only: skipped (ipc disabled)\n");
             if (error_out != nullptr)
                 *error_out = "ipc disabled";
             return false;
@@ -465,6 +481,8 @@ public:
         if (handle_ < 0 || !kd_ipcmsg_is_connect(handle_)) {
             snapshot_.connected = false;
             snapshot_.last_error = "ipc not connected";
+            gw_dlog(config_, "send_only: fail module=0x%x cmd=0x%x — %s\n", module, cmd,
+                    snapshot_.last_error.c_str());
             if (error_out != nullptr)
                 *error_out = snapshot_.last_error;
             return false;
@@ -482,6 +500,7 @@ public:
             payload.size());
         if (msg == nullptr) {
             snapshot_.last_error = "kd_ipcmsg_create_message failed";
+            gw_dlog(config_, "send_only: create_message null module=0x%x cmd=0x%x\n", module, cmd);
             if (error_out != nullptr)
                 *error_out = snapshot_.last_error;
             return false;
@@ -491,6 +510,8 @@ public:
         kd_ipcmsg_destroy_message(msg);
         if (ret != 0) {
             snapshot_.last_error = "kd_ipcmsg_send_only failed";
+            gw_dlog(config_, "send_only: kd_ipcmsg_send_only ret=%d module=0x%x cmd=%s(0x%x)\n", ret,
+                    module, cmd_name_for_log(cmd) ? cmd_name_for_log(cmd) : "?", cmd);
             if (error_out != nullptr)
                 *error_out = snapshot_.last_error;
             return false;
@@ -503,6 +524,11 @@ public:
         snapshot_.last_event_time = now_local_iso8601();
         snapshot_.last_error.clear();
         snapshot_.connected = true;
+
+        gw_dlog(config_, "send_only: ok handle=%d module=0x%x cmd=%s(0x%x) plen=%zu sent_total=%llu\n",
+                handle_, module, cmd_name_for_log(cmd) ? cmd_name_for_log(cmd) : "?", cmd,
+                payload.size(),
+                static_cast<unsigned long long>(snapshot_.sent_count));
 
         if (error_out != nullptr)
             error_out->clear();
@@ -528,29 +554,49 @@ private:
         snapshot_.last_event_time = now_local_iso8601();
         snapshot_.last_error.clear();
         snapshot_.connected = true;
+        gw_dlog(config_,
+                "ipc recv: cmd=0x%x module=0x%x resp=%d ret=%d body_len=%u (大核若仅 send_only 则很少收到)\n",
+                (unsigned)msg->u32CMD, (unsigned)msg->u32Module, (int)msg->bIsResp,
+                (int)msg->s32RetVal, (unsigned)msg->u32BodyLen);
     }
 
     void worker_loop()
     {
         instance_ = this;
+        int wait_dev_count = 0;
+
+        gw_dlog(config_,
+                "ipc worker: service=%s remote_id=%u port=%u (try /dev/ipcm_user then connect)\n",
+                config_.ipc_service.c_str(), config_.ipc_remote_id, config_.ipc_port);
 
         while (!stop_requested_.load()) {
             if (access("/dev/ipcm_user", R_OK | W_OK) != 0) {
                 update_error("waiting for /dev/ipcm_user");
+                if (config_.debug && (++wait_dev_count == 1 || wait_dev_count % 20 == 0))
+                    gw_dlog(config_, "ipc worker: /dev/ipcm_user not ready (try #%d)\n",
+                            wait_dev_count);
                 sleep_with_break(500);
                 continue;
             }
+            if (wait_dev_count != 0) {
+                gw_dlog(config_, "ipc worker: /dev/ipcm_user ok after %d wait(s)\n", wait_dev_count);
+                wait_dev_count = 0;
+            }
 
             if (!add_service_once()) {
+                gw_dlog(config_, "ipc worker: kd_ipcmsg_add_service failed: %s\n",
+                        snapshot_.last_error.c_str());
                 sleep_with_break(1000);
                 continue;
             }
+            gw_dlog(config_, "ipc worker: add_service ok name=%s\n", config_.ipc_service.c_str());
 
             int handle = -1;
             int ret = kd_ipcmsg_try_connect(&handle, config_.ipc_service.c_str(),
                                             handle_message_trampoline);
             if (ret != 0) {
                 update_error("kd_ipcmsg_try_connect failed");
+                gw_dlog(config_, "ipc worker: try_connect ret=%d (大核需先起 face_ctrl.elf）\n", ret);
                 sleep_with_break(1000);
                 continue;
             }
@@ -561,6 +607,7 @@ private:
                 snapshot_.connected = kd_ipcmsg_is_connect(handle_);
                 snapshot_.last_error.clear();
             }
+            gw_dlog(config_, "ipc worker: try_connect ok handle=%d, entering receive loop\n", handle);
 
             kd_ipcmsg_run(handle_);
 
@@ -573,6 +620,7 @@ private:
                 if (snapshot_.last_error.empty())
                     snapshot_.last_error = "ipc receive loop exited";
             }
+            gw_dlog(config_, "ipc worker: kd_ipcmsg_run returned, reconnecting after delay\n");
 
             sleep_with_break(500);
         }
@@ -780,9 +828,29 @@ private:
         return true;
     }
 
+    std::string handle_ipc_send_alias(uint32_t cmd, uint32_t module,
+                                      const std::string &payload)
+    {
+        std::string error;
+        bool ok = ipc_client_.send_only(module, cmd, payload, &error);
+        std::ostringstream oss;
+        oss << "{"
+            << "\"ok\":" << (ok ? "true" : "false") << ","
+            << "\"module\":" << module << ","
+            << "\"cmd\":" << cmd << ","
+            << "\"error\":\"" << json_escape(error) << "\""
+            << "}";
+        return oss.str();
+    }
+
     void route_request(const HttpRequest &request, std::string *status,
                        std::string *content_type, std::string *body)
     {
+        if (config_.debug) {
+            const std::string &p = request.path;
+            if (p.find("ipc") != std::string::npos || p.rfind("/api/face/", 0) == 0 || p == "/api/ping")
+                gw_dlog(config_, "HTTP %s %s\n", request.method.c_str(), p.c_str());
+        }
         if (request.method != "GET" && request.method != "POST") {
             *status = "405 Method Not Allowed";
             *body = "{\"ok\":false,\"error\":\"method not allowed\"}";
@@ -822,6 +890,16 @@ private:
 
         if (request.path == "/api/ipc/send") {
             *body = handle_ipc_send(request.query);
+            return;
+        }
+
+        if (request.path == "/api/face/db_count") {
+            *body = handle_ipc_send_alias(FACE_CTRL_CMD_GET_DB_COUNT, FACE_CTRL_MODULE_WEB, "");
+            return;
+        }
+
+        if (request.path == "/api/face/db_reset") {
+            *body = handle_ipc_send_alias(FACE_CTRL_CMD_DB_RESET, FACE_CTRL_MODULE_WEB, "");
             return;
         }
 
@@ -879,7 +957,6 @@ private:
         oss << "{"
             << "\"ok\":true,"
             << "\"service\":\"face_gateway\","
-            << "\"mock\":" << (config_.mock_mode ? "true" : "false") << ","
             << "\"time\":\"" << json_escape(now_local_iso8601()) << "\","
             << "\"hostname\":\"" << json_escape(hostname) << "\","
             << "\"machine\":\"" << json_escape(uts.machine) << "\","
@@ -914,6 +991,8 @@ private:
                "\"GET /api/ipc/send?cmd=GET_STATUS\","
                "\"GET /api/ipc/send?cmd=GET_DB_COUNT\","
                "\"GET /api/ipc/send?cmd=DB_RESET\","
+               "\"GET /api/face/db_count\","
+               "\"GET /api/face/db_reset\","
                "\"GET /api/ipc/send?cmd=0x1234&module=0x1&payload=hello\""
                "]"
                "}";
@@ -1087,7 +1166,8 @@ void print_usage(const char *argv0)
     std::printf(
         "Usage: %s [--bind 0.0.0.0] [--port 8080]\n"
         "          [--ipc-service face_ctrl] [--ipc-remote-id 1]\n"
-        "          [--ipc-port 110] [--ipc-priority 0] [--no-ipc] [--mock]\n",
+        "          [--ipc-port 110] [--ipc-priority 0] [--no-ipc] [--debug]\n"
+        "          或: FACE_DEBUG=1 打开 stderr 调试（与 --debug 相同）\n",
         argv0);
 }
 
@@ -1109,8 +1189,8 @@ bool parse_args(int argc, char **argv, GatewayConfig *config)
             continue;
         }
 
-        if (arg == "--mock") {
-            config->mock_mode = true;
+        if (arg == "--debug") {
+            config->debug = true;
             continue;
         }
 
@@ -1174,6 +1254,10 @@ bool parse_args(int argc, char **argv, GatewayConfig *config)
         return false;
     }
 
+    if (const char *e = std::getenv("FACE_DEBUG")) {
+        if (e[0] == '1')
+            config->debug = true;
+    }
     return true;
 }
 
@@ -1184,6 +1268,12 @@ int main(int argc, char **argv)
     GatewayConfig config;
     if (!parse_args(argc, argv, &config))
         return argc > 1 ? 1 : 0;
+
+    if (config.debug) {
+        std::fprintf(stderr,
+                     "[face_gateway] debug: FACE_DEBUG/–debug 已开启 (stderr, flow: HTTP → IPC send_only → "
+                     "大核 face_ctrl)\n");
+    }
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
