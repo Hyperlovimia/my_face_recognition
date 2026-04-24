@@ -66,6 +66,14 @@ static uint64_t now_monotonic_ms()
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+static uint64_t now_realtime_ms()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
 static bool ai_metrics_enabled(int debug_mode)
 {
     const char *e = std::getenv("FACE_METRICS");
@@ -178,6 +186,7 @@ static void notify_face_event(int id, float score, const char *name, ipc_evt_kin
     ev->magic = IPC_MAGIC;
     ev->face_id = id;
     ev->score = score;
+    ev->ts_ms = now_realtime_ms();
     if (name)
         strncpy(ev->name, name, IPC_NAME_MAX - 1);
     ev->is_stranger = (evt_kind == IPC_EVT_KIND_STRANGER) ? 1 : 0;
@@ -199,6 +208,16 @@ static void notify_face_event(int id, float score, const char *name, ipc_evt_kin
 
     mark_face_event_sent(cache_slot, id, name, evt_kind);
     g_ai_evt_send_ok.fetch_add(1);
+}
+
+static void set_reply_op(ipc_ai_reply_t *reply, ipc_op_result_t result, const char *message)
+{
+    if (!reply)
+        return;
+    reply->op_result = (int32_t)result;
+    memset(reply->op_message, 0, sizeof(reply->op_message));
+    if (message)
+        strncpy(reply->op_message, message, sizeof(reply->op_message) - 1);
 }
 
 /* 请求侧 shmid 由 face_video 在 ipc_pack_request 中创建并在 rpc_ai 的 send_recv 返回后 ipc_shm_free。
@@ -340,17 +359,20 @@ int main(int argc, char **argv)
         memset(&reply, 0, sizeof(reply));
         reply.magic = IPC_MAGIC;
         reply.status = IPC_STATUS_OK;
+        set_reply_op(&reply, IPC_OP_RESULT_NONE, nullptr);
 
         if (hdr->cmd == IPC_CMD_DB_COUNT)
         {
             reply.count = face_recg.database_count(db_dir);
             reply.num_faces = 0;
+            set_reply_op(&reply, IPC_OP_RESULT_OK, "database count ready");
         }
         else if (hdr->cmd == IPC_CMD_SHUTDOWN)
         {
             reply.count = 0;
             reply.num_faces = 0;
             should_exit = true;
+            set_reply_op(&reply, IPC_OP_RESULT_OK, "shutdown acknowledged");
             std::cout << "face_ai: shutdown requested\n";
         }
         else if (hdr->cmd == IPC_CMD_DB_RESET)
@@ -358,6 +380,7 @@ int main(int argc, char **argv)
             face_recg.database_reset(db_dir);
             reply.count = 0;
             reply.num_faces = 0;
+            set_reply_op(&reply, IPC_OP_RESULT_OK, "database reset");
         }
         else if (hdr->cmd == IPC_CMD_INFER || hdr->cmd == IPC_CMD_REGISTER_COMMIT)
         {
@@ -551,14 +574,17 @@ int main(int argc, char **argv)
                 {
                     std::string reg_name(hdr->register_name);
                     face_recg.database_add(reg_name, db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
                     std::cout << "face_ai: register ok: " << reg_name << std::endl;
                 }
                 else if (det_results.size() == 1 && fas && reply.num_faces >= 1 && !reply.faces[0].is_live)
                 {
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "register rejected: liveness failed");
                     std::cout << "face_ai: register rejected (liveness failed)\n";
                 }
                 else
                 {
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "register failed: need exactly one face");
                     std::cout << "face_ai: register failed (need exactly one face)\n";
                 }
             }

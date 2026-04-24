@@ -8,7 +8,26 @@
 
 - `face_ai.elf`：人脸检测、识别、数据库操作，可选加载活体模型
 - `face_video.elf`：视频采集、显示与 OSD
-- `face_event.elf`：单串口交互入口、事件输出与考勤日志
+- `face_event.elf`：单串口交互入口、事件输出、考勤日志与 RT 对外桥接中心
+
+v1 新增一套“电脑服务器 + 网页 + 反向控制”的落地链路：
+
+```text
+浏览器
+  <-HTTP/WebSocket->
+电脑端 face-web
+  <-MQTT->
+Linux 小核 face_netd
+  <-IPCMSG->
+RT-Smart 大核三进程
+```
+
+说明：
+
+- `MQTT` 只用于“电脑服务器 <-> Linux 小核”这一段
+- `IPCMSG` 用于“Linux 小核 <-> RT-Smart 大核”控制与事件桥接
+- `sharefs` 仅用于手动部署 `face_netd`，不承载实时消息
+- v1 不做图片和实时视频，只做“状态、事件、控制”
 
 ## 编译
 
@@ -105,3 +124,106 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 > 注：
 > 注册截图时请确保画面中仅有一张清晰可见的人脸。
 > 姓名应使用可识别英文字符，避免特殊符号。
+
+## 远程桥接能力
+
+`face_event.elf` 现在除了保留串口入口，还会启动一个 `IPCMSG` 服务：
+
+- 服务名：`face_bridge`
+- 端口：`2301`
+- 连接方：Linux 小核 `face_netd`
+
+远程命令固定为：
+
+- `db_count`
+- `db_reset`
+- `register_current`
+- `shutdown`
+
+网页端命令最终会被转换成上述桥接命令，经 `face_event -> face_video -> face_ai` 原有链路执行。
+
+## Linux 小核 face_netd
+
+`face_netd` 是独立手动部署程序，不进入 Linux 镜像。
+
+编译：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_bridge
+./build_face_netd.sh
+```
+
+将以下文件复制到板端 `/sharefs/face_bridge/`：
+
+- `linux_bridge/out/face_netd`
+- `linux_bridge/face_netd.ini`
+
+启动：
+
+```sh
+cd /sharefs/face_bridge
+chmod +x ./face_netd
+./face_netd --config ./face_netd.ini
+```
+
+`face_netd.ini` 里至少需要修改：
+
+- `device_id`
+- `mqtt_url`
+
+MQTT topic 约定：
+
+- `k230/<device_id>/up/event`
+- `k230/<device_id>/up/reply`
+- `k230/<device_id>/up/status`
+- `k230/<device_id>/down/cmd`
+
+## 电脑端 server_pc
+
+电脑端服务位于 `server_pc/`，使用：
+
+- `Mosquitto` 作为 MQTT Broker
+- `FastAPI + Paho MQTT + SQLite`
+- 静态单页网页 + WebSocket 实时更新
+
+启动：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+docker compose up --build
+```
+
+启动后访问：
+
+```text
+http://<电脑IP>:8000
+```
+
+提供接口：
+
+- `GET /api/devices`
+- `GET /api/devices/{device_id}/state`
+- `GET /api/devices/{device_id}/events?limit=100`
+- `POST /api/devices/{device_id}/commands/db-count`
+- `POST /api/devices/{device_id}/commands/db-reset`
+- `POST /api/devices/{device_id}/commands/register-current`
+- `POST /api/devices/{device_id}/commands/shutdown`
+- `GET /ws`
+
+## 推荐启动顺序
+
+1. 开发机启动 `server_pc`，确认 `1883` 和 `8000` 可访问
+2. 板端 RT-Smart 启动 `face_ai.elf`
+3. 板端 RT-Smart 启动 `face_video.elf`
+4. 板端 RT-Smart 启动 `face_event.elf`
+5. 板端 Linux 小核启动 `face_netd`
+6. 浏览器打开 `http://<电脑IP>:8000`
+
+## v1 边界
+
+当前版本有意保持简单：
+
+- 不做实时视频和抓拍图
+- 不做 TLS、账号权限、多租户
+- 默认单板、单电脑、同一受信任局域网
+- 调试阶段不要同时从串口和网页并发下发命令

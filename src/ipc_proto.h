@@ -10,9 +10,16 @@
 #define IPC_FACE_EVT_CHANNEL "face_evt"
 /* event_service -> video_service：业务状态与退出（与 IPC_CMD_* 无关） */
 #define IPC_FACE_VIDEO_CTRL "face_video_ctrl"
+#define IPC_FACE_VIDEO_REPLY "face_video_reply"
+
+#define IPC_FACE_BRIDGE_SERVICE "face_bridge"
+#define IPC_FACE_BRIDGE_PORT 2301u
+#define IPC_FACE_BRIDGE_MODULE 1u
 
 #define IPC_MAX_FACES 8
 #define IPC_NAME_MAX 64
+#define IPC_REQUEST_ID_MAX 64
+#define IPC_OP_MESSAGE_MAX 128
 
 typedef enum {
     IPC_CMD_INFER = 0,
@@ -31,6 +38,12 @@ typedef enum {
     IPC_STATUS_ERR_INFER = 4,
     IPC_STATUS_ERR_BAD_CMD = 5,
 } ipc_status_t;
+
+typedef enum {
+    IPC_OP_RESULT_NONE = 0,
+    IPC_OP_RESULT_OK = 1,
+    IPC_OP_RESULT_FAIL = 2,
+} ipc_op_result_t;
 
 typedef struct {
     float x;
@@ -71,7 +84,9 @@ typedef struct {
     int32_t status; /* ipc_status_t */
     int32_t count;
     int32_t num_faces;
+    int32_t op_result; /* ipc_op_result_t */
     ipc_face_bundle_t faces[IPC_MAX_FACES];
+    char op_message[IPC_OP_MESSAGE_MAX];
 } ipc_ai_reply_t;
 
 /** face_ai -> face_event：业务事件类型（考勤/报警/留痕） */
@@ -85,11 +100,31 @@ typedef struct {
     uint32_t magic;
     int32_t face_id;
     float score;
+    uint64_t ts_ms; /* realtime ms */
     char name[IPC_NAME_MAX];
     uint8_t is_stranger; /* 1=陌生人；与 evt_kind 一致时 STRANGER 为 1 */
     uint8_t evt_kind;    /* ipc_evt_kind_t */
     uint8_t _pad[2];
 } ipc_evt_t;
+
+typedef enum {
+    IPC_VIDEO_CTRL_SRC_LOCAL = 0,
+    IPC_VIDEO_CTRL_SRC_BRIDGE = 1,
+} ipc_video_ctrl_source_t;
+
+typedef enum {
+    IPC_BRIDGE_CMD_NONE = 0,
+    IPC_BRIDGE_CMD_DB_COUNT = 1,
+    IPC_BRIDGE_CMD_DB_RESET = 2,
+    IPC_BRIDGE_CMD_REGISTER_CURRENT = 3,
+    IPC_BRIDGE_CMD_SHUTDOWN = 4,
+} ipc_bridge_cmd_t;
+
+typedef enum {
+    IPC_BRIDGE_MSG_CMD_REQ = 1,
+    IPC_BRIDGE_MSG_EVENT = 2,
+    IPC_BRIDGE_MSG_CMD_RESULT = 3,
+} ipc_bridge_msg_kind_t;
 
 typedef enum {
     IPC_VIDEO_CTRL_OP_SET = 0,
@@ -100,7 +135,54 @@ typedef struct {
     uint32_t magic;
     int32_t op; /* ipc_video_ctrl_op_t */
     int32_t state;
+    int32_t source;     /* ipc_video_ctrl_source_t */
+    int32_t bridge_cmd; /* ipc_bridge_cmd_t */
+    char request_id[IPC_REQUEST_ID_MAX];
     char register_name[IPC_NAME_MAX];
 } ipc_video_ctrl_t;
+
+typedef struct {
+    uint32_t magic;
+    int32_t source;     /* ipc_video_ctrl_source_t */
+    int32_t bridge_cmd; /* ipc_bridge_cmd_t */
+    int32_t count;
+    uint8_t ok;
+    uint8_t _pad[3];
+    char request_id[IPC_REQUEST_ID_MAX];
+    char message[IPC_OP_MESSAGE_MAX];
+} ipc_video_reply_t;
+
+typedef struct {
+    uint32_t magic;
+    int32_t cmd; /* ipc_bridge_cmd_t */
+    char request_id[IPC_REQUEST_ID_MAX];
+    char name[IPC_NAME_MAX];
+} bridge_cmd_req_t;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t accepted;
+    uint8_t _pad[3];
+    char reason[IPC_OP_MESSAGE_MAX];
+} bridge_cmd_ack_t;
+
+typedef struct {
+    uint32_t magic;
+    int32_t evt_kind; /* ipc_evt_kind_t */
+    int32_t face_id;
+    float score;
+    uint64_t ts_ms; /* realtime ms */
+    char name[IPC_NAME_MAX];
+} bridge_event_t;
+
+typedef struct {
+    uint32_t magic;
+    int32_t cmd; /* ipc_bridge_cmd_t */
+    int32_t count;
+    uint8_t ok;
+    uint8_t _pad[3];
+    char request_id[IPC_REQUEST_ID_MAX];
+    char message[IPC_OP_MESSAGE_MAX];
+} bridge_cmd_result_t;
 
 #endif

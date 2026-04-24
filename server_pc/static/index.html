@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>K230 Face Bridge</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">K230 Face Recognition Bridge</p>
+        <h1>设备状态、识别事件、反向控制</h1>
+        <p class="sub">网页通过 `FastAPI + WebSocket` 连电脑端服务，电脑端通过 MQTT 与板端 `face_netd` 通信。</p>
+      </div>
+      <div class="hero-actions">
+        <label class="field">
+          <span>设备</span>
+          <select id="deviceSelect"></select>
+        </label>
+        <button id="refreshAllBtn" class="secondary">刷新页面数据</button>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>当前状态</h2>
+        <div class="stats" id="deviceStats"></div>
+      </article>
+
+      <article class="card">
+        <h2>控制面板</h2>
+        <div class="controls">
+          <button id="dbCountBtn">刷新人数</button>
+          <button id="dbResetBtn" class="danger">清空数据库</button>
+          <label class="field">
+            <span>注册姓名</span>
+            <input id="registerName" type="text" maxlength="63" placeholder="例如 alice">
+          </label>
+          <button id="registerBtn">注册当前画面</button>
+          <button id="shutdownBtn" class="danger ghost">关闭系统</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <div class="section-head">
+          <h2>最近命令结果</h2>
+          <span id="wsStatus" class="badge offline">WS disconnected</span>
+        </div>
+        <div id="commandList" class="list"></div>
+      </article>
+
+      <article class="card">
+        <h2>最近识别事件</h2>
+        <div id="eventList" class="list"></div>
+      </article>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

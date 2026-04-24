@@ -4,6 +4,12 @@ build_codex/
 tmp/
 .idea/
 /.venv/
+/linux_bridge/out/
+/server_pc/data/*
+!/server_pc/data/.gitkeep
+/server_pc/__pycache__/
+/server_pc/app/__pycache__/
+/server_pc/.pytest_cache/
 /models_src/calib_npy/
 /models_src/nncase_dump/
 /host_test/

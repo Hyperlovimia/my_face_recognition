@@ -1,5 +1,7 @@
 set(common_ai_src ai_utils.cc ai_base.cc face_detection.cc face_recognition.cc anchors_320.cc anchors_640.cc)
 set(face_ai_src face_ai_main.cc ipc_shm.cc ipc_lwp_syscall.c ${common_ai_src} face_antispoof.cc)
+set(k230_sdk_root "${PROJECT_SOURCE_DIR}/../../../../")
+set(ipcmsg_root "${k230_sdk_root}/src/common/cdk/user/component/ipcmsg")
 
 set(mpp_link
     -Wl,--start-group
@@ -18,7 +20,9 @@ include_directories(${k230_mpp_root}/userapps/api/)
 include_directories(${k230_mpp_root}/include)
 include_directories(${k230_mpp_root}/include/comm)
 include_directories(${k230_mpp_root}/userapps/sample/sample_vo)
+include_directories(${ipcmsg_root}/include)
 link_directories(${nncase_sdk_root}/riscv64/rvvlib/)
+link_directories(${ipcmsg_root}/slave/lib)
 
 # 单进程原版（保留，无活体 FaceAntiSpoof）
 add_executable(face_recognition.elf main.cc video_pipeline.cc ${common_ai_src})
@@ -34,6 +38,6 @@ target_link_libraries(face_ai.elf ${nncase_link} ${opencv_link})
 
 # 三进程：事件 / 考勤日志
 add_executable(face_event.elf face_event_main.cc ipc_shm.cc ipc_lwp_syscall.c)
-target_link_libraries(face_event.elf sys atomic)
+target_link_libraries(face_event.elf sys atomic ipcmsg)
 
 install(TARGETS face_recognition.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)

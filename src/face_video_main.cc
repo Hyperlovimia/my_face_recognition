@@ -76,6 +76,10 @@ static std::atomic<bool> g_shutdown_ai_requested{false};
 static std::mutex g_ui;
 static std::string register_name;
 static std::atomic<int> g_video_ctrl_ch{-1};
+static std::atomic<int> g_video_reply_ch{-1};
+static ipc_video_ctrl_t g_last_ctrl{};
+static ipc_video_ctrl_t g_shutdown_ctrl{};
+static bool g_shutdown_ctrl_valid = false;
 
 /* 异步推理（仅 state==0）：采集线程只提交最新帧；独立线程 rpc，避免阻塞 GetFrame/VO。 */
 static constexpr size_t k_ai_frame_bytes = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
@@ -106,6 +110,82 @@ static bool metrics_log_enabled(int debug_mode)
 {
     const char *e = std::getenv("FACE_METRICS");
     return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
+}
+
+static const char *default_op_message(const ipc_ai_reply_t &reply, const char *fallback)
+{
+    return reply.op_message[0] ? reply.op_message : fallback;
+}
+
+static bool is_remote_ctrl(const ipc_video_ctrl_t &ctrl)
+{
+    return ctrl.source == IPC_VIDEO_CTRL_SRC_BRIDGE && ctrl.request_id[0] != '\0' &&
+           ctrl.bridge_cmd != IPC_BRIDGE_CMD_NONE;
+}
+
+static int ensure_video_reply_channel()
+{
+    int ch = g_video_reply_ch.load();
+    if (ch >= 0)
+        return ch;
+
+    for (int attempt = 0; attempt < 40 && !isp_stop.load(); ++attempt)
+    {
+        ch = rt_channel_open(IPC_FACE_VIDEO_REPLY, 0);
+        if (ch >= 0)
+        {
+            g_video_reply_ch.store(ch);
+            std::cout << "face_video: connected to " << IPC_FACE_VIDEO_REPLY << " (ch=" << ch << ")" << std::endl;
+            return ch;
+        }
+        usleep(50 * 1000);
+    }
+    return -1;
+}
+
+static bool send_video_reply(const ipc_video_ctrl_t &ctrl, bool ok, int32_t count, const char *message)
+{
+    if (!is_remote_ctrl(ctrl))
+        return true;
+
+    int ch = ensure_video_reply_channel();
+    if (ch < 0)
+    {
+        std::cerr << "face_video: " << IPC_FACE_VIDEO_REPLY << " not ready, drop result for " << ctrl.request_id
+                  << std::endl;
+        return false;
+    }
+
+    void *p = nullptr;
+    int shmid = ipc_shm_alloc(sizeof(ipc_video_reply_t), &p);
+    if (shmid < 0 || !p)
+        return false;
+
+    ipc_video_reply_t *reply = (ipc_video_reply_t *)p;
+    memset(reply, 0, sizeof(*reply));
+    reply->magic = IPC_MAGIC;
+    reply->source = ctrl.source;
+    reply->bridge_cmd = ctrl.bridge_cmd;
+    reply->count = count;
+    reply->ok = ok ? 1 : 0;
+    strncpy(reply->request_id, ctrl.request_id, IPC_REQUEST_ID_MAX - 1);
+    if (message)
+        strncpy(reply->message, message, IPC_OP_MESSAGE_MAX - 1);
+    lwp_shmdt(p);
+
+    struct rt_channel_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = RT_CHANNEL_RAW;
+    msg.u.d = (void *)(intptr_t)shmid;
+
+    if (rt_channel_send(ch, &msg) == 0)
+        return true;
+
+    ipc_shm_free(shmid);
+    rt_channel_close(ch);
+    g_video_reply_ch.store(-1);
+    std::cerr << "face_video: send " << IPC_FACE_VIDEO_REPLY << " failed, channel reset\n";
+    return false;
 }
 
 static void ctrl_recv_loop()
@@ -154,6 +234,11 @@ static void ctrl_recv_loop()
 
         if ((ipc_video_ctrl_op_t)c->op == IPC_VIDEO_CTRL_OP_QUIT)
         {
+            {
+                std::lock_guard<std::mutex> lk(g_ui);
+                memcpy(&g_shutdown_ctrl, c, sizeof(*c));
+                g_shutdown_ctrl_valid = true;
+            }
             g_shutdown_ai_requested.store(true);
             isp_stop = true;
             lwp_shmdt(p);
@@ -164,6 +249,7 @@ static void ctrl_recv_loop()
         cur_state.store(c->state);
         {
             std::lock_guard<std::mutex> lk(g_ui);
+            memcpy(&g_last_ctrl, c, sizeof(*c));
             register_name.assign(c->register_name);
         }
         g_infer_cv.notify_all();
@@ -377,7 +463,12 @@ static void video_ipc_loop(int debug_mode)
 
         int state = cur_state.load();
         ipc_ai_reply_t ai_reply{};
+        ipc_video_ctrl_t ctrl_snapshot{};
         memset(&ai_reply, 0, sizeof(ai_reply));
+        {
+            std::lock_guard<std::mutex> lk(g_ui);
+            memcpy(&ctrl_snapshot, &g_last_ctrl, sizeof(ctrl_snapshot));
+        }
         const auto now = std::chrono::steady_clock::now();
         const bool preview_active = !register_preview_src.empty() && now < register_preview_deadline;
 
@@ -409,8 +500,11 @@ static void video_ipc_loop(int debug_mode)
         else if (state == 1)
         {
             ipc_ai_reply_t r{};
-            if (rpc_ai_sync(ai_ch, IPC_CMD_DB_COUNT, nullptr, 0, 1, 1, 1, nullptr, &r))
+            bool ok = rpc_ai_sync(ai_ch, IPC_CMD_DB_COUNT, nullptr, 0, 1, 1, 1, nullptr, &r);
+            if (ok)
                 std::cout << "当前注册人数：" << r.count << " 人。" << std::endl;
+            send_video_reply(ctrl_snapshot, ok && r.op_result != IPC_OP_RESULT_FAIL, ok ? r.count : -1,
+                             ok ? default_op_message(r, "database count ready") : "database count rpc failed");
             cur_state = 0;
             display_state = 0;
         }
@@ -450,11 +544,11 @@ static void video_ipc_loop(int debug_mode)
             uint32_t tc = 3u;
 
             ipc_ai_reply_t r{};
-            if (rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw, name_copy.c_str(),
-                            &r))
-            {
-                /* result printed in face_ai */
-            }
+            bool ok =
+                rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw,
+                            name_copy.c_str(), &r);
+            send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, 0,
+                             ok ? default_op_message(r, "register processed") : "register rpc failed");
             cur_state = 0;
             display_state = 0;
         }
@@ -491,19 +585,22 @@ static void video_ipc_loop(int debug_mode)
             uint32_t tc = 3u;
 
             ipc_ai_reply_t r{};
-            if (rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw, name_copy.c_str(),
-                            &r))
-            {
-                /* result printed in face_ai */
-            }
+            bool ok =
+                rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw,
+                            name_copy.c_str(), &r);
+            send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, 0,
+                             ok ? default_op_message(r, "register processed") : "register rpc failed");
             cur_state = 0;
             display_state = 2;
         }
         else if (state == 4)
         {
             ipc_ai_reply_t r{};
-            if (rpc_ai_sync(ai_ch, IPC_CMD_DB_RESET, nullptr, 0, 1, 1, 1, nullptr, &r))
+            bool ok = rpc_ai_sync(ai_ch, IPC_CMD_DB_RESET, nullptr, 0, 1, 1, 1, nullptr, &r);
+            if (ok)
                 std::cout << "人脸数据库已清空！" << std::endl;
+            send_video_reply(ctrl_snapshot, ok && r.op_result != IPC_OP_RESULT_FAIL, 0,
+                             ok ? default_op_message(r, "database reset") : "database reset rpc failed");
             cur_state = 0;
             display_state = 0;
         }
@@ -549,10 +646,28 @@ static void video_ipc_loop(int debug_mode)
     if (g_shutdown_ai_requested.load())
     {
         ipc_ai_reply_t shutdown_reply{};
-        if (rpc_ai_sync(ai_ch, IPC_CMD_SHUTDOWN, nullptr, 0, 1, 1, 1, nullptr, &shutdown_reply))
+        bool ok = rpc_ai_sync(ai_ch, IPC_CMD_SHUTDOWN, nullptr, 0, 1, 1, 1, nullptr, &shutdown_reply);
+        if (ok)
             std::cout << "face_video: AI shutdown acknowledged\n";
         else
             std::cout << "face_video: warn: AI shutdown request failed\n";
+
+        ipc_video_ctrl_t shutdown_ctrl{};
+        bool shutdown_ctrl_valid = false;
+        {
+            std::lock_guard<std::mutex> lk(g_ui);
+            if (g_shutdown_ctrl_valid)
+            {
+                memcpy(&shutdown_ctrl, &g_shutdown_ctrl, sizeof(shutdown_ctrl));
+                shutdown_ctrl_valid = true;
+            }
+        }
+        if (shutdown_ctrl_valid)
+        {
+            send_video_reply(shutdown_ctrl, ok && shutdown_reply.op_result != IPC_OP_RESULT_FAIL, 0,
+                             ok ? default_op_message(shutdown_reply, "shutdown acknowledged")
+                                : "shutdown rpc failed");
+        }
     }
 
     if (g_fixed_infer_ptr)
@@ -568,6 +683,10 @@ static void video_ipc_loop(int debug_mode)
     g_fixed_infer_ready = false;
 
     rt_channel_close(ai_ch);
+    int reply_ch = g_video_reply_ch.load();
+    if (reply_ch >= 0)
+        rt_channel_close(reply_ch);
+    g_video_reply_ch.store(-1);
     pl.Destroy();
 }
 
@@ -581,6 +700,14 @@ int main(int argc, char **argv)
     }
     int debug_mode = atoi(argv[1]);
     g_shutdown_ai_requested.store(false);
+    g_video_reply_ch.store(-1);
+    {
+        std::lock_guard<std::mutex> lk(g_ui);
+        memset(&g_last_ctrl, 0, sizeof(g_last_ctrl));
+        memset(&g_shutdown_ctrl, 0, sizeof(g_shutdown_ctrl));
+        g_shutdown_ctrl_valid = false;
+        register_name.clear();
+    }
 
     std::thread th_ctrl(ctrl_recv_loop);
     for (int i = 0; i < 100 && g_video_ctrl_ch.load() < 0; i++)
