@@ -112,12 +112,19 @@ typedef enum {
     IPC_VIDEO_CTRL_SRC_BRIDGE = 1,
 } ipc_video_ctrl_source_t;
 
+/* 数值为 MQTT/IPC 有线协议：linux_bridge/face_event/face_netd 需同源编译、同时更新板子 */
 typedef enum {
     IPC_BRIDGE_CMD_NONE = 0,
     IPC_BRIDGE_CMD_DB_COUNT = 1,
     IPC_BRIDGE_CMD_DB_RESET = 2,
     IPC_BRIDGE_CMD_REGISTER_CURRENT = 3,
     IPC_BRIDGE_CMD_SHUTDOWN = 4,
+    /** 抓拍+预览(步进注册 step1，对应 video state 2) */
+    IPC_BRIDGE_CMD_REGISTER_PREVIEW = 5,
+    /** 提交姓名完成注册(步进 step2，对应 video state 3) */
+    IPC_BRIDGE_CMD_REGISTER_COMMIT = 6,
+    /** 放弃注册并关闭预览小窗(对应 video state 6) */
+    IPC_BRIDGE_CMD_REGISTER_CANCEL = 7,
 } ipc_bridge_cmd_t;
 
 typedef enum {

@@ -193,14 +193,11 @@ MQTT topic 约定：
 
 - `Mosquitto` 作为 MQTT Broker
 - `FastAPI + Paho MQTT + SQLite`
-- 静态单页网页 + WebSocket 实时更新
+- 网页为 **React + Vite + TypeScript**（源码在 `server_pc/web/`，构建生成到 `server_pc/static/`），WebSocket 实时更新
 
-启动：
+启动：在 `server_pc` 下执行 `docker compose up --build` 即可。`Dockerfile` 为**多阶段**：构建阶段在镜像内 `npm install` / `npm run build`（需能拉取 `node:20-bookworm-slim`；可先 `docker pull node:20-bookworm-slim` 缓存在本机）。若**无法**访问 Docker Hub，可改为在宿主机用本机 Node 在 `server_pc/web` 里打好 `static/`，并改用本仓库的 `Dockerfile.prebuilt`（只复制 `static/`，不装 Node 镜像，见同目录下文件说明）或等价的单阶段 `COPY static`。
 
-```bash
-cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
-docker compose up --build
-```
+若**不用 Docker**、直接本机起 `uvicorn`，需先在 `server_pc/web` 执行 `npm install && npm run build`，或开发时用 Vite 代理（见 `server_pc/web/README.md`）。
 
 ### 如果 `server_pc` 运行在 WSL / Docker 中
 
@@ -270,6 +267,9 @@ http://<电脑IP>:8000
 - `POST /api/devices/{device_id}/commands/db-count`
 - `POST /api/devices/{device_id}/commands/db-reset`
 - `POST /api/devices/{device_id}/commands/register-current`
+- `POST /api/devices/{device_id}/commands/register-preview`
+- `POST /api/devices/{device_id}/commands/register-commit`
+- `POST /api/devices/{device_id}/commands/register-cancel`
 - `POST /api/devices/{device_id}/commands/shutdown`
 - `GET /ws`
 
@@ -410,7 +410,7 @@ docker exec -it face-mosquitto mosquitto_sub -h 127.0.0.1 -t 'k230/+/up/#' -v
 然后在网页依次测试：
 
 1. `db-count`
-2. `register-current`
+2. `register-preview` / `register-commit`（或一键 `register-current`）
 3. `db-reset`
 4. `shutdown`
 

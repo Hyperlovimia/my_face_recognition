@@ -24,6 +24,10 @@ extern "C" {
 #include "../src/ipc_proto.h"
 #include "third_party/mongoose/mongoose.h"
 
+/* Must match face_event.elf / ipc_proto.h on K230; do not renumber without redeploying all sides. */
+static_assert(sizeof(bridge_cmd_req_t) == 136, "bridge_cmd_req_t ABI");
+static_assert(IPC_BRIDGE_CMD_REGISTER_PREVIEW == 5, "wire cmd for register_preview");
+
 namespace {
 
 constexpr const char *kSchema = "k230.face.bridge.v1";
@@ -33,6 +37,10 @@ constexpr int kMqttConnectTimeoutMs = 10000;
 constexpr int kMqttRetryInitialMs = 1000;
 constexpr int kMqttRetryMaxMs = 8000;
 constexpr size_t kMaxQueueDepth = 512;
+/** Min / max for heartbeat_interval_ms after load (avoid MQTT flood or accidental hang). */
+constexpr int kHeartbeatMinMs = 200;
+constexpr int kHeartbeatMaxMs = 120000;
+constexpr int kHeartbeatDefaultMs = 1000;
 
 struct Config {
     std::string device_id = "k230-dev-01";
@@ -40,7 +48,7 @@ struct Config {
     std::string mqtt_client_id = "face-netd-k230-dev-01";
     std::string mqtt_username;
     std::string mqtt_password;
-    int heartbeat_interval_ms = 5000;
+    int heartbeat_interval_ms = kHeartbeatDefaultMs;
     int ipc_connect_retry_ms = 500;
     int ipc_sync_timeout_ms = 3000;
     int mqtt_keepalive_s = 15;
@@ -227,7 +235,11 @@ bool load_config(const std::string &path, Config *cfg)
     if (cfg->mqtt_url.empty())
         cfg->mqtt_url = "mqtt://192.168.1.10:1883";
     if (cfg->heartbeat_interval_ms <= 0)
-        cfg->heartbeat_interval_ms = 5000;
+        cfg->heartbeat_interval_ms = kHeartbeatDefaultMs;
+    if (cfg->heartbeat_interval_ms < kHeartbeatMinMs)
+        cfg->heartbeat_interval_ms = kHeartbeatMinMs;
+    if (cfg->heartbeat_interval_ms > kHeartbeatMaxMs)
+        cfg->heartbeat_interval_ms = kHeartbeatMaxMs;
     if (cfg->ipc_connect_retry_ms <= 0)
         cfg->ipc_connect_retry_ms = 500;
     if (cfg->ipc_sync_timeout_ms <= 0)
@@ -318,6 +330,12 @@ const char *bridge_cmd_name(int cmd)
         return "db_reset";
     case IPC_BRIDGE_CMD_REGISTER_CURRENT:
         return "register_current";
+    case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
+        return "register_preview";
+    case IPC_BRIDGE_CMD_REGISTER_COMMIT:
+        return "register_commit";
+    case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+        return "register_cancel";
     case IPC_BRIDGE_CMD_SHUTDOWN:
         return "shutdown";
     default:
@@ -335,6 +353,12 @@ bool bridge_cmd_from_string(const std::string &cmd, int *out)
         *out = IPC_BRIDGE_CMD_DB_RESET;
     else if (cmd == "register_current")
         *out = IPC_BRIDGE_CMD_REGISTER_CURRENT;
+    else if (cmd == "register_preview" || cmd == "register-preview")
+        *out = IPC_BRIDGE_CMD_REGISTER_PREVIEW;
+    else if (cmd == "register_commit" || cmd == "register-commit")
+        *out = IPC_BRIDGE_CMD_REGISTER_COMMIT;
+    else if (cmd == "register_cancel" || cmd == "register-cancel")
+        *out = IPC_BRIDGE_CMD_REGISTER_CANCEL;
     else if (cmd == "shutdown")
         *out = IPC_BRIDGE_CMD_SHUTDOWN;
     else
@@ -579,7 +603,7 @@ void command_worker_thread()
 
         bridge_cmd_req_t req{};
         req.magic = IPC_MAGIC;
-        req.cmd = cmd.cmd;
+        req.cmd = static_cast<int32_t>(cmd.cmd);
         strncpy(req.request_id, cmd.request_id.c_str(), sizeof(req.request_id) - 1);
         strncpy(req.name, cmd.name.c_str(), sizeof(req.name) - 1);
 
@@ -686,6 +710,11 @@ void parse_and_enqueue_command(mg_str json)
         return;
     }
     if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_CURRENT && name_s.empty())
+    {
+        publish_reply_failure(request_id_s, bridge_cmd, "name is required");
+        return;
+    }
+    if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_COMMIT && name_s.empty())
     {
         publish_reply_failure(request_id_s, bridge_cmd, "name is required");
         return;

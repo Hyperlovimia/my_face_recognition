@@ -16,8 +16,23 @@ export MPP_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/mpp/"
 export NNCASE_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/nncase/"
 export OPENCV_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/utils/lib/opencv/"
 
-# Set cross-compile toolchain path
-export PATH=$PATH:/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin
+# Cross-compile RISC-V musl 工具链：优先用 SDK 根目录下 toolchain/（本机/完整 SDK 树），
+# 再兼容 Docker 里挂载的 /opt/toolchain。
+K230_RISCV_BIN="${SDK_SRC_ROOT_DIR}/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
+if [ -d "${K230_RISCV_BIN}" ]; then
+    export PATH="${K230_RISCV_BIN}:${PATH}"
+else
+    export PATH="${PATH}:/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
+fi
+
+if ! command -v riscv64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+    echo "[ERROR] riscv64-unknown-linux-musl-gcc is not in PATH."
+    echo "  Put the K230 riscv64 musl toolchain under:"
+    echo "    ${K230_RISCV_BIN}"
+    echo "  (same layout as a full k230_sdk checkout), or in Docker mount:"
+    echo "    -v \$(pwd)/toolchain:/opt/toolchain   (run from <k230_sdk_root>)"
+    exit 1
+fi
 
 # =======================
 # Output directories

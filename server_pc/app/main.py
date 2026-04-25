@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,6 +28,11 @@ SCHEMA = "k230.face.bridge.v1"
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def server_now_ms() -> int:
+    """Wall-clock ms on the PC; use for Last seen so UI matches local time even if device clock is unset."""
+    return int(time.time() * 1000)
 
 
 def json_dumps(data: Any) -> str:
@@ -186,7 +192,9 @@ class FaceWebState:
         db_count: int,
         last_seen_ms: int,
         last_status_json: str | None,
+        updated_at: str | None = None,
     ) -> None:
+        ts = updated_at if updated_at is not None else now_iso()
         with self.db_lock:
             self.db.execute(
                 """
@@ -207,7 +215,7 @@ class FaceWebState:
                     db_count,
                     last_seen_ms,
                     last_status_json,
-                    now_iso(),
+                    ts,
                 ),
             )
             self.db.commit()
@@ -216,7 +224,8 @@ class FaceWebState:
         online = 1 if payload.get("online") else 0
         rt_connected = 1 if payload.get("rt_connected") else 0
         db_count = int(payload.get("db_count", -1))
-        last_seen_ms = int(payload.get("last_seen_ms", 0))
+        last_seen_ms = server_now_ms()
+        updated = now_iso()
         self._upsert_device(
             device_id,
             online=online,
@@ -224,8 +233,22 @@ class FaceWebState:
             db_count=db_count,
             last_seen_ms=last_seen_ms,
             last_status_json=json_dumps(payload),
+            updated_at=updated,
         )
-        return {"type": "status", "device_id": device_id, "payload": payload}
+        device_row: dict[str, Any] = {
+            "device_id": device_id,
+            "online": online,
+            "rt_connected": rt_connected,
+            "db_count": db_count,
+            "last_seen_ms": last_seen_ms,
+            "updated_at": updated,
+        }
+        return {
+            "type": "status",
+            "device_id": device_id,
+            "payload": payload,
+            "device": device_row,
+        }
 
     def _handle_event(self, device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         evt_kind = str(payload.get("evt_kind", "unknown"))
@@ -251,7 +274,7 @@ class FaceWebState:
             online=online,
             rt_connected=rt_connected,
             db_count=db_count,
-            last_seen_ms=ts_ms,
+            last_seen_ms=server_now_ms(),
             last_status_json=None,
         )
         return {"type": "event", "device_id": device_id, "payload": payload}
@@ -296,13 +319,12 @@ class FaceWebState:
         online = int(bool(row["online"])) if row else 1
         rt_connected = int(bool(row["rt_connected"])) if row else 1
         db_count = count if ok and cmd == "db_count" else (0 if ok and cmd == "db_reset" else (int(row["db_count"]) if row else -1))
-        last_seen_ms = int(row["last_seen_ms"]) if row else 0
         self._upsert_device(
             device_id,
             online=online,
             rt_connected=rt_connected,
             db_count=db_count,
-            last_seen_ms=last_seen_ms,
+            last_seen_ms=server_now_ms(),
             last_status_json=None,
         )
         return {"type": "reply", "device_id": device_id, "payload": payload}
@@ -432,6 +454,12 @@ async def root() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """避免浏览器自动请求时刷 404 日志；无资源时 204 即可。"""
+    return Response(status_code=204)
+
+
 @app.get("/api/devices")
 async def api_devices() -> dict[str, Any]:
     return {"devices": state.list_devices()}
@@ -473,6 +501,21 @@ async def api_cmd_db_reset(device_id: str) -> dict[str, Any]:
 @app.post("/api/devices/{device_id}/commands/register-current", status_code=202)
 async def api_cmd_register_current(device_id: str, body: RegisterCurrentBody) -> dict[str, Any]:
     return state.publish_command(device_id, "register_current", name=body.name.strip())
+
+
+@app.post("/api/devices/{device_id}/commands/register-preview", status_code=202)
+async def api_cmd_register_preview(device_id: str) -> dict[str, Any]:
+    return state.publish_command(device_id, "register_preview")
+
+
+@app.post("/api/devices/{device_id}/commands/register-commit", status_code=202)
+async def api_cmd_register_commit(device_id: str, body: RegisterCurrentBody) -> dict[str, Any]:
+    return state.publish_command(device_id, "register_commit", name=body.name.strip())
+
+
+@app.post("/api/devices/{device_id}/commands/register-cancel", status_code=202)
+async def api_cmd_register_cancel(device_id: str) -> dict[str, Any]:
+    return state.publish_command(device_id, "register_cancel")
 
 
 @app.post("/api/devices/{device_id}/commands/shutdown", status_code=202)

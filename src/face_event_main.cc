@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -16,6 +17,8 @@
 #include "ipc_shm.h"
 #include "ipc_lwp_user.h"
 #include "k_ipcmsg.h"
+
+static_assert(IPC_BRIDGE_CMD_REGISTER_PREVIEW == 5, "wire value must match linux_bridge register_preview");
 
 static std::atomic<int> g_video_ch{-1};
 static std::atomic<int> g_bridge_id{-1};
@@ -60,6 +63,12 @@ static const char *bridge_cmd_name(int32_t cmd)
         return "db_reset";
     case IPC_BRIDGE_CMD_REGISTER_CURRENT:
         return "register_current";
+    case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
+        return "register_preview";
+    case IPC_BRIDGE_CMD_REGISTER_COMMIT:
+        return "register_commit";
+    case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+        return "register_cancel";
     case IPC_BRIDGE_CMD_SHUTDOWN:
         return "shutdown";
     default:
@@ -92,8 +101,31 @@ static int bridge_cmd_to_state(ipc_bridge_cmd_t cmd)
         return 4;
     case IPC_BRIDGE_CMD_REGISTER_CURRENT:
         return 5;
+    case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
+        return 2;
+    case IPC_BRIDGE_CMD_REGISTER_COMMIT:
+        return 3;
+    case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+        return 6;
     default:
         return 0;
+    }
+}
+
+static bool is_supported_bridge_cmd(int32_t c)
+{
+    switch (c)
+    {
+    case IPC_BRIDGE_CMD_DB_COUNT:
+    case IPC_BRIDGE_CMD_DB_RESET:
+    case IPC_BRIDGE_CMD_REGISTER_CURRENT:
+    case IPC_BRIDGE_CMD_SHUTDOWN:
+    case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
+    case IPC_BRIDGE_CMD_REGISTER_COMMIT:
+    case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -299,15 +331,23 @@ static void bridge_handle_message(k_s32 s32Id, k_ipcmsg_message_t *msg)
         return;
     }
 
-    ipc_bridge_cmd_t bridge_cmd = (ipc_bridge_cmd_t)req.cmd;
-    if (bridge_cmd != IPC_BRIDGE_CMD_DB_COUNT && bridge_cmd != IPC_BRIDGE_CMD_DB_RESET &&
-        bridge_cmd != IPC_BRIDGE_CMD_REGISTER_CURRENT && bridge_cmd != IPC_BRIDGE_CMD_SHUTDOWN)
+    int32_t raw_cmd = req.cmd;
+    if (!is_supported_bridge_cmd(raw_cmd))
     {
-        reply_bridge_ack(s32Id, msg, false, "unsupported command");
+        char detail[IPC_OP_MESSAGE_MAX];
+        snprintf(detail, sizeof(detail), "unsupported command (cmd=%d) redeploy face_event.elf+ipc_proto", (int)raw_cmd);
+        reply_bridge_ack(s32Id, msg, false, detail);
         return;
     }
 
+    const ipc_bridge_cmd_t bridge_cmd = (ipc_bridge_cmd_t)raw_cmd;
+
     if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_CURRENT && req.name[0] == '\0')
+    {
+        reply_bridge_ack(s32Id, msg, false, "name is required");
+        return;
+    }
+    if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_COMMIT && req.name[0] == '\0')
     {
         reply_bridge_ack(s32Id, msg, false, "name is required");
         return;
@@ -487,7 +527,20 @@ static void video_reply_recv_loop(int reply_ch)
         std::cout << "face_event: bridge result cmd=" << bridge_cmd_name(reply->bridge_cmd)
                   << " request_id=" << reply->request_id << " ok=" << (int)reply->ok
                   << " message=" << reply->message << std::endl;
-        forward_bridge_result(reply);
+        try
+        {
+            forward_bridge_result(reply);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "face_event: forward_bridge_result: " << e.what() << std::endl;
+            clear_bridge_inflight_if_match(reply->request_id);
+        }
+        catch (...)
+        {
+            std::cerr << "face_event: forward_bridge_result: unknown exception\n";
+            clear_bridge_inflight_if_match(reply->request_id);
+        }
 
         lwp_shmdt(reply);
         ipc_shm_free(shmid);

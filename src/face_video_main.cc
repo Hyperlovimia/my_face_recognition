@@ -42,6 +42,9 @@ void convert_preview_to_osd_argb8888(const cv::Mat &src_preview, cv::Mat &dst_ar
 /* 竖屏模式下 VO 视频层走 K_ROTATION_90；注册预览保持同方向，并限制在角落。 */
 void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
 {
+    if (dump_img.empty() || dump_img.rows < 1 || dump_img.cols < 1) {
+        return;
+    }
     cv::Mat oriented_preview;
     if (DISPLAY_ROTATE) {
         cv::rotate(dump_img, oriented_preview, cv::ROTATE_90_CLOCKWISE);
@@ -104,6 +107,7 @@ static std::atomic<uint64_t> g_metric_infer_rpc_ok{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_fail{0};
 static std::atomic<uint64_t> g_metric_infer_stale{0};
 static std::atomic<uint64_t> g_metric_infer_applied{0};
+/* 与 face_event 终端输入「i」一致：OSD 小窗只短时显示；dump_img 会保留到下一步输入姓名或取消 */
 static constexpr int k_register_preview_hold_ms = 2000;
 
 static bool metrics_log_enabled(int debug_mode)
@@ -115,6 +119,16 @@ static bool metrics_log_enabled(int debug_mode)
 static const char *default_op_message(const ipc_ai_reply_t &reply, const char *fallback)
 {
     return reply.op_message[0] ? reply.op_message : fallback;
+}
+
+/** register_commit 后带给桥接/网页的说明：成功或携带 face_ai 的 op_message（如活体未通过） */
+static const char *register_commit_reply_message(const ipc_ai_reply_t &r, bool rpc_ok)
+{
+    if (rpc_ok && r.op_result == IPC_OP_RESULT_OK)
+        return default_op_message(r, "register processed");
+    if (r.op_message[0] != '\0')
+        return r.op_message;
+    return rpc_ok ? "register rejected" : "register rpc failed";
 }
 
 static bool is_remote_ctrl(const ipc_video_ctrl_t &ctrl)
@@ -469,8 +483,6 @@ static void video_ipc_loop(int debug_mode)
             std::lock_guard<std::mutex> lk(g_ui);
             memcpy(&ctrl_snapshot, &g_last_ctrl, sizeof(ctrl_snapshot));
         }
-        const auto now = std::chrono::steady_clock::now();
-        const bool preview_active = !register_preview_src.empty() && now < register_preview_deadline;
 
         uint8_t *frame_ptr = reinterpret_cast<uint8_t *>(dump_res.virt_addr);
         size_t frame_len = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
@@ -523,6 +535,7 @@ static void video_ipc_loop(int debug_mode)
             cv::merge(sensor_bgr, dump_img);
             cur_state = 0;
             display_state = 2;
+            send_video_reply(ctrl_snapshot, true, 0, "register preview ready");
         }
         else if (state == 3)
         {
@@ -548,9 +561,14 @@ static void video_ipc_loop(int debug_mode)
                 rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw,
                             name_copy.c_str(), &r);
             send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, 0,
-                             ok ? default_op_message(r, "register processed") : "register rpc failed");
+                             register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 0;
+            if (!register_preview_src.empty())
+            {
+                register_preview_src.release();
+            }
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
         }
         /* 本帧抓拍并提交注册，避免「i」与姓名分开发送时 cur_state 被覆盖导致未抓拍 */
         else if (state == 5)
@@ -589,9 +607,20 @@ static void video_ipc_loop(int debug_mode)
                 rpc_ai_sync(ai_ch, IPC_CMD_REGISTER_COMMIT, chw_vec.data(), chw_vec.size(), tc, th, tw,
                             name_copy.c_str(), &r);
             send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, 0,
-                             ok ? default_op_message(r, "register processed") : "register rpc failed");
+                             register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 2;
+        }
+        else if (state == 6)
+        {
+            if (!register_preview_src.empty())
+            {
+                register_preview_src.release();
+            }
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
+            cur_state = 0;
+            display_state = 0;
+            send_video_reply(ctrl_snapshot, true, 0, "register preview cancelled");
         }
         else if (state == 4)
         {
@@ -605,14 +634,19 @@ static void video_ipc_loop(int debug_mode)
             display_state = 0;
         }
 
+        /* 须在 state 1–6 可能 release 了 register_preview_src 之后计算，避免同一帧仍用已失效的 preview_active 去 resize 空图 */
+        const auto now_after_ctrl = std::chrono::steady_clock::now();
+        const bool preview_still =
+            !register_preview_src.empty() && now_after_ctrl < register_preview_deadline;
+
         if (display_state == 2)
         {
-            /* 首次进入注册预览：缓存 dump_img 副本，设定 2 秒过期时刻；旋转/缩放每帧按源重做。 */
+            /* 首次进入注册预览：缓存 dump_img 副本，设定过期时刻；旋转/缩放每帧按源重做。 */
             register_preview_src = dump_img.clone();
-            register_preview_deadline = now + std::chrono::milliseconds(k_register_preview_hold_ms);
+            register_preview_deadline = now_after_ctrl + std::chrono::milliseconds(k_register_preview_hold_ms);
             render_register_preview(draw_frame, register_preview_src);
         }
-        else if (preview_active)
+        else if (preview_still)
         {
             render_register_preview(draw_frame, register_preview_src);
         }

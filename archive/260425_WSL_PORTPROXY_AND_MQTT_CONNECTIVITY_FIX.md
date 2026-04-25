@@ -180,8 +180,8 @@ docker compose logs --tail=50 mosquitto face-web
 wsl hostname -I
 netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=1883
 netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=8000
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=<当前WSL_IP> connectport=1883
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=<当前WSL_IP> connectport=8000
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=172.26.111.179 connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=172.26.111.179 connectport=8000
 ```
 
 注意：

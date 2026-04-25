@@ -1,0 +1,14 @@
+# 可选：当无法拉取 node 镜像时，在宿主机 server_pc/web 执行 npm install && npm run build
+# 生成 static/ 后，用本文件构建： docker build -f Dockerfile.prebuilt .
+FROM python:3.11-slim
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY app /app/app
+COPY static /app/static
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
