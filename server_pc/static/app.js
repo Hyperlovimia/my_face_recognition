@@ -9,6 +9,7 @@ const state = {
 const els = {
   deviceSelect: document.getElementById("deviceSelect"),
   refreshAllBtn: document.getElementById("refreshAllBtn"),
+  clearWebDataBtn: document.getElementById("clearWebDataBtn"),
   deviceStats: document.getElementById("deviceStats"),
   commandList: document.getElementById("commandList"),
   eventList: document.getElementById("eventList"),
@@ -173,6 +174,12 @@ async function postCommand(path, body) {
   return result;
 }
 
+async function clearWebData() {
+  const result = await fetchJson("/api/web-data/clear", { method: "POST" });
+  await refreshAll();
+  return result;
+}
+
 function connectWs() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   state.ws = new WebSocket(`${protocol}://${location.host}/ws`);
@@ -216,8 +223,25 @@ els.deviceSelect.addEventListener("change", async (event) => {
 });
 
 els.refreshAllBtn.addEventListener("click", refreshAll);
+els.clearWebDataBtn.addEventListener("click", async () => {
+  if (!confirm("确定要清空当前网页保存的本地设备、命令和事件记录吗？这不会清空开发板的人脸库。")) {
+    return;
+  }
+  try {
+    const result = await clearWebData();
+    const cleared = result.cleared || {};
+    alert(`已清空网页本地数据：设备 ${cleared.devices || 0} 条，命令 ${cleared.commands || 0} 条，事件 ${cleared.events || 0} 条`);
+  } catch (err) {
+    console.error(err);
+    alert(err.message);
+  }
+});
 els.dbCountBtn.addEventListener("click", () => postCommand("db-count"));
-els.dbResetBtn.addEventListener("click", () => postCommand("db-reset"));
+els.dbResetBtn.addEventListener("click", () => {
+  if (confirm("确定要清空当前设备的人脸数据库吗？")) {
+    postCommand("db-reset");
+  }
+});
 els.registerBtn.addEventListener("click", () => {
   const name = els.registerName.value.trim();
   if (!name) {

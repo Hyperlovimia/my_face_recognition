@@ -349,6 +349,27 @@ class FaceWebState:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def clear_web_data(self) -> dict[str, int]:
+        with self.db_lock:
+            cur = self.db.cursor()
+            event_count = int(cur.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            command_count = int(cur.execute("SELECT COUNT(*) FROM commands").fetchone()[0])
+            device_count = int(cur.execute("SELECT COUNT(*) FROM devices").fetchone()[0])
+            cur.executescript(
+                """
+                DELETE FROM events;
+                DELETE FROM commands;
+                DELETE FROM devices;
+                DELETE FROM sqlite_sequence WHERE name IN ('events', 'commands');
+                """
+            )
+            self.db.commit()
+        return {
+            "devices": device_count,
+            "events": event_count,
+            "commands": command_count,
+        }
+
     def publish_command(self, device_id: str, cmd: str, *, name: str | None = None) -> dict[str, Any]:
         if not self.mqtt_connected.is_set():
             raise HTTPException(status_code=503, detail="MQTT broker is not connected")
@@ -429,6 +450,14 @@ async def api_device_events(device_id: str, limit: int = Query(default=100, ge=1
     if state.get_device_state(device_id) is None:
         raise HTTPException(status_code=404, detail="device not found")
     return {"events": state.get_events(device_id, limit)}
+
+
+@app.post("/api/web-data/clear")
+async def api_clear_web_data() -> dict[str, Any]:
+    cleared = state.clear_web_data()
+    if state.loop:
+        await state.ws.broadcast({"type": "snapshot", "devices": state.list_devices()})
+    return {"status": "ok", "cleared": cleared}
 
 
 @app.post("/api/devices/{device_id}/commands/db-count", status_code=202)
