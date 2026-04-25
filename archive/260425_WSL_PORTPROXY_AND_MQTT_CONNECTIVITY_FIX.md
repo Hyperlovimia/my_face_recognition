@@ -136,6 +136,76 @@ Get-NetTCPConnection -LocalPort 1883,8000 -State Listen
 - `portproxy` 规则已经存在
 - `1883` / `8000` 已不再只绑定到 `127.0.0.1`
 
+但这一步只说明“转发规则存在”，**不能单独证明** 重启后 `127.0.0.1:1883` 这一跳仍然真正通到 WSL / Docker 里的 `mosquitto`。
+
+如果板端日志变成下面这样：
+
+```text
+face_netd: mqtt event CONNECT id=1 send CONNECT ...
+face_netd: mqtt event WRITE id=1 bytes=...
+face_netd: mqtt pending id=1 ... connecting=0 send=0 recv=0
+face_netd: mqtt event CLOSE id=1 connected=0 ...
+```
+
+则含义已经不是“TCP 三次握手没完成”，而是：
+
+- Windows 局域网地址上的 `1883` 已经有人接受连接
+- `face_netd` 已经把 MQTT `CONNECT` 包写出去了
+- 但后端真正的 MQTT Broker 没有返回 `CONNACK`
+
+这通常说明：
+
+- `portproxy` 规则还在
+- 但重启后 `connectaddress=127.0.0.1 connectport=1883` 这一跳没有再正确落到 WSL / Docker 中的 `mosquitto`
+- 或者 `mosquitto` 容器本身没有正常启动
+
+因此重启电脑后，建议额外执行以下验证：
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 1883
+Test-NetConnection 127.0.0.1 -Port 8000
+```
+
+以及在 WSL 中执行：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+docker compose ps
+docker compose logs --tail=50 mosquitto face-web
+```
+
+若 `127.0.0.1:1883` 在 Windows 上不通，或者板端始终只有 `CONNECT/WRITE` 但收不到 `CONNACK`，可改为把 `portproxy` 直接转发到 **当前 WSL IP**：
+
+```powershell
+wsl hostname -I
+netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=1883
+netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=8000
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=<当前WSL_IP> connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=<当前WSL_IP> connectport=8000
+```
+
+注意：
+
+- WSL IP 在每次重启后都可能变化
+- 因此若使用 WSL IP 作为 `connectaddress`，通常需要在每次重启后重新写入 `portproxy`
+- `portproxy show all` 看到规则还在，并不代表 `connectaddress` 仍然指向正确的后端
+
+本次在开发机上还额外复现到一个更隐蔽的现象：
+
+- Windows 上 `Test-NetConnection 127.0.0.1 -Port 1883` 返回成功
+- `docker compose ps` 与 `mosquitto` 日志也显示 Broker 正常运行
+- 但从 WSL / 容器访问 `192.168.160.8:1883` 时，MQTT 客户端发出 `CONNECT` 后会直接断开
+- 同时 `mosquitto` 日志中看不到这次连接
+
+而改为直接访问当前 WSL IP 的 `1883` 时，又可以立即收到 `CONNACK`。
+
+这说明在该环境下，`connectaddress=127.0.0.1` 这条 `portproxy` 写法可能出现：
+
+- TCP 探活看起来正常
+- 但真实 MQTT 流量没有被正确转发到 WSL 中的 Broker
+
+因此，如果出现“`localhost` 探活通过，但板端始终没有 `CONNACK`”这一类症状，应优先把 `portproxy` 后端改为 **当前 WSL IP**，而不是继续坚持使用 `127.0.0.1`。
+
 ## 5. 代码侧辅助修复
 
 为了更快定位此类问题，本次还对 `linux_bridge/main.cpp` 做了辅助增强：
@@ -186,3 +256,4 @@ face_netd: mqtt connected mqtt://192.168.160.8:1883
 2. 若服务仅在 WSL 内监听，还必须额外配置 Windows `portproxy`
 3. 如果网页显示“暂无设备”，应优先检查 `face_netd` 是否已经成功打印 `mqtt connected`
 4. 若 `face_netd` 长期停留在 `connecting=1`，应优先怀疑 Windows 对 WSL 的对外转发问题
+5. 若 `face_netd` 已打印 `CONNECT` 和 `WRITE`，但始终没有 `READ/CONNACK`，应优先检查 `portproxy` 背后的 `127.0.0.1 -> WSL/Docker` 这一跳，以及 `mosquitto` 容器是否真的在响应

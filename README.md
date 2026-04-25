@@ -237,7 +237,18 @@ New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allo
 ```powershell
 netsh interface portproxy show all
 Get-NetTCPConnection -LocalPort 1883,8000 -State Listen
+Test-NetConnection 127.0.0.1 -Port 1883
+Test-NetConnection 127.0.0.1 -Port 8000
 ```
+
+注意：
+
+- `netsh interface portproxy show all` 只能证明规则存在
+- 它不能单独证明 `127.0.0.1:1883` 在重启后仍然真正转发到了 WSL / Docker 中的 `mosquitto`
+- 如果板端日志已经出现 `mqtt event CONNECT` 和 `mqtt event WRITE`，但始终没有 `mqtt connected`，通常说明 TCP 前门已经接通，但后端 broker 没有返回 `CONNACK`
+- 此时应优先检查 `docker compose ps`、`docker compose logs --tail=50 mosquitto face-web`，以及 Windows 上 `Test-NetConnection 127.0.0.1 -Port 1883`
+- 即使 `127.0.0.1:1883` 探活通过，也仍可能出现“TCP 能连上，但 MQTT `CONNECT` 发出后收不到 `CONNACK`”的情况；这时也应把 `portproxy` 的 `connectaddress` 改成当前 WSL IP
+- 使用 WSL IP 作为 `connectaddress` 时，要注意 WSL IP 在重启后可能变化
 
 若配置正确，板端 `face_netd` 应能最终打印：
 
@@ -311,6 +322,17 @@ netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 conne
 New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
 New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
 ```
+
+重启电脑后，建议马上补做：
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 1883
+Test-NetConnection 127.0.0.1 -Port 8000
+```
+
+若不通，说明 `portproxy` 规则虽然还在，但它背后的 `127.0.0.1 -> WSL/Docker` 这一跳没有恢复；此时可用 `wsl hostname -I` 取当前 WSL IP，并把 `connectaddress` 改成该 IP 重新写入 `portproxy`。
+
+若 `127.0.0.1:1883` 看起来是通的，但板端仍然卡在“已发送 MQTT `CONNECT`、始终收不到 `CONNACK`”，也建议直接改为当前 WSL IP 作为 `connectaddress`。这是因为某些环境下 `localhost` 探活成功并不等于真实 MQTT 流量已经正确转发到 Broker。
 
 ### 5. 设置 `face_netd.ini`
 
@@ -403,6 +425,7 @@ docker exec -it face-mosquitto mosquitto_sub -h 127.0.0.1 -t 'k230/+/up/#' -v
 3. 若电脑端运行在 WSL / Docker 中，Windows 是否已配置 `portproxy` 和防火墙规则
 4. `face_netd.ini` 中的 `mqtt_url` 是否填写 Windows 主机局域网 IPv4，而不是 WSL 虚拟网卡地址
 5. `docker compose logs -f mosquitto face-web` 中是否能看到来自板子的 MQTT 连接
+6. 若板端已打印 `mqtt event CONNECT` 和 `mqtt event WRITE` 但没有 `mqtt connected`，Windows 上 `Test-NetConnection 127.0.0.1 -Port 1883` 是否仍然通过
 
 ## v1 边界
 
