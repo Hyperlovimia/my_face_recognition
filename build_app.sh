@@ -16,8 +16,31 @@ export MPP_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/mpp/"
 export NNCASE_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/nncase/"
 export OPENCV_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/utils/lib/opencv/"
 
-# Set cross-compile toolchain path
-export PATH=$PATH:/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin
+# Cross-compile toolchain: riscv64 musl. Prefer SDK tree, then /opt (Docker with correct -v)
+TOOLCHAIN_DIR_NAME="riscv64-linux-musleabi_for_x86_64-pc-linux-gnu"
+TOOLCHAIN_GCC="riscv64-unknown-linux-musl-gcc"
+K230_TOOLCHAIN_ROOT=""
+for _root in \
+  "${SDK_SRC_ROOT_DIR}/toolchain/${TOOLCHAIN_DIR_NAME}" \
+  "${SCRIPTPATH}/toolchain/${TOOLCHAIN_DIR_NAME}" \
+  "/opt/toolchain/${TOOLCHAIN_DIR_NAME}"; do
+  if [ -x "${_root}/bin/${TOOLCHAIN_GCC}" ]; then
+    K230_TOOLCHAIN_ROOT="${_root}"
+    break
+  fi
+done
+if [ -z "${K230_TOOLCHAIN_ROOT}" ]; then
+  echo "[ERROR] RISC-V cross compiler (${TOOLCHAIN_GCC}) not found."
+  echo "  Searched under:"
+  echo "    ${SDK_SRC_ROOT_DIR}/toolchain/${TOOLCHAIN_DIR_NAME}"
+  echo "    ${SCRIPTPATH}/toolchain/${TOOLCHAIN_DIR_NAME}"
+  echo "    /opt/toolchain/${TOOLCHAIN_DIR_NAME}"
+  echo "  - On the host, ensure the k230 SDK toolchain is present (often k230_sdk/toolchain/...)."
+  echo "  - In Docker: run from the k230_sdk root and use -v \$(pwd)/toolchain:/opt/toolchain (SDK toolchain),"
+  echo "    or remove -v \$(pwd)/toolchain:... if my_face_recognition/toolchain is empty (empty mount hides /opt/toolchain)."
+  exit 1
+fi
+export PATH="${K230_TOOLCHAIN_ROOT}/bin:${PATH}"
 
 # =======================
 # Output directories
@@ -60,6 +83,7 @@ collect_outputs() {
         "${BUILD_DIR}/bin/face_video.elf"
         "${BUILD_DIR}/bin/face_ai.elf"
         "${BUILD_DIR}/bin/face_event.elf"
+        "${BUILD_DIR}/bin/face_ctrl.elf"
     )
     local found=0
     for f in "${elves[@]}"; do
