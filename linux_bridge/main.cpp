@@ -30,6 +30,8 @@ constexpr const char *kSchema = "k230.face.bridge.v1";
 constexpr int kIpcRemoteIdLinux = 1;
 constexpr int kMqttPollMs = 200;
 constexpr int kMqttConnectTimeoutMs = 10000;
+constexpr int kMqttRetryInitialMs = 1000;
+constexpr int kMqttRetryMaxMs = 8000;
 constexpr size_t kMaxQueueDepth = 512;
 
 struct Config {
@@ -71,7 +73,9 @@ struct Runtime {
     std::atomic<uint64_t> mqtt_dial_start_ms{0};
     std::atomic<uint64_t> mqtt_last_progress_ms{0};
     std::atomic<uint64_t> mqtt_last_pending_log_ms{0};
+    std::atomic<uint64_t> mqtt_next_dial_ms{0};
     std::atomic<uint32_t> mqtt_connect_attempts{0};
+    std::atomic<uint32_t> mqtt_retry_failures{0};
 
     std::mutex out_mu;
     std::deque<PublishItem> outbox;
@@ -715,6 +719,42 @@ void mqtt_send_login(mg_connection *c)
     mg_mqtt_login(c, &opts);
 }
 
+uint64_t mqtt_retry_delay_ms(uint32_t failures)
+{
+    uint64_t delay = kMqttRetryInitialMs;
+    while (failures > 1 && delay < static_cast<uint64_t>(kMqttRetryMaxMs))
+    {
+        delay *= 2;
+        if (delay > static_cast<uint64_t>(kMqttRetryMaxMs))
+            delay = kMqttRetryMaxMs;
+        --failures;
+    }
+    return delay;
+}
+
+void mqtt_reset_retry_backoff()
+{
+    g_rt.mqtt_retry_failures.store(0);
+    g_rt.mqtt_next_dial_ms.store(0);
+}
+
+void mqtt_schedule_retry(bool was_connected)
+{
+    if (g_rt.stop.load())
+    {
+        g_rt.mqtt_next_dial_ms.store(0);
+        return;
+    }
+
+    const uint32_t failures = was_connected ? 1 : (g_rt.mqtt_retry_failures.load() + 1);
+    const uint64_t delay = mqtt_retry_delay_ms(failures);
+    g_rt.mqtt_retry_failures.store(failures);
+    g_rt.mqtt_next_dial_ms.store(now_ms() + delay);
+
+    std::cerr << "face_netd: mqtt reconnect scheduled in " << delay << "ms"
+              << " (failure_streak=" << failures << ")" << std::endl;
+}
+
 void mqtt_handle_read(mg_connection *c)
 {
     if (!c)
@@ -746,6 +786,7 @@ void mqtt_handle_read(mg_connection *c)
                 break;
             }
 
+            mqtt_reset_retry_backoff();
             g_rt.mqtt_connected.store(true);
             g_mqtt = c;
             {
@@ -834,14 +875,17 @@ void mqtt_event_handler(mg_connection *c, int ev, void *ev_data)
         std::cerr << "face_netd: mqtt error: " << (ev_data ? static_cast<char *>(ev_data) : "unknown") << std::endl;
         break;
     case MG_EV_CLOSE:
-        g_rt.mqtt_connected.store(false);
+    {
+        const bool was_connected = g_rt.mqtt_connected.exchange(false);
         if (g_mqtt == c)
             g_mqtt = nullptr;
         g_rt.mqtt_last_progress_ms.store(now_ms());
         std::cout << "face_netd: mqtt event CLOSE id=" << c->id << " connected=" << g_rt.mqtt_connected.load()
                   << " state(resolving=" << c->is_resolving << ",connecting=" << c->is_connecting
                   << ",send=" << c->send.len << ",recv=" << c->recv.len << ")" << std::endl;
+        mqtt_schedule_retry(was_connected);
         break;
+    }
     default:
         break;
     }
@@ -887,15 +931,48 @@ void maybe_connect_mqtt()
     if (g_mqtt || g_rt.stop.load())
         return;
 
-    const uint32_t attempt = g_rt.mqtt_connect_attempts.fetch_add(1) + 1;
     const uint64_t now = now_ms();
+    const uint64_t next_dial = g_rt.mqtt_next_dial_ms.load();
+    if (next_dial != 0 && now < next_dial)
+        return;
+
+    const uint32_t attempt = g_rt.mqtt_connect_attempts.fetch_add(1) + 1;
     g_rt.mqtt_dial_start_ms.store(now);
     g_rt.mqtt_last_progress_ms.store(now);
     g_rt.mqtt_last_pending_log_ms.store(0);
+    g_rt.mqtt_next_dial_ms.store(0);
     std::cout << "face_netd: mqtt dial attempt=" << attempt << " url=" << g_rt.cfg.mqtt_url << std::endl;
     g_mqtt = mg_connect(&g_mgr, g_rt.cfg.mqtt_url.c_str(), mqtt_event_handler, nullptr);
     if (!g_mqtt)
+    {
         std::cerr << "face_netd: mqtt connect request failed " << g_rt.cfg.mqtt_url << std::endl;
+        mqtt_schedule_retry(false);
+    }
+}
+
+void shutdown_mqtt_gracefully()
+{
+    mg_connection *c = g_mqtt;
+    if (!c)
+        return;
+
+    if (g_rt.mqtt_connected.load())
+    {
+        mg_mqtt_opts opts{};
+        std::cout << "face_netd: mqtt graceful disconnect id=" << c->id << std::endl;
+        mg_mqtt_disconnect(c, &opts);
+        const uint64_t flush_deadline = now_ms() + 300;
+        while (g_mqtt == c && now_ms() < flush_deadline)
+            mg_mgr_poll(&g_mgr, 50);
+    }
+
+    if (g_mqtt == c)
+    {
+        c->is_closing = 1;
+        const uint64_t close_deadline = now_ms() + 200;
+        while (g_mqtt == c && now_ms() < close_deadline)
+            mg_mgr_poll(&g_mgr, 50);
+    }
 }
 
 bool publish_queue_empty()
@@ -981,8 +1058,7 @@ int main(int argc, char **argv)
     if (ipc_thread.joinable())
         ipc_thread.join();
 
-    if (g_mqtt)
-        g_mqtt->is_closing = 1;
+    shutdown_mqtt_gracefully();
     mg_mgr_free(&g_mgr);
 
     std::cout << "face_netd: stopped" << std::endl;
