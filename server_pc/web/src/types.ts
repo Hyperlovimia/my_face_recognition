@@ -22,6 +22,10 @@ export type EventRow = {
   name: string;
   score: number;
   ts_ms: number;
+  /** 板端原始时间戳（未校时时很小）；MQTT 展示用 ts_ms 已由服务端归一化 */
+  device_ts_ms?: number;
+  /** ISO8601，服务端入库时间；设备 ts_ms 不可信时用于展示 */
+  created_at?: string;
 };
 
 export type WsMessage =

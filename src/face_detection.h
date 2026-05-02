@@ -112,6 +112,9 @@ public:
      */
     void post_process(FrameCHWSize frame_size, vector<FaceDetectionInfo> &results);
 
+    /** 当前构造传入的检测置信度阈值，供 face_ai 与识别/活体协同策略使用 */
+    float det_conf_thresh() const { return obj_thresh_; }
+
      /**
      * @brief 将检测结果画到原图
      * @param src_img     原图

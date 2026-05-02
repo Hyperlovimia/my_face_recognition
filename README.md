@@ -61,13 +61,15 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 启用活体检测时，先后台启动 `face_ai.elf`，最后一个参数传入活体模型：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 /data/face_antispoof.kmodel &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel 0.18 real0 &
 ```
+
+> 说明：`0.18` 为 REAL 概率阈值（真人分数常在 0.15～0.30 间波动时可从偏低试起，翻拍易过再提到 0.22～0.25）；`real0` 表示该 kmodel 约定 **out[0]=REAL**（与常见训练导出一致）。若你的模型确认为 **out[0]=SPOOF**，则不要加 `real0`，只要 9 个参数或仅「模型路径 + 阈值」共 10 个参数即可，详见下文「参数说明」表。
 
 暂不启用活体检测时，使用 8 参数启动 `face_ai.elf`：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
 ```
 
 然后后台启动视频进程：
@@ -96,19 +98,23 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 `face_ai.elf` 参数格式：
 
 ```text
-face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> <debug_mode> [<face_antispoof.kmodel>]
+face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> <debug_mode>
+    [<face_antispoof.kmodel> [<real_prob_threshold> [real0|idx0]]]
 ```
 
 | 参数        | 说明                             | 取值范围     |
 | ----------- | -------------------------------- | ------------ |
 | kmodel_det  | 人脸检测kmodel路径               | kmodel 路径         |
-| det_thres   | 人脸检测阈值，推荐 `0.5`          | 0.0~1.0      |
-| nms_thres   | 人脸检测 NMS 阈值，推荐 `0.2`    | 0.0~1.0      |
+| det_thres   | 检测框置信度下限（`face_detection.cc` 中低于此的 anchor 丢弃）。**越高越严、易漏检**；易漏检可试 `0.32`～`0.40` | 0.0~1.0      |
+| nms_thres   | NMS 的 IoU 门槛：两框 IoU≥此值则抑制低分框。**略调高**（如 `0.30`～`0.35`）可减轻「好框被旁边候选误杀」 | 0.0~1.0      |
 | kmodel_recg | 人脸识别kmodel路径               | kmodel 路径         |
-| recg_thres  | 人脸识别阈值，推荐 `60`          | 0~100    |
+| recg_thres  | 人脸识别分数下限（`cal_cosine_distance` 的 0~100 标尺）。**库内人多或易互认时推荐 `65`～`72`** | 0~100    |
+| （库内≥2 人） | `FaceRecognition::database_search` | 除超过 `recg_thres` 外，还要求 **第一名与第二名分差 ≥ 8.5**（默认 `db_top2_margin_`），否则陌生人。帧间对特征做 **短时 EMA**（仅流式 `INFER`）减轻单帧误判 |
 | db_dir      | 数据库目录，推荐 `/data/face_db` | 数据库目录路径         |
 | debug_mode  | 是否需要调试，0、1、2分别表示不调试、简单调试、详细调试 | 0、1、2 |
 | face_antispoof.kmodel | 可选活体模型路径，存在且加载成功时启用活体 | kmodel 路径 |
+| real_prob_threshold（第 10 个参数） | 启用活体时：REAL 概率 ≥ 该值判为真人；越高越严。默认 **0.32**（未传第 10 个时，代码内建） | 现场常试 **0.15**～`0.28`，按误拒/放过翻拍折中 |
+| real0 或 idx0（第 11 个参数） | 仅当 kmodel 输出为 **out[0]=REAL、out[1]=SPOOF** 时追加（需同时给出第 10 个阈值）。仓库示例 `k230_bin/run_3process.sh` 已按此配置。若加此后「翻拍」也极易通过，说明你的模型实际是 **out[0]=SPOOF**，应去掉 `real0` | 字面量 `real0` / `idx0` |
 
 ## 功能支持
 
@@ -349,10 +355,12 @@ Test-NetConnection 127.0.0.1 -Port 8000
 
 ### 6. 板端 RT-Smart 启动三进程
 
+易 **漏检人脸** 时，优先把 `face_ai` 第 2、3 个参数由 `0.5` / `0.2` 调成约 **`0.38` / `0.30`**（与 `k230_bin/run_3process.sh` 一致）。
+
 启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 /data/face_antispoof.kmodel &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel &
 /data/face_video.elf 0 &
 /data/face_event.elf /tmp/attendance.log
 ```
@@ -360,7 +368,7 @@ Test-NetConnection 127.0.0.1 -Port 8000
 不启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 &
+/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
 /data/face_video.elf 0 &
 /data/face_event.elf /tmp/attendance.log
 ```

@@ -25,6 +25,8 @@
 #ifndef _FACE_RECOGNITION_H
 #define _FACE_RECOGNITION_H
 
+#include <cstddef>
+#include <string>
 #include <vector>
 #include "ai_utils.h"
 #include "ai_base.h"
@@ -34,9 +36,11 @@ using std::vector;
 
 typedef struct FaceRecognitionInfo
 {
-    int id;                     //人脸识别结果对应ID
-    float score;                //人脸识别结果对应得分
-    string name;                //人脸识别结果对应人名
+    int id = -1;                         // 人脸识别结果对应 ID；-1 为未识别
+    float score = 0.f;                   // 人脸识别得分（与 top1 模板相似度，未识别时仍为 top1 分）
+    string name;                         // 人脸识别结果对应人名
+    int top1_id = -1;                    // 库内相似度最高者下标；无库或未搜索时为 -1
+    bool ambiguous_match = false;        // 库内≥2 人且 top1/top2 歧义导致未识别（不宜做滞回提拔）
 } FaceRecognitionInfo;
 
 /**
@@ -54,7 +58,8 @@ public:
      * @param debug_mode        0（不调试）、 1（只显示时间）、2（显示所有打印信息）
      * @return None
      */
-    FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize isp_shape, int debug_mode);
+    FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize isp_shape, int debug_mode,
+                    float db_top2_margin = 5.0f);
 
     /**
      * @brief FaceRecognition析构函数
@@ -118,9 +123,26 @@ public:
     /**
      * @brief 人脸数据库查询接口
      * @param result 人脸识别结果
+     * @param query_l2norm 已 L2 归一化的查询特征；nullptr 则用当前推理输出
+     * @param frame_face_count 当前帧检出人数；≥2 时略放宽两可判决、与 face_ai 多人单帧特征策略配合
      * @return None
      */
-    void database_search(FaceRecognitionInfo& result);
+    void database_search(FaceRecognitionInfo &result, const float *query_l2norm = nullptr,
+                         int frame_face_count = 1);
+
+    /** 当前推理输出特征的 L2 归一化拷贝（需在 inference() 成功后调用） */
+    void export_query_l2_normalized(float *dst) const;
+
+    int feature_dim() const { return feature_num_; }
+
+    /** 识别阈值（与构造参数 thresh 一致，0～100 标尺） */
+    float recognition_threshold() const { return obj_thresh_; }
+
+    /** 当前已注册人脸数量 */
+    int registered_face_count() const { return valid_register_face_; }
+
+    /** 已注册姓名拷贝；idx 越界返回空串 */
+    string registered_name_at(int idx) const;
 
     /**
      * @brief 将处理好的轮廓画到原图
@@ -165,7 +187,7 @@ private:
     * @param len  原始数据长度
     * @return None
     */
-    void l2_normalize(float* src, float* dst, int len);
+    void l2_normalize(float* src, float* dst, int len) const;
 
     /**
     * @brief 计算两特征的余弦距离
@@ -195,5 +217,6 @@ private:
     vector<string> names_;                        // 人脸数据库名字
     vector<vector<float>> features_;              // 人脸数据库特征
     int valid_register_face_;                     // 数据库中实际人脸个数
+    float db_top2_margin_;                        // 第一、二高分至少相差此值(0~100 标尺)才确认身份，抑库内互串
 };
 #endif

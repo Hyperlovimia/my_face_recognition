@@ -1,4 +1,5 @@
 /* RT-Smart: AI process — face detection + recognition server over IPC (rt_channel + lwp_shm). */
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -6,6 +7,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <time.h>
 #include <vector>
 
@@ -25,7 +27,7 @@ static float fas_real_thresh_from_env()
     const char *e = std::getenv("FACE_FAS_REAL_THRESH");
     if (!e || !e[0])
         /* 略低于 0.5：静默活体单帧分数对真人往往更「抖」，默认 0.5 容易误拒；假体若 REAL 长期很低仍易区分 */
-        return 0.4f;
+        return 0.32f;
     return static_cast<float>(std::atof(e));
 }
 
@@ -33,7 +35,116 @@ static float fas_real_thresh_from_env()
 static float g_fas_real_ema[IPC_MAX_FACES];
 static uint8_t g_fas_real_ema_inited[IPC_MAX_FACES];
 
-static constexpr float k_fas_ema_alpha = 0.38f;
+/* REAL 概率 EMA：raw 高于当前 EMA 时用较大 α 快速跟上（减少「明明这一帧不错仍判假体」）；
+ * raw 低于 EMA 时用较小 α 缓降，避免单帧毛刺把结果打穿，同时抑制偶发低分拖尾过长可以用 alpha_dn 微调。 */
+static constexpr float k_fas_ema_alpha_up = 0.62f;
+static constexpr float k_fas_ema_alpha_dn = 0.35f;
+/* 注册 commit 单帧：eff REAL 允许比流式阈值低一截（仍设下限，避免明显低分入库） */
+static constexpr float k_fas_register_relax = 0.065f;
+static constexpr float k_fas_register_real_floor = 0.06f;
+
+static float fas_register_eff_floor(float fas_real_thresh)
+{
+    return (std::max)(k_fas_register_real_floor, fas_real_thresh - k_fas_register_relax);
+}
+
+/* 库内≥2 人时 Top1-Top2 分差门槛；过高易与特征 EMA 叠加导致频繁 unknown；可用环境变量 FACE_DB_TOP2_MARGIN 覆盖 */
+static float db_top2_margin_from_env()
+{
+    const char *e = std::getenv("FACE_DB_TOP2_MARGIN");
+    if (!e || !e[0])
+        return 5.0f;
+    return static_cast<float>(std::atof(e));
+}
+
+/* 识别特征短时 EMA（按检测槽位）：减弱单帧噪声导致「更像错的人」；注册 commit 仍用单帧检索 */
+static std::vector<float> g_rec_feat_ema[IPC_MAX_FACES];
+static uint8_t g_rec_feat_inited[IPC_MAX_FACES]{};
+static constexpr float k_rec_feat_ema_alpha = 0.34f;
+static constexpr float k_rec_feat_ema_alpha_cap = 0.48f;
+
+/** 按检测分数与框面积排序，稳定槽位与 EMA 曲线（多人时减少错位） */
+static void sort_det_results_by_quality(vector<FaceDetectionInfo> &dets)
+{
+    std::sort(dets.begin(), dets.end(), [](const FaceDetectionInfo &a, const FaceDetectionInfo &b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        const float aa = a.bbox.w * a.bbox.h;
+        const float bb = b.bbox.w * b.bbox.h;
+        return aa > bb;
+    });
+}
+
+/* 识别阈值滞回：上一帧已确认身份且本帧 top1 仍为同一人时，允许在略低于阈值的分数上保持识别，减轻抖动。
+ * 默认带宽约 5（与 score 同标尺），可用环境变量 FACE_REC_HYST 覆盖，建议范围约 2～12。多人同帧不启用。 */
+static int g_rec_sticky_id[IPC_MAX_FACES];
+static char g_rec_sticky_name[IPC_MAX_FACES][IPC_NAME_MAX];
+static uint8_t g_rec_sticky_valid[IPC_MAX_FACES];
+
+static float rec_hysteresis_band_from_env()
+{
+    const char *e = std::getenv("FACE_REC_HYST");
+    float v = (e && e[0]) ? static_cast<float>(std::atof(e)) : 5.0f;
+    if (v < 2.0f)
+        v = 2.0f;
+    if (v > 12.0f)
+        v = 12.0f;
+    return v;
+}
+
+static void apply_recognition_hysteresis(int slot_i, int frame_face_count, const FaceRecognition &fr,
+                                         FaceRecognitionInfo &r)
+{
+    if (frame_face_count != 1)
+        return;
+
+    if (r.ambiguous_match)
+    {
+        g_rec_sticky_valid[slot_i] = 0;
+        return;
+    }
+
+    const float t = fr.recognition_threshold();
+    const float band = rec_hysteresis_band_from_env();
+    const float relax = t - band;
+
+    if (r.id >= 0)
+    {
+        g_rec_sticky_valid[slot_i] = 1;
+        g_rec_sticky_id[slot_i] = r.id;
+        memset(g_rec_sticky_name[slot_i], 0, sizeof(g_rec_sticky_name[slot_i]));
+        if (!r.name.empty())
+            strncpy(g_rec_sticky_name[slot_i], r.name.c_str(), IPC_NAME_MAX - 1);
+        return;
+    }
+
+    if (r.top1_id < 0 || fr.registered_face_count() <= 0)
+    {
+        g_rec_sticky_valid[slot_i] = 0;
+        return;
+    }
+
+    if (!g_rec_sticky_valid[slot_i])
+        return;
+
+    if (r.top1_id != g_rec_sticky_id[slot_i])
+    {
+        g_rec_sticky_valid[slot_i] = 0;
+        return;
+    }
+
+    if (r.score >= relax)
+    {
+        r.id = r.top1_id;
+        const std::string nm = fr.registered_name_at(r.top1_id);
+        if (!nm.empty())
+            r.name = nm;
+        else if (g_rec_sticky_name[slot_i][0] != '\0')
+            r.name = g_rec_sticky_name[slot_i];
+    }
+    else
+        g_rec_sticky_valid[slot_i] = 0;
+}
 
 static std::atomic<uint64_t> g_ai_ipc_recv{0};
 static std::atomic<uint64_t> g_ai_reply_err_infer{0};
@@ -263,12 +374,13 @@ int main(int argc, char **argv)
 {
     std::cout << "face_ai: built " << __DATE__ << " " << __TIME__ << std::endl;
 
-    if (argc != 8 && argc != 9 && argc != 10)
+    if (argc != 8 && argc != 9 && argc != 10 && argc != 11)
     {
         std::cout << "Usage: face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir> "
-                     "<debug_mode> [<face_antispoof.kmodel> [<real_prob_threshold>]]\n";
+                     "<debug_mode> [<face_antispoof.kmodel> [<real_prob_threshold> [real0|idx0]]]\n";
         std::cout << "  Optional 9th: silent liveness kmodel; omit to disable.\n";
-        std::cout << "  Optional 10th: REAL 概率阈值 (需同时带 9th)；默认 0.4 或环境变量 FACE_FAS_REAL_THRESH。\n";
+        std::cout << "  Optional 10th: REAL 概率阈值 (需同时带 9th)；默认 0.32 或环境变量 FACE_FAS_REAL_THRESH。\n";
+        std::cout << "  Optional 11th: 仅当 kmodel 约定 out[0]=REAL、out[1]=SPOOF 时写 real0 或 idx0（多数模型无需）。\n";
         std::cout << "  活体启用时对 REAL 做短时平滑(EMA)，减轻真人单帧误拒；板端勿依赖 export。\n";
         return -1;
     }
@@ -278,14 +390,28 @@ int main(int argc, char **argv)
     if (argc >= 10 && argv[9] && argv[9][0] != '\0')
         fas_real_thresh = static_cast<float>(std::atof(argv[9]));
 
+    bool fas_real_idx0 = false;
+    if (argc >= 11 && argv[10] && argv[10][0] != '\0')
+    {
+        if (std::strcmp(argv[10], "real0") == 0 || std::strcmp(argv[10], "idx0") == 0)
+            fas_real_idx0 = true;
+        else
+        {
+            std::cerr << "face_ai: 11th arg must be real0 or idx0 (out[0]=REAL), got: " << argv[10] << std::endl;
+            return -1;
+        }
+    }
+
     std::unique_ptr<FaceAntiSpoof> fas;
-    if (argc == 9 && argv[8] && argv[8][0] != '\0')
+    /* argc==9: 仅活体 kmodel；argc==10/11: kmodel + 阈值（+ 可选 real0） */
+    if (argc >= 9 && argv[8] && argv[8][0] != '\0')
     {
         try
         {
-            fas.reset(new FaceAntiSpoof(argv[8], debug_mode));
+            fas.reset(new FaceAntiSpoof(argv[8], debug_mode, fas_real_idx0));
             std::cout << "face_ai: FaceAntiSpoof loaded: " << argv[8] << " (REAL>=" << fas_real_thresh
-                      << ", EMA alpha=" << k_fas_ema_alpha << ")\n";
+                      << ", EMA up/dn=" << k_fas_ema_alpha_up << "/" << k_fas_ema_alpha_dn
+                      << ", real_out_idx0=" << (fas_real_idx0 ? "yes" : "no") << ")\n";
         }
         catch (const std::exception &e)
         {
@@ -312,8 +438,13 @@ int main(int argc, char **argv)
 
     FaceDetection face_det(argv[1], atof(argv[2]), atof(argv[3]), image_size, debug_mode);
     char *db_dir = argv[6];
-    FaceRecognition face_recg(argv[4], atoi(argv[5]), image_size, debug_mode);
+    const float db_top2_margin = db_top2_margin_from_env();
+    FaceRecognition face_recg(argv[4], static_cast<float>(atof(argv[5])), image_size, debug_mode, db_top2_margin);
     face_recg.database_init(db_dir);
+    std::cout << "face_ai: recognition db_top2_margin=" << db_top2_margin
+              << " (env FACE_DB_TOP2_MARGIN overrides default)\n"
+              << "face_ai: recognition hysteresis band=" << rec_hysteresis_band_from_env()
+              << " (env FACE_REC_HYST, 2..12, eases threshold chatter for single-face frames)\n";
 
     vector<FaceDetectionInfo> det_results;
     vector<FaceRecognitionInfo> rec_results;
@@ -464,9 +595,19 @@ int main(int argc, char **argv)
                 continue;
             }
             face_det.post_process(fs, det_results);
+            sort_det_results_by_quality(det_results);
+            if (det_results.size() > 1u)
+            {
+                for (int z = 0; z < IPC_MAX_FACES; ++z)
+                    g_rec_sticky_valid[z] = 0;
+            }
 
             for (size_t j = det_results.size(); j < (size_t)IPC_MAX_FACES; ++j)
+            {
                 g_fas_real_ema_inited[j] = 0;
+                g_rec_feat_inited[j] = 0;
+                g_rec_sticky_valid[j] = 0;
+            }
 
             bool rec_ok = true;
             for (size_t i = 0; i < det_results.size() && i < (size_t)IPC_MAX_FACES; ++i)
@@ -475,59 +616,162 @@ int main(int argc, char **argv)
                 float live_spoof = 0.f;
                 uint8_t is_live = 1;
 
-                /* 识别 affine 与检测关键点同源；活体与识别共用同一张对齐脸，避免检测框裁剪与识别输入不一致。 */
-                if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points))
-                {
-                    std::cerr << "face_ai: recognition pre_process failed\n";
-                    rec_ok = false;
-                    break;
-                }
-
-                if (fas)
-                {
-                    cv::Mat aligned_bgr;
-                    if (!face_recg.aligned_face_to_bgr(aligned_bgr) || aligned_bgr.empty() ||
-                        !fas->feed_bgr_mat(aligned_bgr) || !fas->forward() ||
-                        !fas->decode_liveness_scores(&live_real, &live_spoof))
-                    {
-                        std::cerr << "face_ai: liveness inference failed\n";
-                        rec_ok = false;
-                        break;
-                    }
-                    const float raw_real = live_real;
-                    if (!g_fas_real_ema_inited[i])
-                    {
-                        g_fas_real_ema[i] = raw_real;
-                        g_fas_real_ema_inited[i] = 1;
-                    }
-                    else
-                        g_fas_real_ema[i] =
-                            k_fas_ema_alpha * raw_real + (1.f - k_fas_ema_alpha) * g_fas_real_ema[i];
-                    live_real = g_fas_real_ema[i];
-                    is_live = (live_real >= fas_real_thresh) ? 1 : 0;
-                    if (debug_mode > 1)
-                    {
-                        std::cout << "face_ai: liveness REAL_raw=" << raw_real << " REAL_ema=" << live_real
-                                  << " SPOOF=" << live_spoof << " pass=" << (int)is_live << std::endl;
-                    }
-                }
+                const float det_thresh_cfg = face_det.det_conf_thresh();
+                const float det_weak_floor = (std::max)(0.24f, det_thresh_cfg * 0.68f);
+                const bool det_weak =
+                    (hdr->cmd != IPC_CMD_REGISTER_COMMIT) && (det_results[i].score < det_weak_floor);
+                const bool suppress_infer_evt = det_weak;
 
                 FaceRecognitionInfo recg_result;
-                if (fas && !is_live)
+
+                if (det_weak)
                 {
+                    g_rec_sticky_valid[i] = 0;
+                    /* 极低置信检测：对齐/活体易受噪声干扰，跳过 KPU 链路与事件，仅保留框用于 OSD */
                     recg_result.id = -1;
                     recg_result.score = 0.f;
                     recg_result.name.clear();
                 }
                 else
                 {
-                    if (!face_recg.inference())
+                    /* 识别 affine 与检测关键点同源；活体与识别共用同一张对齐脸，避免检测框裁剪与识别输入不一致。 */
+                    if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points))
                     {
-                        std::cerr << "face_ai: recognition inference failed\n";
+                        std::cerr << "face_ai: recognition pre_process failed\n";
                         rec_ok = false;
                         break;
                     }
-                    face_recg.database_search(recg_result);
+
+                    float fas_ema_alpha_up = k_fas_ema_alpha_up;
+                    if (det_results[i].score >= 0.52f)
+                        fas_ema_alpha_up += 0.04f;
+                    fas_ema_alpha_up = (std::min)(fas_ema_alpha_up, 0.72f);
+
+                    if (fas)
+                    {
+                        cv::Mat aligned_bgr;
+                        if (!face_recg.aligned_face_to_bgr(aligned_bgr) || aligned_bgr.empty() ||
+                            !fas->feed_bgr_mat(aligned_bgr) || !fas->forward() ||
+                            !fas->decode_liveness_scores(&live_real, &live_spoof))
+                        {
+                            std::cerr << "face_ai: liveness inference failed\n";
+                            rec_ok = false;
+                            break;
+                        }
+                        const float raw_real = live_real;
+                        if (!g_fas_real_ema_inited[i])
+                        {
+                            g_fas_real_ema[i] = raw_real;
+                            g_fas_real_ema_inited[i] = 1;
+                        }
+                        else
+                        {
+                            const float ema_prev = g_fas_real_ema[i];
+                            const float a =
+                                (raw_real >= ema_prev) ? fas_ema_alpha_up : k_fas_ema_alpha_dn;
+                            g_fas_real_ema[i] = a * raw_real + (1.f - a) * ema_prev;
+                        }
+                        const float ema_real = g_fas_real_ema[i];
+                        const float eff_real = (std::max)(ema_real, raw_real);
+                        live_real = eff_real;
+                        is_live = (eff_real >= fas_real_thresh) ? 1 : 0;
+                        if (debug_mode > 1)
+                        {
+                            std::cout << "face_ai: liveness REAL_raw=" << raw_real << " REAL_ema=" << ema_real
+                                      << " REAL_eff=" << eff_real << " SPOOF=" << live_spoof
+                                      << " pass=" << (int)is_live << std::endl;
+                        }
+                    }
+
+                    const bool skip_recg_infer =
+                        fas && !is_live &&
+                        !(hdr->cmd == IPC_CMD_REGISTER_COMMIT &&
+                          live_real >= fas_register_eff_floor(fas_real_thresh));
+
+                    if (skip_recg_infer)
+                    {
+                        recg_result.id = -1;
+                        recg_result.score = 0.f;
+                        recg_result.name.clear();
+                    }
+                    else
+                    {
+                        if (!face_recg.inference())
+                        {
+                            std::cerr << "face_ai: recognition inference failed\n";
+                            rec_ok = false;
+                            break;
+                        }
+                        if (hdr->cmd == IPC_CMD_INFER)
+                        {
+                            const int fd = face_recg.feature_dim();
+                            const int nfaces = (int)det_results.size();
+                            const bool multi_face = nfaces > 1;
+                            if (fd > 0)
+                            {
+                                std::vector<float> feat_now((size_t)fd);
+                                face_recg.export_query_l2_normalized(feat_now.data());
+                                /* 多人同帧：禁用槽位 EMA，直接单帧检索，避免两人特征在槽位间平均后互串 */
+                                if (multi_face)
+                                {
+                                    face_recg.database_search(recg_result, feat_now.data(), nfaces);
+                                }
+                                else
+                                {
+                                    float rec_feat_ema_alpha = k_rec_feat_ema_alpha;
+                                    rec_feat_ema_alpha += 0.05f;
+                                    if (fas && is_live)
+                                    {
+                                        if (live_real >= 0.38f)
+                                            rec_feat_ema_alpha += 0.05f;
+                                        if (live_real >= 0.52f)
+                                            rec_feat_ema_alpha += 0.04f;
+                                    }
+                                    rec_feat_ema_alpha = (std::min)(rec_feat_ema_alpha, k_rec_feat_ema_alpha_cap);
+                                    if (!g_rec_feat_inited[i])
+                                    {
+                                        g_rec_feat_ema[i] = std::move(feat_now);
+                                        g_rec_feat_inited[i] = 1;
+                                    }
+                                    else
+                                    {
+                                        if ((int)g_rec_feat_ema[i].size() != fd)
+                                        {
+                                            g_rec_feat_ema[i] = std::move(feat_now);
+                                        }
+                                        else
+                                        {
+                                            for (int k = 0; k < fd; ++k)
+                                            {
+                                                const size_t z = (size_t)k;
+                                                g_rec_feat_ema[i][z] = rec_feat_ema_alpha * feat_now[z] +
+                                                                       (1.f - rec_feat_ema_alpha) * g_rec_feat_ema[i][z];
+                                            }
+                                            float sum = 0.f;
+                                            for (int k = 0; k < fd; ++k)
+                                            {
+                                                const size_t z = (size_t)k;
+                                                sum += g_rec_feat_ema[i][z] * g_rec_feat_ema[i][z];
+                                            }
+                                            sum = sqrtf(sum);
+                                            if (sum > 1e-6f)
+                                            {
+                                                for (int k = 0; k < fd; ++k)
+                                                    g_rec_feat_ema[i][(size_t)k] /= sum;
+                                            }
+                                        }
+                                    }
+                                    face_recg.database_search(recg_result, g_rec_feat_ema[i].data(), 1);
+                                }
+                            }
+                            else
+                                face_recg.database_search(recg_result, nullptr, nfaces);
+
+                            apply_recognition_hysteresis((int)i, nfaces, face_recg, recg_result);
+                        }
+                        else
+                            face_recg.database_search(recg_result, nullptr, (int)det_results.size());
+                    }
                 }
                 rec_results.push_back(recg_result);
 
@@ -546,18 +790,29 @@ int main(int argc, char **argv)
                 reply.faces[reply.num_faces].is_live = is_live;
                 reply.num_faces++;
 
-                if (hdr->cmd == IPC_CMD_INFER)
+                if (hdr->cmd == IPC_CMD_INFER && !suppress_infer_evt)
                 {
+                    const bool is_stranger = (recg_result.id == -1);
+                    /* 多人同框时次要人脸常为侧脸/远小目标，相似度不稳易刷陌生人；主脸（排序后 slot0）仍上报 */
+                    const bool skip_stranger_evt_secondary =
+                        is_stranger && det_results.size() > 1 && i > 0;
+
                     if (fas && !is_live)
                     {
                         /*活体失败：留痕考勤/串口，便于 SD 日志与后续 MQTT 扩展 */
                         notify_face_event(-1, live_real, nullptr, IPC_EVT_KIND_LIVENESS_FAIL);
                     }
-                    else if (is_live)
+                    else if (is_live && !skip_stranger_evt_secondary)
                     {
-                        bool is_stranger = (recg_result.id == -1);
                         notify_face_event(recg_result.id, recg_result.score, recg_result.name.c_str(),
                                           is_stranger ? IPC_EVT_KIND_STRANGER : IPC_EVT_KIND_RECOGNIZED);
+                    }
+                    else if (is_live && skip_stranger_evt_secondary)
+                    {
+                        /* 次要脸仍可能已识别：放行 recognized，仅压陌生人噪声 */
+                        if (!is_stranger)
+                            notify_face_event(recg_result.id, recg_result.score, recg_result.name.c_str(),
+                                              IPC_EVT_KIND_RECOGNIZED);
                     }
                 }
             }
@@ -570,14 +825,17 @@ int main(int argc, char **argv)
 
             if (hdr->cmd == IPC_CMD_REGISTER_COMMIT)
             {
-                if (det_results.size() == 1 && reply.num_faces >= 1 && reply.faces[0].is_live)
+                const bool reg_ok_live =
+                    !fas || (reply.num_faces >= 1 && reply.faces[0].liveness_real_score >=
+                                                     fas_register_eff_floor(fas_real_thresh));
+                if (det_results.size() == 1 && reply.num_faces >= 1 && reg_ok_live)
                 {
                     std::string reg_name(hdr->register_name);
                     face_recg.database_add(reg_name, db_dir);
                     set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
                     std::cout << "face_ai: register ok: " << reg_name << std::endl;
                 }
-                else if (det_results.size() == 1 && fas && reply.num_faces >= 1 && !reply.faces[0].is_live)
+                else if (det_results.size() == 1 && fas && reply.num_faces >= 1 && !reg_ok_live)
                 {
                     set_reply_op(&reply, IPC_OP_RESULT_FAIL, "register rejected: liveness failed");
                     std::cout << "face_ai: register rejected (liveness failed)\n";

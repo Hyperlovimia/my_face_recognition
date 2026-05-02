@@ -35,6 +35,44 @@ def server_now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# 小于此值的 ts_ms 视为设备未校时（约在 2001-09 之前）；网页展示改用服务端入库时间。
+_MIN_SANE_DEVICE_EPOCH_MS = 1_000_000_000_000
+
+
+def _parse_created_at_to_epoch_ms(created_at_iso: str) -> int | None:
+    """把服务端写入的 created_at 转为 epoch ms；兼容 ISO8601 / 空格日期 / 无 Z 后缀。"""
+    s = created_at_iso.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            head = s[:19] if len(s) >= 19 else s
+            dt = datetime.strptime(head, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def event_ts_ms_for_ui(ts_ms: int, created_at_iso: str | None) -> int:
+    if ts_ms >= _MIN_SANE_DEVICE_EPOCH_MS:
+        return ts_ms
+    if created_at_iso:
+        parsed = _parse_created_at_to_epoch_ms(created_at_iso)
+        if parsed is not None:
+            return parsed
+    return server_now_ms()
+
+
 def json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
@@ -256,13 +294,15 @@ class FaceWebState:
         name = str(payload.get("name", ""))
         score = float(payload.get("score", 0.0))
         ts_ms = int(payload.get("ts_ms", 0))
+        created = now_iso()
+        ts_ms_ui = event_ts_ms_for_ui(ts_ms, created)
         with self.db_lock:
             self.db.execute(
                 """
                 INSERT INTO events(device_id, evt_kind, face_id, name, score, ts_ms, payload_json, created_at)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (device_id, evt_kind, face_id, name, score, ts_ms, json_dumps(payload), now_iso()),
+                (device_id, evt_kind, face_id, name, score, ts_ms_ui, json_dumps(payload), created),
             )
             self.db.commit()
         row = self.get_device_state(device_id)
@@ -277,7 +317,11 @@ class FaceWebState:
             last_seen_ms=server_now_ms(),
             last_status_json=None,
         )
-        return {"type": "event", "device_id": device_id, "payload": payload}
+        payload_out = dict(payload)
+        payload_out["ts_ms"] = ts_ms_ui
+        payload_out["device_ts_ms"] = ts_ms
+        payload_out["created_at"] = created
+        return {"type": "event", "device_id": device_id, "payload": payload_out}
 
     def _handle_reply(self, device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = str(payload.get("request_id", ""))
@@ -318,7 +362,9 @@ class FaceWebState:
         row = self.get_device_state(device_id)
         online = int(bool(row["online"])) if row else 1
         rt_connected = int(bool(row["rt_connected"])) if row else 1
-        db_count = count if ok and cmd == "db_count" else (0 if ok and cmd == "db_reset" else (int(row["db_count"]) if row else -1))
+        db_count = count if ok and cmd == "db_count" else (
+            0 if ok and cmd == "db_reset" else (int(row["db_count"]) if row else -1)
+        )
         self._upsert_device(
             device_id,
             online=online,
@@ -357,6 +403,18 @@ class FaceWebState:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_command_by_request_id(self, request_id: str) -> dict[str, Any] | None:
+        with self.db_lock:
+            row = self.db.execute(
+                """
+                SELECT request_id, device_id, cmd, status, ok, count, message, reply_json, updated_at
+                FROM commands
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_events(self, device_id: str, limit: int) -> list[dict[str, Any]]:
         with self.db_lock:
             rows = self.db.execute(
@@ -369,7 +427,12 @@ class FaceWebState:
                 """,
                 (device_id, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["ts_ms"] = event_ts_ms_for_ui(int(d.get("ts_ms") or 0), d.get("created_at"))
+            out.append(d)
+        return out
 
     def clear_web_data(self) -> dict[str, int]:
         with self.db_lock:

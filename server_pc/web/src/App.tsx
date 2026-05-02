@@ -6,9 +6,50 @@ import SlIcon from "@shoelace-style/shoelace/dist/react/icon/index.js";
 import * as api from "./api";
 import type { CommandRow, DeviceRow, EventRow, WsMessage } from "./types";
 
+/** 设备未校时时 ts_ms 接近 1970；优先信任服务端时间 */
+const MIN_SANE_DEVICE_TS_MS = 1_000_000_000_000;
+
+/** 解析服务端 ISO8601 created_at（兼容 Safari 对高位小数秒的挑剔） */
+function parseIsoToMs(iso: string): number | null {
+  const s0 = iso.trim();
+  if (!s0) return null;
+  const withT = s0.includes("T") ? s0 : s0.replace(/^(\d{4}-\d{2}-\d{2})[ T]/, "$1T");
+  let t = Date.parse(withT);
+  if (!Number.isNaN(t)) return t;
+  const trimmedFrac = withT.replace(/\.(\d{3})\d+/, ".$1");
+  if (trimmedFrac !== withT) {
+    t = Date.parse(trimmedFrac);
+    if (!Number.isNaN(t)) return t;
+  }
+  return null;
+}
+
+function eventDisplayMs_ms(ev: EventRow): number {
+  const ts = Number(ev.ts_ms);
+  if (Number.isFinite(ts) && ts >= MIN_SANE_DEVICE_TS_MS) {
+    return ts;
+  }
+  if (ev.created_at) {
+    const fromCreated = parseIsoToMs(ev.created_at);
+    if (fromCreated !== null) {
+      return fromCreated;
+    }
+  }
+  /* 勿用设备未校时的小 ts_ms（会显示 1970）；若服务端已归一化 ts，上一分支已命中 */
+  return 0;
+}
+
 function fmtTs(ms: number) {
-  if (!ms) return "—";
-  return new Date(ms).toLocaleString();
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  return new Date(ms).toLocaleString(undefined, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 function escapeHtml(value: string | number | null | undefined) {
@@ -41,6 +82,7 @@ export function App() {
   useEffect(() => {
     selectedRef.current = selectedDevice;
   }, [selectedDevice]);
+
   useEffect(() => {
     sessionRef.current = registerSessionOpen;
   }, [registerSessionOpen]);
@@ -483,7 +525,7 @@ export function App() {
                     </div>
                     <div className="data-table__secondary">{Number(ev.score).toFixed(3)}</div>
                     <div className="data-table__meta">
-                      {escapeHtml(fmtTs(ev.ts_ms))}
+                      {escapeHtml(fmtTs(eventDisplayMs_ms(ev)))}
                     </div>
                   </div>
                 ))}

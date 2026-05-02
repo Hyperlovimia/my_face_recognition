@@ -85,8 +85,9 @@ void softmax2(float a, float b, float *o0, float *o1)
 
 } // namespace
 
-FaceAntiSpoof::FaceAntiSpoof(const char *kmodel_file, int debug_mode)
+FaceAntiSpoof::FaceAntiSpoof(const char *kmodel_file, int debug_mode, bool real_class_is_output_index0)
     : AIBase(kmodel_file, "FaceAntiSpoof", debug_mode)
+    , real_class_is_output_index0_(real_class_is_output_index0)
 {
     model_name_ = "FaceAntiSpoof";
 }
@@ -286,10 +287,16 @@ bool FaceAntiSpoof::decode_liveness_scores(float *real_prob, float *spoof_prob) 
     if (sumab > 0.08f)
         softmax2(v0, v1, &p0, &p1);
 
-    /* 类别维顺序必须与训练/ONNX 导出一致。
-     * 多数量产 FAS 导出为 out[0]=REAL、out[1]=SPOOF；旧文档曾写 [0]=SPOOF。
-     * 若出现「真人 REAL 分长期很低、翻拍/照片反而易过」，即为反类，应使用下面这组赋值。 */
-    *real_prob = p0;
-    *spoof_prob = p1;
+    /* 默认：out[0]=SPOOF、out[1]=REAL。仅当构造参数 real_class_is_output_index0 时对调。 */
+    if (real_class_is_output_index0_)
+    {
+        *real_prob = p0;
+        *spoof_prob = p1;
+    }
+    else
+    {
+        *real_prob = p1;
+        *spoof_prob = p0;
+    }
     return true;
 }

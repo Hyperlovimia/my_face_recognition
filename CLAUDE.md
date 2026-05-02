@@ -78,3 +78,24 @@ cd src/reference/ai_poc/my_face_recognition
 ```
 
 > 编译完成后，可在 `k230_bin/` 目录下看到可执行程序与配套测试文件
+
+## 活体检测（偏严 / 误拒真人）
+
+静默活体在 `face_ai` 里用 **REAL 概率** 与阈值比较：`score >= 阈值` 视为通过。阈值 **越高越严**（真人更容易被判为不通过），**越低越松**。
+
+| 项目 | 位置 | 说明 |
+|------|------|------|
+| 默认 REAL 阈值 | `src/face_ai_main.cc` 中 `fas_real_thresh_from_env()` | 未设置环境变量时默认为 **0.32** |
+| 环境变量（板端常不可用） | `FACE_FAS_REAL_THRESH` | 优先用第 10 个参数 |
+| 命令行 | 第 10 / 11 参数 | 阈值为 10；`real0` 为 11（约定 out[0]=REAL 时），见 README |
+| REAL 帧间平滑 | `k_fas_ema_alpha_up` / `k_fas_ema_alpha_dn` | **非对称 EMA**：高分帧快速跟上、低分帧缓降，减轻抖动误拒 |
+
+**启用活体时的启动示例**（路径按你板子实际 `/data` 或 `/sharefs` 调整；常见 kmodel 需 **`real0`**，见 README）：
+
+```sh
+/data/face_ai.elf /data/face_detection_320.kmodel 0.5 0.2 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 60 /data/face_db 0 /data/face_antispoof.kmodel 0.18 real0 &
+```
+
+`0.18` 为 REAL 阈值（真人分数常在 0.15～0.30 波动时可从偏低试起）；不写第 10 个参数则用默认 **0.32**。调试时可将 `<debug_mode>` 设为 `2`，串口打印 `REAL_raw` / `REAL_ema`。
+
+若仍大量误拒，除略降阈值外，还需核对 **光照、角度、活体模型与当前相机场景** 是否匹配；阈值过低会抬高攻击通过风险，需现场折中。

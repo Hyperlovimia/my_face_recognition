@@ -23,8 +23,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #include <algorithm>
+#include <cstring>
 #include <dirent.h>
 #include <sstream>
+#include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -123,10 +125,13 @@ std::string sparse_points_to_string(const float *sparse_points)
 using namespace nncase::runtime;
 using namespace nncase::runtime::detail;
 
-FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize image_size,int debug_mode) : AIBase(kmodel_file, "FaceRecognition", debug_mode)
+FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize image_size,
+                                 int debug_mode, float db_top2_margin)
+    : AIBase(kmodel_file, "FaceRecognition", debug_mode)
 {
 	model_name_ = "FaceRecognition";
 	obj_thresh_ = thresh;
+    db_top2_margin_ = db_top2_margin;
 	valid_register_face_ = 0;
 	image_size_ = image_size;
     const std::vector<int> &raw_input_shape = input_shapes_[0];
@@ -167,6 +172,12 @@ FaceRecognition::~FaceRecognition()
 {
 }
 
+string FaceRecognition::registered_name_at(int idx) const
+{
+    if (idx < 0 || idx >= valid_register_face_)
+        return string();
+    return names_[idx];
+}
 
 bool FaceRecognition::pre_process(runtime_tensor& input_tensor, float *sparse_points)
 {
@@ -417,38 +428,75 @@ int FaceRecognition::database_count(char* db_pth)
 }
 
 
-void FaceRecognition::database_search(FaceRecognitionInfo &result)
+void FaceRecognition::export_query_l2_normalized(float *dst) const
+{
+    if (!dst || feature_num_ <= 0 || p_outputs_.empty() || !p_outputs_[0])
+        return;
+    l2_normalize(p_outputs_[0], dst, feature_num_);
+}
+
+void FaceRecognition::database_search(FaceRecognitionInfo &result, const float *query_l2norm, int frame_face_count)
 {
 	ScopedTiming st(model_name_ + " database_search", debug_mode_);
 	int i;
 	int v_id = -1;
 	float v_score;
-	float v_score_max = 0.0;
+	float v_score_top1 = -1.f;
+	float v_score_top2 = -1.f;
 	float basef[feature_num_], testf[feature_num_];
-	// current frame
-	l2_normalize(p_outputs_[0], testf, feature_num_);
+	if (query_l2norm)
+		std::memcpy(testf, query_l2norm, sizeof(float) * (size_t)feature_num_);
+	else
+		l2_normalize(p_outputs_[0], testf, feature_num_);
 	for (i = 0; i < valid_register_face_; i++)
 	{
         float* cur_feature=features_[i].data();
         l2_normalize(cur_feature, basef, feature_num_);
 		v_score = cal_cosine_distance(testf, basef, feature_num_);
-		if ((v_score > v_score_max) && (v_score > obj_thresh_))
-		{
-			v_score_max = v_score;
-			v_id = i;
-		}
+        if (v_score > v_score_top1)
+        {
+            v_score_top2 = v_score_top1;
+            v_score_top1 = v_score;
+            v_id = i;
+        }
+        else if (v_score > v_score_top2)
+        {
+            v_score_top2 = v_score;
+        }
 	}
-	if (v_id == -1)
+	const bool above_thresh = (v_score_top1 > obj_thresh_);
+	/* 第二名若未贴近识别阈，视为「仅能匹配一人」，不判两可 */
+	const bool second_plausible =
+	    (valid_register_face_ >= 2) && (v_score_top2 > obj_thresh_ - 0.5f);
+	float margin_need = db_top2_margin_;
+	if (valid_register_face_ == 2)
+		margin_need = (std::min)(margin_need, (std::max)(3.2f, db_top2_margin_ * 0.58f));
+	if (frame_face_count >= 2)
+		margin_need = (std::min)(margin_need, (std::max)(2.9f, db_top2_margin_ * 0.52f));
+	const float gap = v_score_top1 - v_score_top2;
+	/* Top1 显著高于阈值时允许在略小分差下仍采信第一名，减轻同框两人时的 unknown */
+	const bool strong_top1 = (v_score_top1 >= obj_thresh_ + 4.5f);
+	const bool ambiguous =
+	    (valid_register_face_ >= 2) && second_plausible && (gap < margin_need) && !strong_top1;
+	result.top1_id = v_id;
+	result.ambiguous_match = ambiguous;
+	if (v_id == -1 || !above_thresh || ambiguous)
 	{
-		result.id = v_id;
+		result.id = -1;
 		result.name = "unknown";
-		result.score = 0;
+		/* 保留与库里的最高相似度，便于区分「真陌生人」与「过阈但歧义/抖动」；纯无库时 top1 仍为 -1 */
+		result.score = (v_score_top1 > 0.f) ? v_score_top1 : 0.f;
+        if (debug_mode_ > 1 && valid_register_face_ >= 2 && above_thresh && ambiguous)
+        {
+            std::cout << "face_rec: ambiguous match (top1=" << v_score_top1 << " top2=" << v_score_top2
+                      << " margin_need>=" << margin_need << ") -> unknown\n";
+        }
 	}
 	else
 	{
 		result.id = v_id;
 		result.name = names_[v_id];
-		result.score = v_score_max;
+		result.score = v_score_top1;
 	}
 }
 
@@ -603,7 +651,7 @@ void FaceRecognition::get_affine_matrix(float *sparse_points)
 	image_umeyama_112(&matrix_src[0][0], &matrix_dst_[0]);
 }
 
-void FaceRecognition::l2_normalize(float *src, float *dst, int len)
+void FaceRecognition::l2_normalize(float *src, float *dst, int len) const
 {
 	float sum = 0;
 	for (int i = 0; i < len; ++i)

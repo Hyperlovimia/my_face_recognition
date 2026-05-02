@@ -39,7 +39,11 @@
 class FaceAntiSpoof : public AIBase
 {
 public:
-    FaceAntiSpoof(const char *kmodel_file, int debug_mode = 2);
+    /**
+     * @param real_class_is_output_index0 仅当 ONNX/kmodel 约定 out[0]=REAL、out[1]=SPOOF 时置 true；
+     *        默认 false：与工程约定一致，out[0]=SPOOF、out[1]=REAL。
+     */
+    FaceAntiSpoof(const char *kmodel_file, int debug_mode = 2, bool real_class_is_output_index0 = false);
 
     /**
      * 按训练脚本：BGR→RGB、最长边等比缩放、反射 padding、/255、HWC→CHW，写入输入 tensor。
@@ -54,8 +58,8 @@ public:
     bool forward();
 
     /**
-     * forward() 且输出为 2 类后有效。沿用原独立测试约定：out[0]=SPOOF、out[1]=REAL；
-     * 若两路之和接近 1 则视为概率，否则对 logits 做 softmax。
+     * forward() 且输出为 2 类后有效。默认：out[0]=SPOOF、out[1]=REAL（与 header 约定一致）；
+     * 构造时 real_class_is_output_index0=true 时视为 out[0]=REAL。
      */
     bool decode_liveness_scores(float *real_prob, float *spoof_prob) const;
 
@@ -66,6 +70,9 @@ public:
     const std::vector<float *> &last_output_ptrs() const { return p_outputs_; }
 
     const std::vector<std::vector<int>> &cached_output_shapes() const { return output_shapes_; }
+
+private:
+    bool real_class_is_output_index0_;
 };
 
 #endif
