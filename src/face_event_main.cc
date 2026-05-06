@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "attendance_log.h"
 #include "ipc_proto.h"
 #include "ipc_shm.h"
 #include "ipc_lwp_user.h"
@@ -143,6 +144,8 @@ static void print_help()
     std::cout << "  q      : 退出（结束 face_video）\n";
     std::cout << "  请在「本进程」输入命令；需已启动 face_video。\n";
     std::cout << "  单串口场景建议：先后台启动 face_ai / face_video，再前台启动 face_event。\n";
+    std::cout << "  考勤日志目录默认：/sd/face_logs（根目录下按日文件 YYYY-MM-DD.jsonl，结构化 JSONL）；\n";
+    std::cout << "  覆盖：启动参数传入根目录，或环境变量 FACE_ATT_LOG_BASE / FACE_ATT_LOG。\n";
     std::cout << "=======================================\n" << std::endl;
 }
 
@@ -504,7 +507,7 @@ static void bridge_service_loop()
     kd_ipcmsg_del_service(IPC_FACE_BRIDGE_SERVICE);
 }
 
-static void evt_recv_loop(FILE *fp, int evt_ch)
+static void evt_recv_loop(const std::string &log_base, int evt_ch)
 {
     struct rt_channel_msg msg;
     while (!g_evt_stop.load())
@@ -531,30 +534,17 @@ static void evt_recv_loop(FILE *fp, int evt_ch)
         if (ev->evt_kind == IPC_EVT_KIND_LIVENESS_FAIL)
         {
             printf("[ALERT] spoof / liveness failed (REAL score=%.3f)\n", ev->score);
-            if (fp)
-            {
-                fprintf(fp, "[SPOOF] real_score=%.3f ts_ms=%llu\n", ev->score, (unsigned long long)ev->ts_ms);
-                fflush(fp);
-            }
+            attendance_log_append_ipc_evt(log_base, ev, nullptr);
         }
         else if (ev->evt_kind == IPC_EVT_KIND_STRANGER || ev->is_stranger)
         {
             printf("[ALERT] 未识别 stranger (score=%.2f) — 可输入 i 或 i <姓名> 现场注册\n", ev->score);
-            if (fp)
-            {
-                fprintf(fp, "[STRANGER] score=%.2f ts_ms=%llu\n", ev->score, (unsigned long long)ev->ts_ms);
-                fflush(fp);
-            }
+            attendance_log_append_ipc_evt(log_base, ev, nullptr);
         }
         else
         {
             printf("[EVT] id=%d name=%s score=%.2f\n", ev->face_id, ev->name, ev->score);
-            if (fp)
-            {
-                fprintf(fp, "[OK] id=%d name=%s score=%.2f ts_ms=%llu\n", ev->face_id, ev->name, ev->score,
-                        (unsigned long long)ev->ts_ms);
-                fflush(fp);
-            }
+            attendance_log_append_ipc_evt(log_base, ev, nullptr);
         }
 
         std::cout << "face_event: bridge event " << evt_kind_name(ev->evt_kind) << " score=" << ev->score
@@ -724,7 +714,7 @@ static void stdin_loop()
     }
 }
 
-static void shutdown_event_process(int evt_ch, int reply_ch, FILE *fp)
+static void shutdown_event_process(int evt_ch, int reply_ch, const std::string &log_base)
 {
     g_evt_stop.store(true);
 
@@ -755,30 +745,18 @@ static void shutdown_event_process(int evt_ch, int reply_ch, FILE *fp)
         kd_ipcmsg_disconnect(bridge_id);
     g_bridge_connected.store(false);
 
-    if (fp)
-    {
-        fprintf(fp, "--- face_event stopping ---\n");
-        fflush(fp);
-    }
+    attendance_log_append_meta(log_base, "face_event_stopping", nullptr);
 }
 
 int main(int argc, char **argv)
 {
-    const char *log_path = (argc >= 2) ? argv[1] : "/tmp/attendance.log";
-
-    FILE *fp = fopen(log_path, "a");
-    if (fp)
-    {
-        fprintf(fp, "--- face_event started ---\n");
-        fflush(fp);
-    }
+    const std::string log_base = attendance_log_resolve_base_dir(argc, argv);
+    attendance_log_append_meta(log_base, "face_event_started", nullptr);
 
     int evt_ch = rt_channel_open(IPC_FACE_EVT_CHANNEL, O_CREAT);
     if (evt_ch < 0)
     {
         printf("face_event: cannot create channel %s\n", IPC_FACE_EVT_CHANNEL);
-        if (fp)
-            fclose(fp);
         return -1;
     }
 
@@ -787,19 +765,17 @@ int main(int argc, char **argv)
     {
         printf("face_event: cannot create channel %s\n", IPC_FACE_VIDEO_REPLY);
         rt_channel_close(evt_ch);
-        if (fp)
-            fclose(fp);
         return -1;
     }
 
-    printf("face_event: listening on %s (ch=%d), log=%s\n", IPC_FACE_EVT_CHANNEL, evt_ch, log_path);
+    printf("face_event: listening on %s (ch=%d), attendance_dir=%s\n", IPC_FACE_EVT_CHANNEL, evt_ch, log_base.c_str());
     printf("face_event: listening on %s (ch=%d)\n", IPC_FACE_VIDEO_REPLY, reply_ch);
     printf("face_event: stdin 在此输入；单串口建议先后台启动 face_ai、face_video，再前台启动本进程。\n");
     printf("face_event: bridge service %s port=%u ready for little-core face_netd\n", IPC_FACE_BRIDGE_SERVICE,
            IPC_FACE_BRIDGE_PORT);
 
     std::thread th_conn(connect_video_ctrl_thread);
-    std::thread th_evt([&]() { evt_recv_loop(fp, evt_ch); });
+    std::thread th_evt([&]() { evt_recv_loop(log_base, evt_ch); });
     std::thread th_reply([&]() { video_reply_recv_loop(reply_ch); });
     std::thread th_bridge(bridge_service_loop);
     std::thread th_stdin(stdin_loop);
@@ -807,7 +783,7 @@ int main(int argc, char **argv)
     while (!g_evt_stop.load())
         usleep(100 * 1000);
 
-    shutdown_event_process(evt_ch, reply_ch, fp);
+    shutdown_event_process(evt_ch, reply_ch, log_base);
 
     th_stdin.join();
     th_evt.join();
@@ -815,7 +791,5 @@ int main(int argc, char **argv)
     th_conn.join();
     th_bridge.join();
 
-    if (fp)
-        fclose(fp);
     return 0;
 }

@@ -5,6 +5,7 @@ import type { SlRequestCloseEvent } from "@shoelace-style/shoelace/dist/react/di
 import SlIcon from "@shoelace-style/shoelace/dist/react/icon/index.js";
 import * as api from "./api";
 import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry, WsMessage } from "./types";
+import type { SdAttendanceLogResponse } from "./api";
 
 /** 设备未校时时 ts_ms 接近 1970；优先信任服务端时间 */
 const MIN_SANE_DEVICE_TS_MS = 1_000_000_000_000;
@@ -60,6 +61,14 @@ function escapeHtml(value: string | number | null | undefined) {
     .replaceAll('"', "&quot;");
 }
 
+function todayLocalYmd(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 export function App() {
   const [devices, setDevices] = useState<DeviceRow[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
@@ -76,6 +85,10 @@ export function App() {
   const [galleryEntries, setGalleryEntries] = useState<FaceGalleryEntry[]>([]);
   const [galleryErr, setGalleryErr] = useState<string | null>(null);
   const [faceBoardBusy, setFaceBoardBusy] = useState(false);
+  const [sdLogData, setSdLogData] = useState<SdAttendanceLogResponse | null>(null);
+  const [sdLogErr, setSdLogErr] = useState<string | null>(null);
+  const [sdLogLoading, setSdLogLoading] = useState(false);
+  const [sdLogDate, setSdLogDate] = useState(todayLocalYmd);
   const dismissProgrammatic = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const sessionRef = useRef(false);
@@ -163,6 +176,29 @@ export function App() {
     [applyGalleryDerivedDbCount, loadSelected],
   );
 
+  const loadSdAttendanceLog = useCallback(async () => {
+    if (!selectedDevice) {
+      alert("请先在顶栏选择设备");
+      return;
+    }
+    setSdLogLoading(true);
+    setSdLogErr(null);
+    try {
+      const data = await api.getSdAttendanceLog(selectedDevice, {
+        date: sdLogDate,
+        timeoutSec: 35,
+        tailLines: 1200,
+        maxBytes: 262144,
+      });
+      setSdLogData(data);
+    } catch (e) {
+      setSdLogErr((e as Error).message);
+      setSdLogData(null);
+    } finally {
+      setSdLogLoading(false);
+    }
+  }, [selectedDevice, sdLogDate]);
+
   useEffect(() => {
     if (!selectedDevice) {
       setGalleryEntries([]);
@@ -171,6 +207,12 @@ export function App() {
     }
     void syncBoardFaceForDevice(selectedDevice);
   }, [selectedDevice, syncBoardFaceForDevice]);
+
+  useEffect(() => {
+    setSdLogData(null);
+    setSdLogErr(null);
+    setSdLogDate(todayLocalYmd());
+  }, [selectedDevice]);
 
   const refreshAll = useCallback(async () => {
     const dev = await loadDevices();
@@ -632,6 +674,59 @@ export function App() {
             )}
           </section>
         </div>
+
+        <section className="panel panel--flush attendance-sd-panel">
+          <div className="panel__head attendance-sd-panel__head">
+            <h2 className="panel__title">TF 卡考勤日志（按日 JSONL）</h2>
+            <div className="attendance-sd-panel__controls">
+              <label className="attendance-sd-date-field">
+                <span className="attendance-sd-date-field__lbl">日期</span>
+                <input
+                  className="attendance-sd-date-field__input"
+                  type="date"
+                  value={sdLogDate}
+                  max={todayLocalYmd()}
+                  onChange={(e) => setSdLogDate(e.target.value)}
+                  disabled={!selectedDevice || sdLogLoading}
+                />
+              </label>
+              <button
+                type="button"
+                className="btn--primary attendance-sd-panel__btn"
+                disabled={!selectedDevice || sdLogLoading}
+                onClick={() => void loadSdAttendanceLog()}
+              >
+                {sdLogLoading ? "读取中…" : "读取当日日志"}
+              </button>
+            </div>
+          </div>
+          {sdLogErr && <p className="face-gallery-error attendance-sd-panel__hint">{escapeHtml(sdLogErr)}</p>}
+          {!sdLogErr && !sdLogData && (
+            <p className="empty-state attendance-sd-panel__hint">
+              考勤 JSONL 路径为 <code>&lt;attendance_log_base&gt;/&lt;YYYY-MM-DD&gt;.jsonl</code>
+              （例如 TF 上 <code>/mnt/tf/face_logs/2026-05-06.jsonl</code>）。挂载{" "}
+              <code>/dev/mmcblk1p1</code> 后，将 <code>face_netd.ini</code> 中{" "}
+              <code>attendance_log_base</code> 指到根目录（如 <code>/mnt/tf/face_logs</code>
+              ）。以下为 MQTT <code>attendance_log_fetch</code> 拉取的当日结构化日志。
+            </p>
+          )}
+          {sdLogData && (
+            <div className="attendance-sd-panel__meta">
+              <span title="板端日期">{escapeHtml(sdLogData.date ?? sdLogDate)}</span>
+              <span title="板端返回的路径">{escapeHtml(sdLogData.path ?? "—")}</span>
+              <span className="attendance-sd-meta-sub">
+                {sdLogData.file_size != null ? `文件约 ${sdLogData.file_size} 字节` : ""}
+                {sdLogData.bytes_returned != null ? ` · 本次返回 ${sdLogData.bytes_returned} 字节` : ""}
+                {sdLogData.truncated ? " · 仅末尾片段" : ""}
+              </span>
+            </div>
+          )}
+          {sdLogData && (
+            <pre className="attendance-sd-pre" dir="ltr">
+              {sdLogData.content || "（空文件）"}
+            </pre>
+          )}
+        </section>
       </main>
 
       <SlDialog

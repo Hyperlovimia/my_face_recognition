@@ -49,3 +49,34 @@ export function getFaceGallery(deviceId: string, timeoutSec = 25) {
     `/api/devices/${encodeURIComponent(deviceId)}/face-gallery?timeout_sec=${encodeURIComponent(String(timeoutSec))}`,
   );
 }
+
+export type SdAttendanceLogResponse = {
+  path?: string;
+  date?: string;
+  truncated?: boolean;
+  file_size?: number;
+  bytes_returned?: number;
+  content: string;
+};
+
+export function getSdAttendanceLog(
+  deviceId: string,
+  opts?: { date?: string; maxBytes?: number; tailLines?: number; timeoutSec?: number },
+) {
+  const p = new URLSearchParams();
+  if (opts?.date != null && opts.date !== "") {
+    p.set("date", opts.date);
+  }
+  if (opts?.maxBytes != null) {
+    p.set("max_bytes", String(opts.maxBytes));
+  }
+  if (opts?.tailLines != null) {
+    p.set("tail_lines", String(opts.tailLines));
+  }
+  if (opts?.timeoutSec != null) {
+    p.set("timeout_sec", String(opts.timeoutSec));
+  }
+  const qs = p.toString();
+  const base = `/api/devices/${encodeURIComponent(deviceId)}/sd-attendance-log`;
+  return fetchJson<SdAttendanceLogResponse>(base + (qs ? `?${qs}` : ""));
+}

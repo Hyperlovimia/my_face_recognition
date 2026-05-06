@@ -15,6 +15,8 @@ services:
     depends_on:
       - mosquitto
     environment:
+      # 影响考勤 JSONL 的 utc_offset_minutes（MQTT/HTTP）；不设 TZ 时容器多为 UTC，墙钟会与本地差一整段时区。
+      TZ: ${TZ:-Asia/Shanghai}
       FACE_MQTT_HOST: mosquitto
       FACE_MQTT_PORT: "1883"
       FACE_WEB_DB_PATH: /app/data/face_web.db

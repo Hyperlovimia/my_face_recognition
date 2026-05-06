@@ -337,6 +337,104 @@ body {
   }
 }
 
+.attendance-sd-panel {
+  margin-bottom: 1rem;
+}
+
+.attendance-sd-panel__head {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.attendance-sd-panel__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.6rem;
+  margin-left: auto;
+}
+
+.attendance-sd-date-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.attendance-sd-date-field__lbl {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.attendance-sd-date-field__input {
+  font: inherit;
+  font-size: 0.8125rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--app-surface);
+  color: var(--ink);
+}
+
+.attendance-sd-panel .panel__head {
+  gap: 0.75rem;
+}
+
+.attendance-sd-panel__btn {
+  padding: 0.45rem 0.9rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--brand);
+  background: var(--brand);
+  color: #fff;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.attendance-sd-panel__btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.attendance-sd-panel__hint {
+  padding: 0.75rem 1.1rem;
+  margin: 0;
+}
+
+.attendance-sd-panel__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1rem;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.75rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--app-elev);
+}
+
+.attendance-sd-panel__meta .attendance-sd-meta-sub {
+  opacity: 0.72;
+}
+
+.attendance-sd-pre {
+  margin: 0;
+  max-height: min(52vh, 420px);
+  overflow: auto;
+  padding: 0.75rem 1.1rem;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  color: var(--ink);
+  background: var(--app-surface);
+}
+
 .panel {
   background: var(--app-surface);
   border: 1px solid var(--line);

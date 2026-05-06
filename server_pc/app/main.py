@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sqlite3
 import time
 import threading
@@ -34,6 +35,22 @@ def now_iso() -> str:
 def server_now_ms() -> int:
     """Wall-clock ms on the PC; use for Last seen so UI matches local time even if device clock is unset."""
     return int(time.time() * 1000)
+
+
+def pc_utc_offset_minutes() -> int:
+    """Minutes east of UTC for TF attendance wall_time (should match your desk clock)."""
+    raw = os.getenv("FACE_ATTENDANCE_UTC_OFFSET_MINUTES", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if -840 <= v <= 840:
+                return v
+        except ValueError:
+            pass
+    off = datetime.now().astimezone().utcoffset()
+    if off is None:
+        return 0
+    return int(off.total_seconds() // 60)
 
 
 # 小于此值的 ts_ms 视为设备未校时（约在 2001-09 之前）；网页展示改用服务端入库时间。
@@ -127,6 +144,36 @@ class FaceWebState:
         self.mqtt.on_disconnect = self._on_disconnect
         self.mqtt.on_message = self._on_message
         self.mqtt.reconnect_delay_set(min_delay=1, max_delay=10)
+        self._time_sync_timer: threading.Timer | None = None
+
+    def _cancel_time_sync_timer(self) -> None:
+        if self._time_sync_timer is not None:
+            self._time_sync_timer.cancel()
+            self._time_sync_timer = None
+
+    def _publish_time_sync(self) -> None:
+        if not self.mqtt_connected.is_set():
+            return
+        payload = json_dumps(
+            {
+                "schema": SCHEMA,
+                "server_ms": server_now_ms(),
+                "iso": now_iso(),
+                "utc_offset_minutes": pc_utc_offset_minutes(),
+            }
+        )
+        self.mqtt.publish("k230/time_sync", payload, qos=0, retain=True)
+
+    def _schedule_next_time_sync_broadcast(self) -> None:
+        self._cancel_time_sync_timer()
+
+        def fire() -> None:
+            self._publish_time_sync()
+            self._schedule_next_time_sync_broadcast()
+
+        self._time_sync_timer = threading.Timer(120.0, fire)
+        self._time_sync_timer.daemon = True
+        self._time_sync_timer.start()
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -135,6 +182,7 @@ class FaceWebState:
         self.mqtt.loop_start()
 
     def stop(self) -> None:
+        self._cancel_time_sync_timer()
         self.mqtt.loop_stop()
         try:
             self.mqtt.disconnect()
@@ -190,13 +238,17 @@ class FaceWebState:
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: dict[str, Any], rc: int) -> None:
         if rc == 0:
+            self._cancel_time_sync_timer()
             self.mqtt_connected.set()
             client.subscribe("k230/+/up/#", qos=1)
+            self._publish_time_sync()
+            self._schedule_next_time_sync_broadcast()
         else:
             self.mqtt_connected.clear()
 
     def _on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
         self.mqtt_connected.clear()
+        self._cancel_time_sync_timer()
 
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
         try:
@@ -468,6 +520,7 @@ class FaceWebState:
         *,
         name: str | None = None,
         slot: int | None = None,
+        mqtt_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.mqtt_connected.is_set():
             raise HTTPException(status_code=503, detail="MQTT broker is not connected")
@@ -482,6 +535,8 @@ class FaceWebState:
             payload["name"] = name
         if slot is not None:
             payload["slot"] = slot
+        if mqtt_extra:
+            payload.update(mqtt_extra)
 
         with self.db_lock:
             self.db.execute(
@@ -557,6 +612,16 @@ async def favicon() -> Response:
     return Response(status_code=204)
 
 
+@app.get("/api/server-time")
+async def api_server_time() -> dict[str, Any]:
+    """板端 Linux 小核未校时时，face_netd 用此接口推算考勤目录日期（与 DB 里 server_now_ms / created_at 思路一致）。"""
+    return {
+        "server_ms": server_now_ms(),
+        "iso": now_iso(),
+        "utc_offset_minutes": pc_utc_offset_minutes(),
+    }
+
+
 @app.get("/api/devices")
 async def api_devices() -> dict[str, Any]:
     return {"devices": state.list_devices()}
@@ -575,6 +640,51 @@ async def api_device_events(device_id: str, limit: int = Query(default=100, ge=1
     if state.get_device_state(device_id) is None:
         raise HTTPException(status_code=404, detail="device not found")
     return {"events": state.get_events(device_id, limit)}
+
+_YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+@app.get("/api/devices/{device_id}/sd-attendance-log")
+async def api_sd_attendance_log(
+    device_id: str,
+    timeout_sec: float = Query(default=25.0, ge=3.0, le=120.0),
+    max_bytes: int = Query(default=262144, ge=4096, le=1048576),
+    tail_lines: int = Query(default=800, ge=1, le=20000),
+    date: str | None = Query(default=None, description="YYYY-MM-DD on device; omit for device local today"),
+) -> dict[str, Any]:
+    """由 Linux 小核 face_netd 读取 TF 上按日文件 <YYYY-MM-DD>.jsonl（MQTT）。"""
+    if date is not None and not _YMD_RE.match(date):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    if state.get_device_state(device_id) is None:
+        raise HTTPException(status_code=404, detail="device not found")
+    mqtt_extra: dict[str, Any] = {"max_bytes": max_bytes, "tail_lines": tail_lines}
+    if date:
+        mqtt_extra["date"] = date
+    accepted = state.publish_command(device_id, "attendance_log_fetch", mqtt_extra=mqtt_extra)
+    request_id = str(accepted["request_id"])
+    row = await await_mqtt_command_done(request_id, timeout_sec)
+    if row is None:
+        raise HTTPException(status_code=504, detail="Timed out waiting for device reply")
+    body = mqtt_reply_body(row.get("reply_json"))
+    if row.get("status") != "done" or not body.get("ok"):
+        detail = str(body.get("message") or row.get("message") or "attendance log fetch failed")
+        raise HTTPException(status_code=502, detail=detail)
+    b64 = body.get("log_b64")
+    if not isinstance(b64, str):
+        raise HTTPException(status_code=502, detail="no log payload in reply")
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=502, detail="invalid base64 log payload") from None
+    text = raw.decode("utf-8", errors="replace")
+    return {
+        "path": body.get("path"),
+        "date": body.get("date"),
+        "truncated": bool(body.get("truncated")),
+        "file_size": body.get("file_size"),
+        "bytes_returned": body.get("bytes_returned"),
+        "content": text,
+    }
 
 
 @app.get("/api/devices/{device_id}/face-gallery")

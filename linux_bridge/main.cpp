@@ -1,9 +1,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cerrno>
+#include <ctime>
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +22,11 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 extern "C" {
 #include "k_ipcmsg.h"
@@ -54,6 +63,12 @@ struct Config {
     std::string mqtt_password;
     /** Linux 小核可见的人脸库目录（与 RT face_ai 的 db_dir 一致，常为 /sharefs/face_db） */
     std::string face_db_dir = "/sharefs/face_db";
+    /** TF 考勤根目录；每日单文件：<base>/<YYYY-MM-DD>.jsonl */
+    std::string attendance_log_base = "/mnt/tf/face_logs";
+    /** 考勤日志 wall_time / 文件名日期：相对 UTC 向东偏移的分钟数（中国常为 480）。MQTT/HTTP 带回 pc_utc_offset_minutes 后自动覆盖。 */
+    int attendance_tz_offset_minutes = 480;
+    /** server_pc HTTP 根 URL（如 http://192.168.1.10:8000）；空则从 mqtt_url 主机推导 :8000；disabled 则关闭校时拉取 */
+    std::string server_http_base;
     int heartbeat_interval_ms = kHeartbeatDefaultMs;
     int ipc_connect_retry_ms = 500;
     int ipc_sync_timeout_ms = 3000;
@@ -100,9 +115,23 @@ struct Runtime {
 
     std::mutex status_mu;
     uint64_t last_status_publish_ms = 0;
+
+    /** serialize TF attendance JSONL writes from ipc callback thread */
+    std::mutex attendance_sd_log_mu;
 };
 
 Runtime g_rt;
+
+/** 与 server_pc main.py _MIN_SANE_DEVICE_EPOCH_MS 一致：小于此值的 Linux epoch ms 视为未校时 */
+constexpr uint64_t kMinSaneLinuxEpochMs = 1000000000000ULL;
+
+std::mutex g_att_wall_cal_mu;
+uint64_t g_att_wall_ref_server_ms = 0;
+uint64_t g_att_wall_ref_linux_ms = 0;
+std::atomic<uint64_t> g_att_wall_last_http_warn_linux_ms{0};
+/** PC 下发的本地时区相对 UTC 偏移（东为正分）；INT32_MIN 表示尚未收到 MQTT/HTTP。 */
+std::atomic<int32_t> g_pc_utc_offset_minutes{INT32_MIN};
+
 mg_mgr g_mgr;
 mg_connection *g_mqtt = nullptr;
 
@@ -125,6 +154,56 @@ std::string trim(const std::string &s)
         return "";
     const size_t end = s.find_last_not_of(ws);
     return s.substr(begin, end - begin + 1);
+}
+
+static bool is_ymd_calendar(const std::string &s)
+{
+    if (s.size() != 10 || s[4] != '-' || s[7] != '-')
+        return false;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (i == 4 || i == 7)
+            continue;
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+    }
+    return true;
+}
+
+static uint64_t wall_calendar_ms_for_attendance_folder();
+
+/** Civil date/time for fixed offset east of UTC (minutes). Uses gmtime_r(utc + offset) trick; no historical DST tables. */
+static bool utc_ms_to_civil_tm_fixed_offset(uint64_t utc_ms, long offset_minutes_east, struct tm *out_tm)
+{
+    if (!out_tm)
+        return false;
+    const std::time_t utc_sec = static_cast<std::time_t>(utc_ms / 1000ULL);
+    const std::time_t adj = utc_sec + offset_minutes_east * 60;
+    return gmtime_r(&adj, out_tm) != nullptr;
+}
+
+static long effective_attendance_tz_offset_minutes()
+{
+    const int32_t synced = g_pc_utc_offset_minutes.load(std::memory_order_relaxed);
+    if (synced == INT32_MIN)
+        return static_cast<long>(g_rt.cfg.attendance_tz_offset_minutes);
+    /* server_pc 在 Docker 里常为 UTC：mqtt 里 utc_offset_minutes=0 会与本地办公桌时区不一致。
+     * 此时若 face_netd.ini 配置了非 0 区（默认 480），用工卡 ini；要严格按 UTC 记考勤请写 attendance_tz_offset_minutes=0。 */
+    if (synced == 0 && g_rt.cfg.attendance_tz_offset_minutes != 0)
+        return static_cast<long>(g_rt.cfg.attendance_tz_offset_minutes);
+    return static_cast<long>(synced);
+}
+
+static std::string today_local_ymd_linux()
+{
+    const uint64_t ms = wall_calendar_ms_for_attendance_folder();
+    struct tm tm_local {};
+    if (!utc_ms_to_civil_tm_fixed_offset(ms, effective_attendance_tz_offset_minutes(), &tm_local))
+        return {};
+    char buf[16]{};
+    if (strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_local) <= 0)
+        return {};
+    return std::string(buf);
 }
 
 bool parse_int(const std::string &s, int *out)
@@ -232,6 +311,24 @@ bool load_config(const std::string &path, Config *cfg)
             parse_int(value, &cfg->mqtt_keepalive_s);
         else if (key == "face_db_dir")
             cfg->face_db_dir = value;
+        else if (key == "attendance_log_base")
+            cfg->attendance_log_base = value;
+        else if (key == "attendance_tz_offset_minutes")
+            parse_int(value, &cfg->attendance_tz_offset_minutes);
+        else if (key == "server_http_base")
+            cfg->server_http_base = value;
+        else if (key == "attendance_log_path")
+        {
+            /* 兼容旧配置：若写的是 …/face_logs/xxx.log，去掉文件名当作根目录 */
+            std::string v = value;
+            while (!v.empty() && (v.back() == '/' || v.back() == '\\'))
+                v.pop_back();
+            const size_t slash = v.find_last_of('/');
+            if (slash != std::string::npos)
+                cfg->attendance_log_base = v.substr(0, slash);
+            else
+                cfg->attendance_log_base = v;
+        }
         else
             std::cerr << "face_netd: ignore unknown config key: " << key << std::endl;
     }
@@ -256,6 +353,10 @@ bool load_config(const std::string &path, Config *cfg)
         cfg->mqtt_keepalive_s = 15;
     if (cfg->face_db_dir.empty())
         cfg->face_db_dir = "/sharefs/face_db";
+    if (cfg->attendance_log_base.empty())
+        cfg->attendance_log_base = "/mnt/tf/face_logs";
+    if (cfg->attendance_tz_offset_minutes < -840 || cfg->attendance_tz_offset_minutes > 840)
+        cfg->attendance_tz_offset_minutes = 480;
 
     return true;
 }
@@ -443,6 +544,119 @@ void handle_db_face_image_local(const std::string &request_id, long slot)
     publish_reply_mqtt(request_id, "db_face_image", true, 1, "ok", extra.str());
 }
 
+void handle_attendance_log_fetch_local(const std::string &request_id, long max_bytes_in, long tail_lines_in,
+                                       const std::string &date_in)
+{
+    constexpr size_t k_default_max = 256 * 1024;
+    constexpr size_t k_hard_max = 1024 * 1024;
+    size_t cap = k_default_max;
+    if (max_bytes_in > 0 && static_cast<size_t>(max_bytes_in) <= k_hard_max)
+        cap = static_cast<size_t>(max_bytes_in);
+
+    size_t tail_lines = 500;
+    if (tail_lines_in > 0 && tail_lines_in <= 50000)
+        tail_lines = static_cast<size_t>(tail_lines_in);
+
+    std::string ymd = trim(date_in);
+    if (ymd.empty())
+        ymd = today_local_ymd_linux();
+    if (ymd.empty() || !is_ymd_calendar(ymd))
+    {
+        publish_reply_mqtt(request_id, "attendance_log_fetch", false, 0, "invalid date (use YYYY-MM-DD)", "");
+        return;
+    }
+
+    const std::string &base = g_rt.cfg.attendance_log_base;
+    const std::string path_flat = base + "/" + ymd + ".jsonl";
+    const std::string path_legacy = base + "/" + ymd + "/events.jsonl";
+
+    std::string path;
+    std::error_code ec;
+    if (fs::exists(path_flat, ec) && fs::is_regular_file(path_flat, ec))
+        path = path_flat;
+    else if (fs::exists(path_legacy, ec) && fs::is_regular_file(path_legacy, ec))
+        path = path_legacy;
+    else
+    {
+        publish_reply_mqtt(request_id, "attendance_log_fetch", false, 0,
+                            "no log file for date (expect <base>/<YYYY-MM-DD>.jsonl or legacy .../<date>/events.jsonl)", "");
+        return;
+    }
+
+    if (!fs::is_regular_file(path, ec))
+    {
+        publish_reply_mqtt(request_id, "attendance_log_fetch", false, 0, "path is not a regular file", "");
+        return;
+    }
+
+    const auto sz_raw = fs::file_size(path, ec);
+    if (ec)
+    {
+        publish_reply_mqtt(request_id, "attendance_log_fetch", false, 0, "cannot stat log file", "");
+        return;
+    }
+    const size_t fsize = static_cast<size_t>(sz_raw);
+
+    bool truncated = false;
+    std::string chunk;
+    {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs)
+        {
+            publish_reply_mqtt(request_id, "attendance_log_fetch", false, 0, "cannot open log file", "");
+            return;
+        }
+        size_t start = 0;
+        if (fsize > cap)
+        {
+            start = fsize - cap;
+            truncated = true;
+        }
+        ifs.seekg(static_cast<std::streamoff>(start));
+        std::ostringstream oss;
+        oss << ifs.rdbuf();
+        chunk = oss.str();
+    }
+
+    if (truncated && !chunk.empty())
+    {
+        const size_t nl = chunk.find('\n');
+        if (nl != std::string::npos && nl + 1 < chunk.size())
+            chunk.erase(0, nl + 1);
+        chunk = std::string("[… omitted earlier bytes]\n") + chunk;
+    }
+
+    if (tail_lines > 0 && !chunk.empty())
+    {
+        size_t cnt = 0;
+        for (size_t i = chunk.size(); i > 0;)
+        {
+            --i;
+            if (chunk[i] == '\n')
+            {
+                ++cnt;
+                if (cnt >= tail_lines)
+                {
+                    chunk.erase(0, i + 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    const std::string b64 =
+        base64_encode_bytes(reinterpret_cast<const unsigned char *>(chunk.data()), chunk.size());
+
+    std::ostringstream extra;
+    extra << ",\"date\":\"" << json_escape(ymd) << "\""
+          << ",\"path\":\"" << json_escape(path) << "\""
+          << ",\"truncated\":" << (truncated ? "true" : "false") << ",\"file_size\":" << fsize
+          << ",\"bytes_returned\":" << chunk.size() << ",\"log_b64\":\"" << b64 << "\"";
+
+    publish_reply_mqtt(request_id, "attendance_log_fetch", true, static_cast<int>(chunk.size()),
+                        truncated ? "ok (tail bytes truncated)" : "ok", extra.str());
+}
+
 bool pop_publish(PublishItem *out)
 {
     if (!out)
@@ -559,13 +773,391 @@ void mark_rt_seen()
     g_rt.status_dirty.store(true);
 }
 
+static std::string derive_http_base_from_mqtt_url(const std::string &mqtt_url)
+{
+    const size_t p = mqtt_url.find("://");
+    if (p == std::string::npos)
+        return {};
+    const size_t i = p + 3;
+    const size_t colon = mqtt_url.find(':', i);
+    const size_t slash = mqtt_url.find('/', i);
+    std::string host;
+    if (colon != std::string::npos && (slash == std::string::npos || colon < slash))
+        host = mqtt_url.substr(i, colon - i);
+    else if (slash != std::string::npos)
+        host = mqtt_url.substr(i, slash - i);
+    else
+        host = mqtt_url.substr(i);
+    while (!host.empty() && std::isspace(static_cast<unsigned char>(host.back())))
+        host.pop_back();
+    if (host.empty())
+        return {};
+    return "http://" + host + ":8000";
+}
+
+static std::string resolved_server_http_base_for_sync()
+{
+    const std::string &raw = g_rt.cfg.server_http_base;
+    if (raw == "-" || raw == "disabled" || raw == "off")
+        return {};
+    if (!raw.empty())
+        return raw;
+    return derive_http_base_from_mqtt_url(g_rt.cfg.mqtt_url);
+}
+
+static bool parse_http_base_host_port(const std::string &base_raw, std::string *host_out, int *port_out)
+{
+    std::string s = trim(base_raw);
+    while (!s.empty() && s.back() == '/')
+        s.pop_back();
+    if (s.size() >= 8 && s.compare(0, 8, "https://") == 0)
+        return false;
+    if (s.size() >= 7 && s.compare(0, 7, "http://") == 0)
+        s = s.substr(7);
+    if (s.empty())
+        return false;
+    const size_t colon = s.find(':');
+    if (colon == std::string::npos)
+    {
+        *host_out = s;
+        *port_out = 80;
+        return true;
+    }
+    *host_out = s.substr(0, colon);
+    const std::string ps = s.substr(colon + 1);
+    char *end = nullptr;
+    const long p = std::strtol(ps.c_str(), &end, 10);
+    if (end == ps.c_str() || p <= 0 || p > 65535)
+        return false;
+    *port_out = static_cast<int>(p);
+    return true;
+}
+
+static uint64_t parse_server_ms_json_body(const std::string &body)
+{
+    const auto pos = body.find("\"server_ms\"");
+    if (pos == std::string::npos)
+        return 0;
+    size_t q = body.find(':', pos);
+    if (q == std::string::npos)
+        return 0;
+    ++q;
+    while (q < body.size() && (body[q] == ' ' || body[q] == '\t'))
+        ++q;
+    char *end = nullptr;
+    const unsigned long long v = std::strtoull(body.c_str() + q, &end, 10);
+    if (end == body.c_str() + q || v == 0ULL || v < kMinSaneLinuxEpochMs)
+        return 0;
+    return static_cast<uint64_t>(v);
+}
+
+static constexpr long k_utc_off_json_missing = 99999;
+
+/** Parses utc_offset_minutes from JSON body if present (mosquito mg_json); clamps [-840,840]. */
+static void apply_pc_utc_offset_minutes_from_json_body(const std::string &body)
+{
+    const long off =
+        mg_json_get_long(mg_str_n(body.data(), body.size()), "$.utc_offset_minutes", k_utc_off_json_missing);
+    if (off == k_utc_off_json_missing)
+        return;
+    if (off < -840 || off > 840)
+        return;
+    g_pc_utc_offset_minutes.store(static_cast<int32_t>(off), std::memory_order_relaxed);
+}
+
+static void apply_wall_clock_from_pc_ms(uint64_t server_ms, const char *via_tag)
+{
+    if (server_ms < kMinSaneLinuxEpochMs)
+        return;
+    std::lock_guard<std::mutex> lk(g_att_wall_cal_mu);
+    const uint64_t L = now_ms();
+    g_att_wall_ref_server_ms = server_ms;
+    g_att_wall_ref_linux_ms = L;
+    std::cout << "face_netd: attendance folder calendar synced (" << via_tag << ") server_ms=" << server_ms
+              << std::endl;
+}
+
+static void handle_time_sync_mqtt_message(const mg_str &data)
+{
+    if (!data.ptr || data.len == 0)
+        return;
+    std::string body(static_cast<size_t>(data.len), '\0');
+    std::memcpy(&body[0], data.ptr, data.len);
+    apply_pc_utc_offset_minutes_from_json_body(body);
+    const uint64_t sm = parse_server_ms_json_body(body);
+    if (sm == 0ULL)
+        return;
+    apply_wall_clock_from_pc_ms(sm, "MQTT k230/time_sync");
+}
+
+static uint64_t http_fetch_server_time_ms_blocking(const std::string &http_base_raw)
+{
+    std::string host;
+    int port = 80;
+    if (!parse_http_base_host_port(http_base_raw, &host, &port))
+        return 0;
+
+    int fd = -1;
+    struct sockaddr_in sin{};
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &sin.sin_addr) == 1)
+    {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0)
+        {
+            struct timeval tv;
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (connect(fd, reinterpret_cast<struct sockaddr *>(&sin), sizeof(sin)) != 0)
+            {
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+
+    if (fd < 0)
+    {
+        struct addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = nullptr;
+        const std::string port_str = std::to_string(port);
+        if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res)
+            return 0;
+
+        for (struct addrinfo *p = res; p; p = p->ai_next)
+        {
+            fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (fd < 0)
+                continue;
+            struct timeval tv;
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (connect(fd, p->ai_addr, static_cast<socklen_t>(p->ai_addrlen)) == 0)
+                break;
+            close(fd);
+            fd = -1;
+        }
+        freeaddrinfo(res);
+    }
+
+    if (fd < 0)
+        return 0;
+
+    std::string host_hdr = host;
+    if (port != 80)
+        host_hdr += ":" + std::to_string(port);
+    const std::string req = "GET /api/server-time HTTP/1.1\r\nHost: " + host_hdr
+                            + "\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
+    const ssize_t sent = send(fd, req.data(), req.size(), 0);
+    if (sent != static_cast<ssize_t>(req.size()))
+    {
+        close(fd);
+        return 0;
+    }
+
+    std::string buf;
+    buf.reserve(8192);
+    char tmp[4096];
+    for (;;)
+    {
+        const ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0)
+            break;
+        buf.append(tmp, static_cast<size_t>(n));
+        if (buf.size() > 65536)
+            break;
+    }
+    close(fd);
+
+    if (buf.size() < 12 || buf.rfind("HTTP/", 0) != 0)
+        return 0;
+
+    size_t line_end = buf.find("\r\n");
+    if (line_end == std::string::npos)
+        line_end = buf.find('\n');
+    if (line_end == std::string::npos || line_end < static_cast<size_t>(10))
+        return 0;
+    const std::string line0 = buf.substr(0, line_end);
+    int http_maj = 0, http_min = 0, status_code = 0;
+    if (std::sscanf(line0.c_str(), "HTTP/%d.%d %d", &http_maj, &http_min, &status_code) != 3 || status_code != 200)
+    {
+        static std::atomic<bool> warn_http_status{};
+        if (!warn_http_status.exchange(true))
+            std::cerr << "face_netd: server-time HTTP non-200 line=\"" << line0 << "\"" << std::endl;
+        return 0;
+    }
+
+    size_t sep_r = buf.find("\r\n\r\n");
+    size_t sep_n = buf.find("\n\n");
+    size_t sep = std::string::npos;
+    size_t skip = 0;
+    if (sep_r != std::string::npos && (sep_n == std::string::npos || sep_r <= sep_n))
+    {
+        sep = sep_r;
+        skip = 4;
+    }
+    else if (sep_n != std::string::npos)
+    {
+        sep = sep_n;
+        skip = 2;
+    }
+    else
+        return 0;
+
+    const std::string body = buf.substr(sep + skip);
+    apply_pc_utc_offset_minutes_from_json_body(body);
+    return parse_server_ms_json_body(body);
+}
+
+/** Linux epoch 不可信时：优先用已缓存的 PC 时间（MQTT k230/time_sync 或 HTTP）；否则尝试 HTTP，再等 MQTT。 */
+static uint64_t wall_calendar_ms_for_attendance_folder()
+{
+    const uint64_t L = now_ms();
+    if (L >= kMinSaneLinuxEpochMs)
+        return L;
+
+    auto extrapolate_from_refs = [&]() -> uint64_t {
+        std::lock_guard<std::mutex> lk(g_att_wall_cal_mu);
+        const uint64_t l_now = now_ms();
+        if (g_att_wall_ref_server_ms >= kMinSaneLinuxEpochMs)
+        {
+            const uint64_t est = g_att_wall_ref_server_ms + (l_now - g_att_wall_ref_linux_ms);
+            if (est >= kMinSaneLinuxEpochMs)
+                return est;
+        }
+        return 0;
+    };
+
+    if (const uint64_t ex = extrapolate_from_refs(); ex != 0)
+        return ex;
+
+    const std::string http_base = resolved_server_http_base_for_sync();
+    if (!http_base.empty())
+    {
+        const uint64_t fetched = http_fetch_server_time_ms_blocking(http_base);
+        if (fetched >= kMinSaneLinuxEpochMs)
+        {
+            apply_wall_clock_from_pc_ms(fetched, "HTTP /api/server-time");
+            return fetched;
+        }
+
+        const uint64_t noww = now_ms();
+        uint64_t prev = g_att_wall_last_http_warn_linux_ms.load(std::memory_order_relaxed);
+        if (prev == 0 || noww >= prev + 600000ULL)
+        {
+            if (g_att_wall_last_http_warn_linux_ms.compare_exchange_weak(prev, noww, std::memory_order_relaxed))
+                std::cerr << "face_netd: PC calendar HTTP failed (" << http_base
+                          << "/api/server-time). Using MQTT k230/time_sync from server_pc if available..."
+                          << std::endl;
+        }
+    }
+
+    if (const uint64_t ex2 = extrapolate_from_refs(); ex2 != 0)
+        return ex2;
+
+    return L;
+}
+
+static void attendance_wall_clock_prime_from_pc_async()
+{
+    std::thread(
+        []()
+        {
+            const uint64_t ms = wall_calendar_ms_for_attendance_folder();
+            (void)ms;
+        })
+        .detach();
+}
+
 void publish_reply_failure(const std::string &request_id, int cmd, const std::string &message)
 {
     publish_reply_mqtt(request_id, bridge_cmd_name(cmd), false, -1, message, "");
 }
 
+/** Same JSONL shape as RT face_event; written under attendance_log_base when TF is mounted on Linux.
+ *  Mirrors ipc events when big-core /sd is unavailable or returns EINVAL. */
+static void append_attendance_jsonl_linux_tf(const bridge_event_t &ev)
+{
+    const std::string &base = g_rt.cfg.attendance_log_base;
+    if (base.empty())
+        return;
+
+    /* wall_time：与 PC 本地钟对齐（utc_offset_minutes from MQTT/HTTP，否则 attendance_tz_offset_minutes） */
+    const uint64_t folder_clock_ms = wall_calendar_ms_for_attendance_folder();
+    struct tm tm_local {};
+    if (!utc_ms_to_civil_tm_fixed_offset(folder_clock_ms, effective_attendance_tz_offset_minutes(), &tm_local))
+        return;
+    char ymd[16]{};
+    if (strftime(ymd, sizeof(ymd), "%Y-%m-%d", &tm_local) <= 0)
+        return;
+    char hms[12]{};
+    if (strftime(hms, sizeof(hms), "%H:%M:%S", &tm_local) <= 0)
+        return;
+
+    const ipc_evt_kind_t ek = static_cast<ipc_evt_kind_t>(ev.evt_kind);
+    const int is_stranger = (ek == IPC_EVT_KIND_STRANGER) ? 1 : 0;
+    const int live_ok = (ek == IPC_EVT_KIND_LIVENESS_FAIL) ? 0 : 1;
+    const char *evt_str = "unknown";
+    switch (ek)
+    {
+    case IPC_EVT_KIND_RECOGNIZED:
+        evt_str = "recognized";
+        break;
+    case IPC_EVT_KIND_STRANGER:
+        evt_str = "stranger";
+        break;
+    case IPC_EVT_KIND_LIVENESS_FAIL:
+        evt_str = "liveness_fail";
+        break;
+    default:
+        break;
+    }
+
+    std::string nm(ev.name, strnlen(ev.name, IPC_NAME_MAX));
+
+    std::ostringstream json_line;
+    json_line << "{\"wall_time\":\"" << hms << "\",\"evt_kind\":\"" << evt_str << "\""
+              << ",\"face_id\":" << ev.face_id << ",\"name\":\"" << json_escape(nm) << "\""
+              << ",\"score\":" << ev.score << ",\"is_stranger\":" << is_stranger << ",\"live_ok\":" << live_ok << "}";
+
+    std::error_code ec;
+    fs::create_directories(fs::path(base), ec);
+    if (ec)
+    {
+        static std::atomic<bool> warn_mkdir{};
+        if (!warn_mkdir.exchange(true))
+            std::cerr << "face_netd: attendance create_directories failed " << base << " : " << ec.message()
+                      << std::endl;
+        return;
+    }
+
+    const std::string path = (fs::path(base) / (std::string(ymd) + ".jsonl")).string();
+    {
+        std::lock_guard<std::mutex> lk(g_rt.attendance_sd_log_mu);
+        std::ofstream ofs(path, std::ios::app | std::ios::binary);
+        if (!ofs)
+        {
+            static std::atomic<bool> warn_open{};
+            if (!warn_open.exchange(true))
+                std::cerr << "face_netd: cannot open attendance log " << path << " (mount TF under attendance_log_base?)"
+                          << std::endl;
+            return;
+        }
+        ofs << json_line.str() << '\n';
+    }
+}
+
 void handle_bridge_event(const bridge_event_t &ev)
 {
+    append_attendance_jsonl_linux_tf(ev);
+
     std::ostringstream oss;
     oss << "{\"schema\":\"" << kSchema << "\""
         << ",\"device_id\":\"" << json_escape(g_rt.cfg.device_id) << "\""
@@ -862,6 +1454,17 @@ void parse_and_enqueue_command(mg_str json)
         handle_db_face_image_local(request_id_s, slot);
         return;
     }
+    if (cmd_s == "attendance_log_fetch")
+    {
+        const long max_bytes = mg_json_get_long(json, "$.max_bytes", -1);
+        const long tail_lines = mg_json_get_long(json, "$.tail_lines", -1);
+        char *date_c = mg_json_get_str(json, "$.date");
+        std::string date_s = date_c ? trim(date_c) : "";
+        if (date_c)
+            free(date_c);
+        handle_attendance_log_fetch_local(request_id_s, max_bytes, tail_lines, date_s);
+        return;
+    }
 
     int bridge_cmd = IPC_BRIDGE_CMD_NONE;
     if (!bridge_cmd_from_string(cmd_s, &bridge_cmd))
@@ -985,8 +1588,15 @@ void mqtt_handle_read(mg_connection *c)
                 sub.qos = 1;
                 mg_mqtt_sub(c, &sub);
             }
+            {
+                mg_mqtt_opts sub{};
+                sub.topic = mg_str("k230/time_sync");
+                sub.qos = 0;
+                mg_mqtt_sub(c, &sub);
+            }
             enqueue_status_publish(true, true);
             std::cout << "face_netd: mqtt connected " << g_rt.cfg.mqtt_url << std::endl;
+            attendance_wall_clock_prime_from_pc_async();
             break;
 
         case MQTT_CMD_PUBLISH:
@@ -998,6 +1608,8 @@ void mqtt_handle_read(mg_connection *c)
             }
             if (mg_strcmp(mm.topic, mg_str(topic_down_cmd().c_str())) == 0)
                 parse_and_enqueue_command(mm.data);
+            else if (mg_strcmp(mm.topic, mg_str("k230/time_sync")) == 0)
+                handle_time_sync_mqtt_message(mm.data);
             break;
 
         case MQTT_CMD_PUBREC:
@@ -1214,7 +1826,12 @@ int main(int argc, char **argv)
 
     std::cout << "face_netd: device_id=" << g_rt.cfg.device_id << " mqtt_url=" << g_rt.cfg.mqtt_url
               << " heartbeat=" << g_rt.cfg.heartbeat_interval_ms << "ms face_db_dir=" << g_rt.cfg.face_db_dir
-              << std::endl;
+              << " attendance_log_base=" << g_rt.cfg.attendance_log_base << std::endl;
+    {
+        const std::string hb = resolved_server_http_base_for_sync();
+        std::cout << "face_netd: attendance_pc_http=" << (hb.empty() ? "off" : hb)
+                  << " + MQTT k230/time_sync (server_pc)" << std::endl;
+    }
 
     mg_mgr_init(&g_mgr);
 
