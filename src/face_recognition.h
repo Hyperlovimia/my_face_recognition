@@ -100,11 +100,10 @@ public:
     void database_add(std::string& name, float* feature);
 
     /**
-     * @brief 人脸数据库重置，清除所有数据库人脸特征
-     * @param db_pth 数据库目录
-     * @return None
-    */
-    void database_add(std::string& name, char* db_path);
+     * @brief 在线注册：保存特征与画廊快照（整幅 ISP BGR，横版未旋转；与 face_video dump_img 一致，无检测框）
+     * @param full_isp_bgr_landscape 注册当帧 camera/MPI dump，BGR；内部按 DISPLAY_ROTATE 与预览对齐后再写 JPEG
+     */
+    void database_add(std::string& name, char* db_path, const cv::Mat &full_isp_bgr_landscape);
 
     /**
      * @brief 人脸数据库重置，清除所有数据库人脸特征
@@ -198,13 +197,6 @@ private:
     */
     float cal_cosine_distance(float* feature_0, float* feature_1, int feature_len);
     
-    /**
-    * @brief 获取目录下的文件个数
-    * @param path     目标目录
-    * @return 文件个数
-    */
-    int get_dir_files(const char *path);
-
     std::unique_ptr<ai2d_builder> ai2d_builder_; // ai2d构建器
     runtime_tensor ai2d_out_tensor_;             // ai2d输出tensor
     

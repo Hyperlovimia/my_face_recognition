@@ -161,13 +161,22 @@ public:
     template <class T>
     static vector<T> read_binary_file(const char *file_name)
     {
-        ifstream ifs(file_name, std::ios::binary);
-        ifs.seekg(0, ifs.end);
-        size_t len = ifs.tellg();
+        std::ifstream ifs(file_name, std::ios::binary);
+        if (!ifs)
+            return {};
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff len_off = ifs.tellg();
+        if (len_off <= 0)
+            return {};
+        const size_t len = static_cast<size_t>(len_off);
+        constexpr size_t k_max_bytes = 64u * 1024u * 1024u;
+        if (len > k_max_bytes || sizeof(T) == 0 || (len % sizeof(T)) != 0)
+            return {};
+        ifs.seekg(0, std::ios::beg);
         vector<T> vec(len / sizeof(T), 0);
-        ifs.seekg(0, ifs.beg);
-        ifs.read(reinterpret_cast<char *>(vec.data()), len);
-        ifs.close();
+        ifs.read(reinterpret_cast<char *>(vec.data()), static_cast<std::streamsize>(len));
+        if (!ifs)
+            return {};
         return vec;
     }
 

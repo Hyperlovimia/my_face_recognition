@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -362,9 +363,14 @@ class FaceWebState:
         row = self.get_device_state(device_id)
         online = int(bool(row["online"])) if row else 1
         rt_connected = int(bool(row["rt_connected"])) if row else 1
-        db_count = count if ok and cmd == "db_count" else (
-            0 if ok and cmd == "db_reset" else (int(row["db_count"]) if row else -1)
-        )
+        if ok and cmd == "db_count":
+            db_count = count
+        elif ok and cmd == "db_reset":
+            db_count = 0
+        elif ok and cmd == "db_face_list":
+            db_count = count
+        else:
+            db_count = int(row["db_count"]) if row else -1
         self._upsert_device(
             device_id,
             online=online,
@@ -455,7 +461,14 @@ class FaceWebState:
             "commands": command_count,
         }
 
-    def publish_command(self, device_id: str, cmd: str, *, name: str | None = None) -> dict[str, Any]:
+    def publish_command(
+        self,
+        device_id: str,
+        cmd: str,
+        *,
+        name: str | None = None,
+        slot: int | None = None,
+    ) -> dict[str, Any]:
         if not self.mqtt_connected.is_set():
             raise HTTPException(status_code=503, detail="MQTT broker is not connected")
 
@@ -467,6 +480,8 @@ class FaceWebState:
         }
         if name is not None:
             payload["name"] = name
+        if slot is not None:
+            payload["slot"] = slot
 
         with self.db_lock:
             self.db.execute(
@@ -499,6 +514,25 @@ class FaceWebState:
 
 
 state = FaceWebState()
+
+
+async def await_mqtt_command_done(request_id: str, timeout_s: float) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = state.get_command_by_request_id(request_id)
+        if row and row.get("status") in ("done", "failed"):
+            return row
+        await asyncio.sleep(0.05)
+    return None
+
+
+def mqtt_reply_body(reply_json: str | None) -> dict[str, Any]:
+    if not reply_json:
+        return {}
+    try:
+        return json.loads(reply_json)
+    except json.JSONDecodeError:
+        return {}
 
 
 @asynccontextmanager
@@ -541,6 +575,55 @@ async def api_device_events(device_id: str, limit: int = Query(default=100, ge=1
     if state.get_device_state(device_id) is None:
         raise HTTPException(status_code=404, detail="device not found")
     return {"events": state.get_events(device_id, limit)}
+
+
+@app.get("/api/devices/{device_id}/face-gallery")
+async def api_face_gallery(
+    device_id: str,
+    timeout_sec: float = Query(default=20.0, ge=3.0, le=120.0),
+) -> dict[str, Any]:
+    """列出板端 face_db 中已注册条目（由 Linux face_netd 读目录并通过 MQTT 应答）。"""
+    accepted = state.publish_command(device_id, "db_face_list")
+    request_id = str(accepted["request_id"])
+    row = await await_mqtt_command_done(request_id, timeout_sec)
+    if row is None:
+        raise HTTPException(status_code=504, detail="Timed out waiting for device reply")
+    body = mqtt_reply_body(row.get("reply_json"))
+    if row.get("status") != "done" or not body.get("ok"):
+        detail = str(body.get("message") or row.get("message") or "face gallery list failed")
+        raise HTTPException(status_code=502, detail=detail)
+    entries = body.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    return {"entries": entries}
+
+
+@app.get("/api/devices/{device_id}/face-gallery/{slot}/photo.jpg")
+async def api_face_gallery_photo(
+    device_id: str,
+    slot: int,
+    timeout_sec: float = Query(default=25.0, ge=3.0, le=120.0),
+) -> Response:
+    """拉取单张注册抓拍图（MQTT 回传 base64，由服务端解码）。"""
+    if slot < 1 or slot > 4096:
+        raise HTTPException(status_code=400, detail="invalid slot")
+    accepted = state.publish_command(device_id, "db_face_image", slot=slot)
+    request_id = str(accepted["request_id"])
+    row = await await_mqtt_command_done(request_id, timeout_sec)
+    if row is None:
+        raise HTTPException(status_code=504, detail="Timed out waiting for device reply")
+    body = mqtt_reply_body(row.get("reply_json"))
+    if row.get("status") != "done" or not body.get("ok"):
+        detail = str(body.get("message") or row.get("message") or "photo fetch failed")
+        raise HTTPException(status_code=404, detail=detail)
+    b64 = body.get("image_b64")
+    if not isinstance(b64, str) or not b64:
+        raise HTTPException(status_code=404, detail="no image in reply")
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=502, detail="invalid base64 image payload") from None
+    return Response(content=raw, media_type="image/jpeg")
 
 
 @app.post("/api/web-data/clear")

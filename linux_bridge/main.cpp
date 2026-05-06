@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -23,6 +25,8 @@ extern "C" {
 
 #include "../src/ipc_proto.h"
 #include "third_party/mongoose/mongoose.h"
+
+namespace fs = std::filesystem;
 
 /* Must match face_event.elf / ipc_proto.h on K230; do not renumber without redeploying all sides. */
 static_assert(sizeof(bridge_cmd_req_t) == 136, "bridge_cmd_req_t ABI");
@@ -48,6 +52,8 @@ struct Config {
     std::string mqtt_client_id = "face-netd-k230-dev-01";
     std::string mqtt_username;
     std::string mqtt_password;
+    /** Linux 小核可见的人脸库目录（与 RT face_ai 的 db_dir 一致，常为 /sharefs/face_db） */
+    std::string face_db_dir = "/sharefs/face_db";
     int heartbeat_interval_ms = kHeartbeatDefaultMs;
     int ipc_connect_retry_ms = 500;
     int ipc_sync_timeout_ms = 3000;
@@ -224,6 +230,8 @@ bool load_config(const std::string &path, Config *cfg)
             parse_int(value, &cfg->ipc_sync_timeout_ms);
         else if (key == "mqtt_keepalive_s")
             parse_int(value, &cfg->mqtt_keepalive_s);
+        else if (key == "face_db_dir")
+            cfg->face_db_dir = value;
         else
             std::cerr << "face_netd: ignore unknown config key: " << key << std::endl;
     }
@@ -246,6 +254,8 @@ bool load_config(const std::string &path, Config *cfg)
         cfg->ipc_sync_timeout_ms = 3000;
     if (cfg->mqtt_keepalive_s <= 0)
         cfg->mqtt_keepalive_s = 15;
+    if (cfg->face_db_dir.empty())
+        cfg->face_db_dir = "/sharefs/face_db";
 
     return true;
 }
@@ -279,6 +289,158 @@ void enqueue_publish(std::string topic, std::string payload, uint8_t qos, bool r
         std::cerr << "face_netd: publish queue overflow, oldest item dropped" << std::endl;
     }
     g_rt.outbox.push_back(PublishItem{std::move(topic), std::move(payload), qos, retain});
+}
+
+std::string base64_encode_bytes(const unsigned char *data, size_t len)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((len + 2) / 3 * 4);
+    for (size_t i = 0; i < len; i += 3)
+    {
+        const unsigned int remaining = static_cast<unsigned int>(len - i);
+        const unsigned int b0 = data[i];
+        const unsigned int b1 = remaining > 1 ? data[i + 1] : 0;
+        const unsigned int b2 = remaining > 2 ? data[i + 2] : 0;
+        const unsigned int triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(tbl[(triple >> 18) & 63]);
+        out.push_back(tbl[(triple >> 12) & 63]);
+        out.push_back(remaining > 1 ? tbl[(triple >> 6) & 63] : '=');
+        out.push_back(remaining > 2 ? tbl[triple & 63] : '=');
+    }
+    return out;
+}
+
+void publish_reply_mqtt(const std::string &request_id, const std::string &cmd_label, bool ok, int count,
+                        const std::string &message, const std::string &extra_tail)
+{
+    std::ostringstream oss;
+    oss << "{\"schema\":\"" << kSchema << "\""
+        << ",\"device_id\":\"" << json_escape(g_rt.cfg.device_id) << "\""
+        << ",\"request_id\":\"" << json_escape(request_id) << "\""
+        << ",\"cmd\":\"" << json_escape(cmd_label) << "\""
+        << ",\"ok\":" << (ok ? "true" : "false")
+        << ",\"count\":" << count << ",\"message\":\"" << json_escape(message) << "\"" << extra_tail << "}";
+    enqueue_publish(topic_up_reply(), oss.str(), 1, false);
+}
+
+struct FaceGalleryEntry {
+    int slot = 0;
+    std::string name;
+    bool has_image = false;
+};
+
+bool read_file_trim(const std::string &path, std::string *out)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        return false;
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    *out = trim(oss.str());
+    return true;
+}
+
+std::vector<FaceGalleryEntry> scan_face_db_dir(const std::string &dir)
+{
+    std::vector<FaceGalleryEntry> entries;
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
+        return entries;
+
+    std::vector<int> slots;
+    for (const auto &de : fs::directory_iterator(dir, ec))
+    {
+        if (ec)
+            break;
+        if (!de.is_regular_file(ec))
+            continue;
+        const std::string fname = de.path().filename().string();
+        constexpr const char *k_suffix = ".name";
+        constexpr size_t k_suf_len = 5;
+        if (fname.size() <= k_suf_len)
+            continue;
+        if (fname.compare(fname.size() - k_suf_len, k_suf_len, k_suffix) != 0)
+            continue;
+        const std::string stem = fname.substr(0, fname.size() - k_suf_len);
+        char *end = nullptr;
+        const long sl = strtol(stem.c_str(), &end, 10);
+        if (end == stem.c_str() || *end != '\0' || sl <= 0 || sl > 4096)
+            continue;
+        slots.push_back(static_cast<int>(sl));
+    }
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+
+    for (int sl : slots)
+    {
+        const std::string name_path = dir + "/" + std::to_string(sl) + ".name";
+        const std::string jpg_path = dir + "/" + std::to_string(sl) + ".jpg";
+        FaceGalleryEntry e{};
+        e.slot = sl;
+        if (!read_file_trim(name_path, &e.name))
+            continue;
+        std::error_code jec;
+        e.has_image = fs::exists(jpg_path, jec) && fs::is_regular_file(jpg_path, jec);
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+void handle_db_face_list_local(const std::string &request_id)
+{
+    const auto vec = scan_face_db_dir(g_rt.cfg.face_db_dir);
+    std::ostringstream arr;
+    arr << "[";
+    bool first = true;
+    for (const auto &e : vec)
+    {
+        if (!first)
+            arr << ",";
+        first = false;
+        arr << "{\"slot\":" << e.slot << ",\"name\":\"" << json_escape(e.name) << "\""
+            << ",\"has_image\":" << (e.has_image ? "true" : "false") << "}";
+    }
+    arr << "]";
+    std::ostringstream extra;
+    extra << ",\"entries\":" << arr.str();
+    publish_reply_mqtt(request_id, "db_face_list", true, static_cast<int>(vec.size()), "ok", extra.str());
+}
+
+void handle_db_face_image_local(const std::string &request_id, long slot)
+{
+    constexpr size_t k_max_bytes = 512 * 1024;
+    if (slot < 1 || slot > 4096)
+    {
+        publish_reply_mqtt(request_id, "db_face_image", false, 0, "invalid slot", "");
+        return;
+    }
+    const std::string path = g_rt.cfg.face_db_dir + "/" + std::to_string(slot) + ".jpg";
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+    {
+        publish_reply_mqtt(request_id, "db_face_image", false, 0, "photo not found", "");
+        return;
+    }
+    std::ostringstream buf;
+    buf << ifs.rdbuf();
+    std::string raw = buf.str();
+    if (raw.empty())
+    {
+        publish_reply_mqtt(request_id, "db_face_image", false, 0, "empty photo file", "");
+        return;
+    }
+    if (raw.size() > k_max_bytes)
+    {
+        publish_reply_mqtt(request_id, "db_face_image", false, 0, "photo too large", "");
+        return;
+    }
+    const std::string b64 =
+        base64_encode_bytes(reinterpret_cast<const unsigned char *>(raw.data()), raw.size());
+    std::ostringstream extra;
+    extra << ",\"slot\":" << slot << ",\"mime\":\"image/jpeg\""
+          << ",\"image_b64\":\"" << json_escape(b64) << "\"";
+    publish_reply_mqtt(request_id, "db_face_image", true, 1, "ok", extra.str());
 }
 
 bool pop_publish(PublishItem *out)
@@ -399,14 +561,7 @@ void mark_rt_seen()
 
 void publish_reply_failure(const std::string &request_id, int cmd, const std::string &message)
 {
-    std::ostringstream oss;
-    oss << "{\"schema\":\"" << kSchema << "\""
-        << ",\"device_id\":\"" << json_escape(g_rt.cfg.device_id) << "\""
-        << ",\"request_id\":\"" << json_escape(request_id) << "\""
-        << ",\"cmd\":\"" << json_escape(bridge_cmd_name(cmd)) << "\""
-        << ",\"ok\":false"
-        << ",\"message\":\"" << json_escape(message) << "\"}";
-    enqueue_publish(topic_up_reply(), oss.str(), 1, false);
+    publish_reply_mqtt(request_id, bridge_cmd_name(cmd), false, -1, message, "");
 }
 
 void handle_bridge_event(const bridge_event_t &ev)
@@ -445,15 +600,8 @@ void handle_bridge_result(const bridge_cmd_result_t &result)
     if (result.ok && result.cmd == IPC_BRIDGE_CMD_DB_RESET)
         g_rt.db_count.store(0);
 
-    std::ostringstream oss;
-    oss << "{\"schema\":\"" << kSchema << "\""
-        << ",\"device_id\":\"" << json_escape(g_rt.cfg.device_id) << "\""
-        << ",\"request_id\":\"" << json_escape(result.request_id) << "\""
-        << ",\"cmd\":\"" << json_escape(bridge_cmd_name(result.cmd)) << "\""
-        << ",\"ok\":" << (result.ok ? "true" : "false")
-        << ",\"count\":" << result.count
-        << ",\"message\":\"" << json_escape(result.message) << "\"}";
-    enqueue_publish(topic_up_reply(), oss.str(), 1, false);
+    publish_reply_mqtt(result.request_id, bridge_cmd_name(result.cmd), static_cast<bool>(result.ok), result.count,
+                        std::string(result.message), "");
 
     mark_rt_seen();
 
@@ -698,12 +846,24 @@ void parse_and_enqueue_command(mg_str json)
     if (name)
         free(name);
 
-    int bridge_cmd = IPC_BRIDGE_CMD_NONE;
     if (request_id_s.empty())
     {
         publish_reply_failure("", IPC_BRIDGE_CMD_NONE, "request_id is required");
         return;
     }
+    if (cmd_s == "db_face_list")
+    {
+        handle_db_face_list_local(request_id_s);
+        return;
+    }
+    if (cmd_s == "db_face_image")
+    {
+        const long slot = mg_json_get_long(json, "$.slot", -1);
+        handle_db_face_image_local(request_id_s, slot);
+        return;
+    }
+
+    int bridge_cmd = IPC_BRIDGE_CMD_NONE;
     if (!bridge_cmd_from_string(cmd_s, &bridge_cmd))
     {
         publish_reply_failure(request_id_s, IPC_BRIDGE_CMD_NONE, "unsupported command");
@@ -1053,7 +1213,8 @@ int main(int argc, char **argv)
     std::signal(SIGTERM, on_signal);
 
     std::cout << "face_netd: device_id=" << g_rt.cfg.device_id << " mqtt_url=" << g_rt.cfg.mqtt_url
-              << " heartbeat=" << g_rt.cfg.heartbeat_interval_ms << "ms" << std::endl;
+              << " heartbeat=" << g_rt.cfg.heartbeat_interval_ms << "ms face_db_dir=" << g_rt.cfg.face_db_dir
+              << std::endl;
 
     mg_mgr_init(&g_mgr);
 

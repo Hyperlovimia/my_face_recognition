@@ -4,7 +4,7 @@ import SlDialog from "@shoelace-style/shoelace/dist/react/dialog/index.js";
 import type { SlRequestCloseEvent } from "@shoelace-style/shoelace/dist/react/dialog/index.js";
 import SlIcon from "@shoelace-style/shoelace/dist/react/icon/index.js";
 import * as api from "./api";
-import type { CommandRow, DeviceRow, EventRow, WsMessage } from "./types";
+import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry, WsMessage } from "./types";
 
 /** 设备未校时时 ts_ms 接近 1970；优先信任服务端时间 */
 const MIN_SANE_DEVICE_TS_MS = 1_000_000_000_000;
@@ -73,6 +73,9 @@ export function App() {
   const [regName, setRegName] = useState("");
   const [registerSessionOpen, setRegisterSessionOpen] = useState(false);
   const [registerPreviewLoading, setRegisterPreviewLoading] = useState(false);
+  const [galleryEntries, setGalleryEntries] = useState<FaceGalleryEntry[]>([]);
+  const [galleryErr, setGalleryErr] = useState<string | null>(null);
+  const [faceBoardBusy, setFaceBoardBusy] = useState(false);
   const dismissProgrammatic = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const sessionRef = useRef(false);
@@ -87,20 +90,20 @@ export function App() {
     sessionRef.current = registerSessionOpen;
   }, [registerSessionOpen]);
 
-  const loadDevices = useCallback(async () => {
+  const loadDevices = useCallback(async (): Promise<string | null> => {
     const data = await api.getDevices();
     setDevices(data.devices);
     if (data.devices.length === 0) {
       setSelectedDevice(null);
-      return;
+      return null;
     }
+    let nextSelect: string | null = null;
     setSelectedDevice((prev) => {
       const ids = data.devices.map((d) => d.device_id);
-      if (prev && ids.includes(prev)) {
-        return prev;
-      }
-      return data.devices[0].device_id;
+      nextSelect = prev && ids.includes(prev) ? prev : data.devices[0].device_id;
+      return nextSelect;
     });
+    return nextSelect;
   }, []);
 
   const loadSelected = useCallback(async (deviceId: string | null) => {
@@ -127,12 +130,52 @@ export function App() {
     }
   }, [selectedDevice, loadSelected]);
 
-  const refreshAll = useCallback(async () => {
-    await loadDevices();
-    if (selectedRef.current) {
-      await loadSelected(selectedRef.current);
+  const applyGalleryDerivedDbCount = useCallback((deviceId: string, count: number) => {
+    setDevices((prev) => prev.map((d) => (d.device_id === deviceId ? { ...d, db_count: count } : d)));
+    setDeviceState((prev) =>
+      prev && prev.device.device_id === deviceId ? { ...prev, device: { ...prev.device, db_count: count } } : prev,
+    );
+  }, []);
+
+  const syncBoardFaceForDevice = useCallback(
+    async (deviceId: string) => {
+      setFaceBoardBusy(true);
+      setGalleryErr(null);
+      try {
+        await api.postCommand(deviceId, "db-count", null);
+        try {
+          const gal = await api.getFaceGallery(deviceId);
+          const ent = Array.isArray(gal.entries) ? gal.entries : [];
+          setGalleryEntries(ent);
+          applyGalleryDerivedDbCount(deviceId, ent.length);
+        } catch (ge) {
+          setGalleryErr((ge as Error).message);
+          setGalleryEntries([]);
+        }
+        await loadSelected(deviceId);
+      } catch (e) {
+        setGalleryErr((e as Error).message);
+        await loadSelected(deviceId);
+      } finally {
+        setFaceBoardBusy(false);
+      }
+    },
+    [applyGalleryDerivedDbCount, loadSelected],
+  );
+
+  useEffect(() => {
+    if (!selectedDevice) {
+      setGalleryEntries([]);
+      setGalleryErr(null);
+      return;
     }
-  }, [loadDevices, loadSelected]);
+    void syncBoardFaceForDevice(selectedDevice);
+  }, [selectedDevice, syncBoardFaceForDevice]);
+
+  const refreshAll = useCallback(async () => {
+    const dev = await loadDevices();
+    if (dev) await syncBoardFaceForDevice(dev);
+  }, [loadDevices, syncBoardFaceForDevice]);
 
   const connectWs = useCallback(() => {
     const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -161,7 +204,7 @@ export function App() {
           });
         }
         if (selectedRef.current) {
-          await loadSelected(selectedRef.current);
+          await syncBoardFaceForDevice(selectedRef.current);
         }
         return;
       }
@@ -180,10 +223,18 @@ export function App() {
           prev && prev.device.device_id === msg.device_id ? { ...prev, device: msg.device! } : prev,
         );
       } else if (msg.type === "reply" || msg.type === "status") {
+        if (msg.type === "reply") {
+          const p = msg.payload as Record<string, unknown>;
+          const cmd = typeof p.cmd === "string" ? p.cmd : "";
+          if (cmd === "db_reset") {
+            await syncBoardFaceForDevice(msg.device_id);
+            return;
+          }
+        }
         await loadSelected(msg.device_id);
       }
     };
-  }, [loadDevices, loadSelected]);
+  }, [loadDevices, loadSelected, syncBoardFaceForDevice]);
 
   useEffect(() => {
     connectWsRef.current = connectWs;
@@ -227,7 +278,11 @@ export function App() {
       return;
     }
     await api.postCommand(selectedDevice, path, body);
-    await loadSelected(selectedDevice);
+    if (path === "db-reset") {
+      await syncBoardFaceForDevice(selectedDevice);
+    } else {
+      await loadSelected(selectedDevice);
+    }
   };
 
   const doCloseRegisterMqtt = useCallback(async () => {
@@ -325,13 +380,13 @@ export function App() {
         setRegisterOpen(false);
         setRegName("");
         setRegisterSessionOpen(false);
-        await loadSelected(dev);
+        await syncBoardFaceForDevice(dev);
       } catch (err) {
         console.error(err);
         alert((err as Error).message);
       }
     })();
-  }, [regName, selectedDevice, loadSelected]);
+  }, [regName, selectedDevice, syncBoardFaceForDevice]);
 
   const d = deviceState?.device;
 
@@ -339,9 +394,6 @@ export function App() {
     <div className="app">
       <header className="app-header">
         <div className="app-header__brand">
-          <div className="app-logo" aria-hidden>
-            <SlIcon name="router" />
-          </div>
           <div>
             <h1 className="app-title">K230 人脸设备网管</h1>
             <p className="app-subtitle">设备遥测 · 事件审计 · 远程控制（MQTT / face_netd）</p>
@@ -384,86 +436,133 @@ export function App() {
 
       <main className="app-main">
         <section className="app-section">
-          <div className="app-section__head">
-            <h2 className="app-section__title">运行概览</h2>
-            <p className="app-section__desc">与板端 `face_netd` 上报的状态同步，用于判断在线与算力侧连接情况。</p>
-          </div>
           {!d && <div className="panel empty-state">尚未选择设备或暂无设备数据，请确认板端已连 MQTT 并上报状态。</div>}
           {d && (
-            <div className="metric-row">
-              <div className="metric-card">
-                <span className="metric-card__label">小核在线</span>
-                <span className={`metric-card__value ${d.online ? "ok" : "bad"}`}>{d.online ? "在线" : "离线"}</span>
+            <div className="dashboard-toolbar">
+              <div className="dashboard-toolbar__top">
+                <section className="panel panel--control-only dashboard-toolbar__controls">
+                  <div className="panel__head">
+                    <h2 className="panel__title">控制指令</h2>
+                  </div>
+                  <div className="panel__body">
+                    <div className="controls-stack">
+                      <div className="btn-row">
+                        <button
+                          type="button"
+                          className="btn--primary"
+                          disabled={!selectedDevice || faceBoardBusy}
+                          onClick={() => selectedDevice && void syncBoardFaceForDevice(selectedDevice)}
+                        >
+                          {faceBoardBusy ? "同步中…" : "同步人脸库（人数 · 快照）"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn--danger"
+                          onClick={() => {
+                            if (confirm("确定清空当前设备上的人脸库？此操作在板端执行，不可从网页撤销。")) {
+                              void postCmd("db-reset");
+                            }
+                          }}
+                        >
+                          清库
+                        </button>
+                      </div>
+
+                      <SlButton
+                        className="register-face-btn"
+                        variant="primary"
+                        size="large"
+                        disabled={!selectedDevice}
+                        loading={registerPreviewLoading}
+                        onClick={() => void startRegister()}
+                      >
+                        <SlIcon name="person-plus" slot="prefix" />
+                        注册人脸（抓拍预览）
+                      </SlButton>
+
+                      <button
+                        type="button"
+                        className="btn--danger"
+                        style={{ width: "100%" }}
+                        onClick={() => {
+                          if (confirm("将向板端发送关闭指令，确定继续？")) {
+                            void postCmd("shutdown");
+                          }
+                        }}
+                      >
+                        关闭板端三进程
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
+                <div className="metric-row metric-row--2x2 dashboard-toolbar__metrics" aria-label="运行状态">
+                  <div className="metric-card">
+                    <span className="metric-card__label">小核在线</span>
+                    <span className={`metric-card__value ${d.online ? "ok" : "bad"}`}>{d.online ? "在线" : "离线"}</span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-card__label">RT 桥接</span>
+                    <span className={`metric-card__value ${d.rt_connected ? "ok" : "bad"}`}>
+                      {d.rt_connected ? "已连接" : "未连接"}
+                    </span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-card__label">库内人数</span>
+                    <span className="metric-card__value">{d.db_count >= 0 ? d.db_count : "—"}</span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-card__label">最后通信</span>
+                    <span className="metric-card__value dim" title="服务端收到最近一条状态的时间">
+                      {fmtTs(d.last_seen_ms)}
+                    </span>
+                  </div>
+                </div>
               </div>
-              <div className="metric-card">
-                <span className="metric-card__label">RT 桥接</span>
-                <span className={`metric-card__value ${d.rt_connected ? "ok" : "bad"}`}>
-                  {d.rt_connected ? "已连接" : "未连接"}
-                </span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-card__label">库内人数</span>
-                <span className="metric-card__value">{d.db_count >= 0 ? d.db_count : "—"}</span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-card__label">最后通信</span>
-                <span className="metric-card__value dim" title="服务端收到最近一条状态的时间">
-                  {fmtTs(d.last_seen_ms)}
-                </span>
-              </div>
+
+              {selectedDevice && (
+                <div className="overview-gallery dashboard-toolbar__gallery">
+                  <div className="overview-gallery__head">
+                    <h3 className="overview-gallery__title">人脸注册库</h3>
+                    <span className="overview-gallery__badge">
+                      {faceBoardBusy ? "同步中…" : `已列出 ${galleryEntries.length} 人`}
+                    </span>
+                  </div>
+                  {galleryErr && <p className="face-gallery-error">{escapeHtml(galleryErr)}</p>}
+                  {!galleryErr && galleryEntries.length === 0 && !faceBoardBusy && (
+                    <p className="overview-gallery__hint">
+                      暂无条目或仅有旧版库（无 `.jpg`）。完成一次注册后会写入与板端预览同源的全景快照；请确认 face_netd.ini 的{" "}
+                      <code>face_db_dir</code> 与 face_ai 的 db 路径一致。
+                    </p>
+                  )}
+                  {galleryEntries.length > 0 && (
+                    <div className="face-gallery-grid face-gallery-grid--in-overview">
+                      {galleryEntries.map((en) => (
+                        <div className="face-gallery-card" key={en.slot}>
+                          <div className="face-gallery-thumb-wrap">
+                            {en.has_image ? (
+                              <img
+                                src={api.faceGalleryPhotoUrl(selectedDevice, en.slot)}
+                                alt=""
+                                loading="lazy"
+                                decoding="async"
+                              />
+                            ) : (
+                              <div className="face-gallery-thumb-missing">无快照</div>
+                            )}
+                          </div>
+                          <div className="face-gallery-meta">
+                            <div className="face-gallery-slot">#{escapeHtml(en.slot)}</div>
+                            <div className="face-gallery-name">{escapeHtml(en.name || "—")}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
-        </section>
-
-        <section className="panel panel--control-only">
-          <div className="panel__head">
-            <h2 className="panel__title">控制指令</h2>
-          </div>
-          <div className="panel__body">
-            <div className="controls-stack">
-              <div className="btn-row">
-                <button type="button" className="btn--primary" onClick={() => void postCmd("db-count")}>
-                  查询人数
-                </button>
-                <button
-                  type="button"
-                  className="btn--danger"
-                  onClick={() => {
-                    if (confirm("确定清空当前设备上的人脸库？此操作在板端执行，不可从网页撤销。")) {
-                      void postCmd("db-reset");
-                    }
-                  }}
-                >
-                  清库
-                </button>
-              </div>
-
-              <SlButton
-                className="register-face-btn"
-                variant="primary"
-                size="large"
-                disabled={!selectedDevice}
-                loading={registerPreviewLoading}
-                onClick={() => void startRegister()}
-              >
-                <SlIcon name="person-plus" slot="prefix" />
-                注册人脸（抓拍预览）
-              </SlButton>
-
-              <button
-                type="button"
-                className="btn--danger"
-                style={{ width: "100%" }}
-                onClick={() => {
-                  if (confirm("将向板端发送关闭指令，确定继续？")) {
-                    void postCmd("shutdown");
-                  }
-                }}
-              >
-                关闭板端三进程
-              </button>
-            </div>
-          </div>
         </section>
 
         <div className="app-grid-2">

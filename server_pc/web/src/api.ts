@@ -1,4 +1,4 @@
-import type { CommandRow, DeviceRow, EventRow } from "./types";
+import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry } from "./types";
 
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(url, options);
@@ -37,4 +37,15 @@ export function postCommand(deviceId: string, path: string, body: Record<string,
     init.body = JSON.stringify(body);
   }
   return fetchJson<{ request_id: string; status: string }>(url, init);
+}
+
+export function faceGalleryPhotoUrl(deviceId: string, slot: number, timeoutSec = 25) {
+  const qs = `timeout_sec=${encodeURIComponent(String(timeoutSec))}`;
+  return `/api/devices/${encodeURIComponent(deviceId)}/face-gallery/${slot}/photo.jpg?${qs}`;
+}
+
+export function getFaceGallery(deviceId: string, timeoutSec = 25) {
+  return fetchJson<{ entries: FaceGalleryEntry[] }>(
+    `/api/devices/${encodeURIComponent(deviceId)}/face-gallery?timeout_sec=${encodeURIComponent(String(timeoutSec))}`,
+  );
 }

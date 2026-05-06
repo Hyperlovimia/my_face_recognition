@@ -5,6 +5,7 @@
 #include <exception>
 #include <iostream>
 #include <mutex>
+#include <deque>
 #include <string>
 #include <thread>
 
@@ -34,7 +35,9 @@ typedef struct
     char request_id[IPC_REQUEST_ID_MAX];
 } bridge_inflight_t;
 
+static constexpr size_t k_bridge_pending_cap = 32;
 static bridge_inflight_t g_bridge_inflight{};
+static std::deque<bridge_cmd_req_t> g_bridge_pending;
 
 static void copy_cstr(char *dst, size_t dst_size, const char *src)
 {
@@ -225,18 +228,6 @@ static void clear_bridge_inflight_locked()
     memset(g_bridge_inflight.request_id, 0, sizeof(g_bridge_inflight.request_id));
 }
 
-static void clear_bridge_inflight_if_match(const char *request_id)
-{
-    std::lock_guard<std::mutex> lk(g_bridge_inflight_mu);
-    if (!g_bridge_inflight.active)
-        return;
-    if (!request_id || request_id[0] == '\0' ||
-        strncmp(g_bridge_inflight.request_id, request_id, sizeof(g_bridge_inflight.request_id)) == 0)
-    {
-        clear_bridge_inflight_locked();
-    }
-}
-
 static bool send_bridge_payload(uint32_t msg_kind, const void *body, uint32_t body_len)
 {
     int bridge_id = g_bridge_id.load();
@@ -259,6 +250,66 @@ static bool send_bridge_payload(uint32_t msg_kind, const void *body, uint32_t bo
         return false;
     }
     return true;
+}
+
+static void bridge_publish_cmd_failed(const bridge_cmd_req_t &req, const char *fail_msg)
+{
+    bridge_cmd_result_t out{};
+    out.magic = IPC_MAGIC;
+    out.cmd = req.cmd;
+    out.count = -1;
+    out.ok = 0;
+    copy_cstr(out.request_id, sizeof(out.request_id), req.request_id);
+    copy_cstr(out.message, sizeof(out.message), fail_msg ? fail_msg : "dispatch_failed");
+    send_bridge_payload(IPC_BRIDGE_MSG_CMD_RESULT, &out, sizeof(out));
+}
+
+/** 持锁 g_bridge_inflight_mu：上一命令结束后拉起队列里的下一条（发往 face_video）。 */
+static void bridge_dispatch_pending_unlocked()
+{
+    while (!g_bridge_pending.empty() && !g_bridge_inflight.active)
+    {
+        const bridge_cmd_req_t req = g_bridge_pending.front();
+        g_bridge_pending.pop_front();
+
+        const ipc_bridge_cmd_t bridge_cmd = (ipc_bridge_cmd_t)req.cmd;
+        const ipc_video_ctrl_op_t op =
+            (bridge_cmd == IPC_BRIDGE_CMD_SHUTDOWN) ? IPC_VIDEO_CTRL_OP_QUIT : IPC_VIDEO_CTRL_OP_SET;
+        const int32_t state = bridge_cmd_to_state(bridge_cmd);
+
+        char vreason[IPC_OP_MESSAGE_MAX] = {0};
+        if (!send_video_ctrl(op, state, req.name, IPC_VIDEO_CTRL_SRC_BRIDGE, bridge_cmd, req.request_id, vreason,
+                               sizeof(vreason)))
+        {
+            std::cerr << "face_event: bridge queued dispatch failed cmd=" << bridge_cmd_name(req.cmd)
+                      << " request_id=" << req.request_id << " reason=" << vreason << std::endl;
+            bridge_publish_cmd_failed(req, vreason[0] ? vreason : "send_video_ctrl_failed");
+            continue;
+        }
+
+        g_bridge_inflight.active = true;
+        g_bridge_inflight.cmd = req.cmd;
+        copy_cstr(g_bridge_inflight.request_id, sizeof(g_bridge_inflight.request_id), req.request_id);
+        std::cout << "face_event: bridge dispatch queued cmd=" << bridge_cmd_name(req.cmd)
+                  << " request_id=" << req.request_id << std::endl;
+        break;
+    }
+}
+
+static void clear_bridge_inflight_if_match(const char *request_id)
+{
+    std::lock_guard<std::mutex> lk(g_bridge_inflight_mu);
+    if (!g_bridge_inflight.active)
+    {
+        bridge_dispatch_pending_unlocked();
+        return;
+    }
+    if (!request_id || request_id[0] == '\0' ||
+        strncmp(g_bridge_inflight.request_id, request_id, sizeof(g_bridge_inflight.request_id)) == 0)
+    {
+        clear_bridge_inflight_locked();
+        bridge_dispatch_pending_unlocked();
+    }
 }
 
 static void forward_bridge_event(const ipc_evt_t *ev)
@@ -353,41 +404,56 @@ static void bridge_handle_message(k_s32 s32Id, k_ipcmsg_message_t *msg)
         return;
     }
 
-    char reason[IPC_OP_MESSAGE_MAX] = {0};
-    bool accepted = false;
+    char reject_reason[IPC_OP_MESSAGE_MAX] = {0};
+    char ack_note[IPC_OP_MESSAGE_MAX] = {0};
+    bool ack_ok = false;
+
     {
         std::lock_guard<std::mutex> lk(g_bridge_inflight_mu);
         if (g_bridge_inflight.active)
         {
-            copy_cstr(reason, sizeof(reason), "busy");
+            if (g_bridge_pending.size() >= k_bridge_pending_cap)
+            {
+                copy_cstr(reject_reason, sizeof(reject_reason), "queue_overflow");
+                ack_ok = false;
+            }
+            else
+            {
+                g_bridge_pending.push_back(req);
+                ack_ok = true;
+                copy_cstr(ack_note, sizeof(ack_note), "queued");
+            }
         }
         else
         {
             ipc_video_ctrl_op_t op = (bridge_cmd == IPC_BRIDGE_CMD_SHUTDOWN) ? IPC_VIDEO_CTRL_OP_QUIT
                                                                              : IPC_VIDEO_CTRL_OP_SET;
             int32_t state = bridge_cmd_to_state(bridge_cmd);
-            if (send_video_ctrl(op, state, req.name, IPC_VIDEO_CTRL_SRC_BRIDGE, bridge_cmd, req.request_id, reason,
-                                sizeof(reason)))
+            if (send_video_ctrl(op, state, req.name, IPC_VIDEO_CTRL_SRC_BRIDGE, bridge_cmd, req.request_id,
+                                reject_reason, sizeof(reject_reason)))
             {
-                accepted = true;
+                ack_ok = true;
                 g_bridge_inflight.active = true;
                 g_bridge_inflight.cmd = bridge_cmd;
                 copy_cstr(g_bridge_inflight.request_id, sizeof(g_bridge_inflight.request_id), req.request_id);
+                ack_note[0] = '\0';
             }
+            else
+                ack_ok = false;
         }
     }
 
-    if (accepted)
+    if (ack_ok)
     {
         std::cout << "face_event: bridge accepted " << bridge_cmd_name(bridge_cmd) << " request_id=" << req.request_id
-                  << std::endl;
-        reply_bridge_ack(s32Id, msg, true, "accepted");
+                  << (ack_note[0] ? " (queued)" : "") << std::endl;
+        reply_bridge_ack(s32Id, msg, true, ack_note[0] ? ack_note : "");
     }
     else
     {
         std::cout << "face_event: bridge rejected " << bridge_cmd_name(bridge_cmd) << " request_id=" << req.request_id
-                  << " reason=" << reason << std::endl;
-        reply_bridge_ack(s32Id, msg, false, reason[0] ? reason : "rejected");
+                  << " reason=" << reject_reason << std::endl;
+        reply_bridge_ack(s32Id, msg, false, reject_reason[0] ? reject_reason : "rejected");
     }
 }
 

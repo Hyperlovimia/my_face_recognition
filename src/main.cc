@@ -470,7 +470,7 @@ try {
                     usleep(10000);
                     continue;
                 }
-                face_recg.database_add(register_name, db_dir);
+                face_recg.database_add(register_name, db_dir, dump_img);
                 std::cout<<"注册成功！"<<std::endl;
             }
             else{

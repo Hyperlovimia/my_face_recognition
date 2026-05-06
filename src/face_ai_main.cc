@@ -831,7 +831,17 @@ int main(int argc, char **argv)
                 if (det_results.size() == 1 && reply.num_faces >= 1 && reg_ok_live)
                 {
                     std::string reg_name(hdr->register_name);
-                    face_recg.database_add(reg_name, db_dir);
+                    cv::Mat snap_landscape;
+                    {
+                        const int hh = static_cast<int>(hdr->tensor_h);
+                        const int ww = static_cast<int>(hdr->tensor_w);
+                        const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
+                        cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
+                        cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
+                        cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
+                        cv::merge(std::vector<cv::Mat>{mb, mg, mr}, snap_landscape);
+                    }
+                    face_recg.database_add(reg_name, db_dir, snap_landscape);
                     set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
                     std::cout << "face_ai: register ok: " << reg_name << std::endl;
                 }

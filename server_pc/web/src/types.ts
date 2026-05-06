@@ -1,3 +1,9 @@
+export type FaceGalleryEntry = {
+  slot: number;
+  name: string;
+  has_image: boolean;
+};
+
 export type DeviceRow = {
   device_id: string;
   online: number;

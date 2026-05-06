@@ -24,13 +24,14 @@
  */
 #include <algorithm>
 #include <cstring>
-#include <dirent.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
 #include <vector>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <nncase/tensor.h>
 #include "face_recognition.h"
 #include "setting.h"
@@ -38,6 +39,43 @@
 namespace {
 // K230 musl 下 std::filesystem::create_directories 可能静默抛异常，
 // 这里用 POSIX stat/mkdir 做一个可移植的实现。
+/** db_dir + '/' + tail；去掉多余 '/'，避免出现 `/sharefs//face_db/…`。 */
+std::string face_db_join_path(const char *dir, const std::string &tail)
+{
+    if (!dir || dir[0] == '\0')
+        return tail;
+    std::string d(dir);
+    while (!d.empty() && (d.back() == '/' || d.back() == '\\'))
+        d.pop_back();
+    std::string t = tail;
+    while (!t.empty() && (t.front() == '/' || t.front() == '\\'))
+        t.erase(0, 1);
+    return d.empty() ? t : d + "/" + t;
+}
+
+bool face_db_slot_has_pair(const char *dir, int slot)
+{
+    struct stat st_db{};
+    struct stat st_nm{};
+    const std::string dbf = face_db_join_path(dir, std::to_string(slot) + ".db");
+    const std::string nf = face_db_join_path(dir, std::to_string(slot) + ".name");
+    return stat(dbf.c_str(), &st_db) == 0 && S_ISREG(st_db.st_mode) && stat(nf.c_str(), &st_nm) == 0 &&
+           S_ISREG(st_nm.st_mode);
+}
+
+/** 从 1 起连续存在的「index.db + index.name」数量（忽略 .jpg 等附加文件）。 */
+int count_contiguous_face_slots(const char *dir)
+{
+    int n = 0;
+    for (int i = 1; i <= 4096; ++i)
+    {
+        if (!face_db_slot_has_pair(dir, i))
+            break;
+        n = i;
+    }
+    return n;
+}
+
 bool ensure_dir_exists_posix(const char *path)
 {
     struct stat st;
@@ -143,7 +181,8 @@ FaceRecognition::FaceRecognition(char *kmodel_file, float thresh, FrameCHWSize i
     }
     else
     {
-	    input_size_={input_shapes_[0][1],input_shapes_[0][2],input_shapes_[0][3]};
+        input_size_ = {static_cast<size_t>(input_shapes_[0][1]), static_cast<size_t>(input_shapes_[0][2]),
+                       static_cast<size_t>(input_shapes_[0][3])};
     }
 	feature_num_ = output_shapes_[0][1];
 	ai2d_out_tensor_ = get_input_tensor(0);
@@ -223,7 +262,28 @@ bool FaceRecognition::aligned_face_to_bgr(cv::Mat &bgr) const
     if (C != 3 || H <= 0 || W <= 0)
         return false;
 
-    auto th_r = ai2d_out_tensor_.impl()->to_host();
+    /* ai2d 绑定输入 tensor 上常为「设备侧带 padding / 非直观 strides」。手写 strides 索引易与
+     * 运行时布局不一致 → JPEG 快照对角剪切；注册预览用的是整帧 BGR，看起来「正常」。
+     * 先 copy_to 到新建的默认紧凑 tensor，再按 NHWC/NCHW 线性读取，由运行时保证语义正确。 */
+    gsl::span<const size_t> sh = ai2d_out_tensor_.shape();
+    if (sh.size() != 4 || ai2d_out_tensor_.datatype() != typecode_t::dt_uint8)
+        return false;
+
+    dims_t shape_vec;
+    for (size_t i = 0; i < sh.size(); ++i)
+        shape_vec.push_back(sh[i]);
+
+    auto dst_res = host_runtime_tensor::create(typecode_t::dt_uint8, shape_vec, hrt::pool_shared);
+    if (!dst_res.is_ok())
+        return false;
+    runtime_tensor dst = std::move(dst_res.unwrap());
+
+    /* copy_to 是非常量成员函数；aligned_face_to_bgr 为 const，用句柄副本调用即可（共享同一缓冲）。 */
+    runtime_tensor src_rt = ai2d_out_tensor_;
+    if (!src_rt.copy_to(dst).is_ok())
+        return false;
+
+    auto th_r = dst.impl()->to_host();
     if (!th_r.is_ok())
         return false;
     nncase::tensor host_tensor = std::move(th_r.unwrap());
@@ -236,73 +296,39 @@ bool FaceRecognition::aligned_face_to_bgr(cv::Mat &bgr) const
         return false;
     auto mapped = std::move(map_r.unwrap());
     auto buf = mapped.buffer();
-    const size_t plane = static_cast<size_t>(H * W);
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(buf.data());
+    const size_t nbytes = buf.size_bytes();
+    const size_t plane = static_cast<size_t>(H) * static_cast<size_t>(W);
     const size_t need = plane * static_cast<size_t>(C);
-    if (buf.size_bytes() < need)
+    if (nbytes < need)
         return false;
 
     bgr.create(H, W, CV_8UC3);
-    const uint8_t *src = reinterpret_cast<const uint8_t *>(buf.data());
 
     if (input_is_nhwc_)
     {
         for (int y = 0; y < H; ++y)
-        {
             for (int x = 0; x < W; ++x)
             {
-                const size_t off = static_cast<size_t>((y * W + x) * C);
-                const uint8_t rpx = src[off + 0];
-                const uint8_t gpx = src[off + 1];
-                const uint8_t bpx = src[off + 2];
-                bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(bpx, gpx, rpx);
+                const size_t off =
+                    (static_cast<size_t>(y) * static_cast<size_t>(W) + static_cast<size_t>(x)) * static_cast<size_t>(C);
+                bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(src[off + 0], src[off + 1], src[off + 2]);
             }
-        }
         return true;
     }
 
-    for (int y = 0; y < H; ++y)
-    {
-        for (int x = 0; x < W; ++x)
-        {
-            const size_t off = static_cast<size_t>(y * W + x);
-            const uint8_t rpx = src[0 * plane + off];
-            const uint8_t gpx = src[1 * plane + off];
-            const uint8_t bpx = src[2 * plane + off];
-            bgr.at<cv::Vec3b>(y, x) = cv::Vec3b(bpx, gpx, rpx);
-        }
-    }
+    const std::vector<cv::Mat> ch{
+        cv::Mat(H, W, CV_8UC1, const_cast<uint8_t *>(src + 0 * plane)),
+        cv::Mat(H, W, CV_8UC1, const_cast<uint8_t *>(src + 1 * plane)),
+        cv::Mat(H, W, CV_8UC1, const_cast<uint8_t *>(src + 2 * plane)),
+    };
+    cv::merge(ch, bgr);
     return true;
 }
 
 bool FaceRecognition::inference()
 {
 	return try_run() && try_get_output();
-}
-
-int FaceRecognition::get_dir_files(const char *path)
-{
-	DIR *directory = opendir(path);
-	vector<string> files;
-
-	if (directory == nullptr)
-	{
-		std::cerr << "无法打开目录" << std::endl;
-		return 0;
-	}
-
-	dirent *entry;
-	while ((entry = readdir(directory)) != nullptr)
-	{
-		if (entry->d_type == DT_REG)
-		{
-			files.push_back(entry->d_name);
-			if(debug_mode_>1)
-				std::cout << entry->d_name << std::endl;
-		}
-	}
-
-	closedir(directory);
-	return files.size() / 2;
 }
 
 void FaceRecognition::database_init(char *db_pth)
@@ -325,21 +351,25 @@ void FaceRecognition::database_init(char *db_pth)
 	std::cerr << "[db_init] directory ready" << std::endl;
 	std::cerr.flush();
 
-	vector<string> files;
-	int file_num = get_dir_files(db_pth);
-	if( debug_mode_> 0)
-		std::cout<<"found "<< file_num <<" pieces of data in db"<<std::endl;
-	std::cerr << "[db_init] file_num=" << file_num << std::endl;
+	const int file_num = count_contiguous_face_slots(db_pth);
+	if (debug_mode_ > 0)
+		std::cout << "found " << file_num << " contiguous db+.name pairs (jpg ignored)" << std::endl;
+	std::cerr << "[db_init] slots=" << file_num << std::endl;
 	std::cerr.flush();
 
 	valid_register_face_ = 0;
 	for (int i = 1; i <= file_num; ++i)
 	{
-		int valid_index = valid_register_face_;
-		std::string fname = string(db_pth) + "/" + std::to_string(i) + ".db";
+		std::string fname = face_db_join_path(db_pth, std::to_string(i) + ".db");
 		vector<float> db_vec = Utils::read_binary_file<float>(fname.c_str());
-        features_.push_back(std::move(db_vec));
-		fname = string(db_pth) + "/" + std::to_string(i) + ".name";
+		if (db_vec.size() != static_cast<size_t>(feature_num_))
+		{
+			std::cerr << "[db_init] skip slot " << i << ": bad .db size=" << db_vec.size() << " expect=" << feature_num_
+			          << std::endl;
+			break;
+		}
+		features_.push_back(std::move(db_vec));
+		fname = face_db_join_path(db_pth, std::to_string(i) + ".name");
 		vector<char> name_vec = Utils::read_binary_file<char>(fname.c_str());
 		string current_name(name_vec.begin(), name_vec.end());
 		names_.push_back(current_name);
@@ -350,19 +380,40 @@ void FaceRecognition::database_init(char *db_pth)
 	std::cout.flush();
 }
 
+namespace {
+
+/** 与 face_video / main 注册预览一致：DISPLAY_ROTATE 时顺时针 90°。 */
+static void orient_isp_snapshot_like_register_preview(const cv::Mat &landscape_bgr, cv::Mat &dst)
+{
+    if (landscape_bgr.empty() || landscape_bgr.type() != CV_8UC3)
+    {
+        dst.release();
+        return;
+    }
+#if DISPLAY_ROTATE
+    cv::rotate(landscape_bgr, dst, cv::ROTATE_90_CLOCKWISE);
+#else
+    landscape_bgr.copyTo(dst);
+#endif
+}
+
+}  // namespace
+
 void FaceRecognition::database_reset(char *db_pth){
 	ScopedTiming st(model_name_ + " database_reset", debug_mode_);
-    int file_num = get_dir_files(db_pth);
+    const int file_num = count_contiguous_face_slots(db_pth);
     if (debug_mode_ > 0)
         std::cout << "removing " << file_num << " pieces of data in db" << std::endl;
     // 遍历所有文件并删除
     for (int i = 1; i <= file_num; ++i)
     {
-        std::string db_file = std::string(db_pth) + "/" + std::to_string(i) + ".db";
-        std::string name_file = std::string(db_pth) + "/" + std::to_string(i) + ".name";
+        std::string db_file = face_db_join_path(db_pth, std::to_string(i) + ".db");
+        std::string name_file = face_db_join_path(db_pth, std::to_string(i) + ".name");
+        std::string jpg_file = face_db_join_path(db_pth, std::to_string(i) + ".jpg");
 
         unlink(db_file.c_str());
         unlink(name_file.c_str());
+        unlink(jpg_file.c_str());
     }
 
     // 清空内存中的缓存
@@ -372,7 +423,7 @@ void FaceRecognition::database_reset(char *db_pth){
     std::cout << "database reset Done!" << std::endl;
 }
 
-void FaceRecognition::database_add(std::string& name, char* db_path)
+void FaceRecognition::database_add(std::string& name, char* db_path, const cv::Mat &full_isp_bgr_landscape)
 {
 	ScopedTiming st(model_name_ + " database_add", debug_mode_);
     // 计算保存的索引
@@ -380,8 +431,8 @@ void FaceRecognition::database_add(std::string& name, char* db_path)
     int save_index = valid_register_face_ + 1; // 文件名从1开始编号
     
     // 生成文件路径
-    std::string feature_file = std::string(db_path) + "/" + std::to_string(save_index) + ".db";
-    std::string name_file = std::string(db_path) + "/" + std::to_string(save_index) + ".name";
+    std::string feature_file = face_db_join_path(db_path, std::to_string(save_index) + ".db");
+    std::string name_file = face_db_join_path(db_path, std::to_string(save_index) + ".name");
 
     // 写入 feature 到 .db 文件
     FILE* f_db = fopen(feature_file.c_str(), "wb");
@@ -400,6 +451,34 @@ void FaceRecognition::database_add(std::string& name, char* db_path)
     }
     fwrite(name.c_str(), sizeof(char), name.length(), f_name);
     fclose(f_name);
+
+    std::string jpg_file = face_db_join_path(db_path, std::to_string(save_index) + ".jpg");
+    cv::Mat snapshot_oriented;
+    orient_isp_snapshot_like_register_preview(full_isp_bgr_landscape, snapshot_oriented);
+
+    if (!snapshot_oriented.empty())
+    {
+        /* ISP→dump_img 与 OSD 预览一致：Mat 三字节按 RGB 语义送给 VO（face_video convert_preview_to_osd_argb8888）。
+         * cv::imwrite 则按 BGR 编码 JPEG，若不交换则在浏览器里会偏蓝/偏青。 */
+        cv::Mat jpeg_bgr;
+        cv::cvtColor(snapshot_oriented, jpeg_bgr, cv::COLOR_RGB2BGR);
+        static const std::vector<int> k_jpeg_params{cv::IMWRITE_JPEG_QUALITY, 88};
+        if (!cv::imwrite(jpg_file, jpeg_bgr, k_jpeg_params))
+            std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
+    }
+    else
+    {
+        cv::Mat aligned_bgr;
+        if (aligned_face_to_bgr(aligned_bgr) && !aligned_bgr.empty())
+        {
+            if (!cv::imwrite(jpg_file, aligned_bgr, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 88}))
+                std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
+        }
+        else
+            std::cerr << "database_add: skip gallery snapshot (no full frame + aligned_face_to_bgr failed)"
+                      << std::endl;
+    }
+
     std::vector<float> feature_vec(feature, feature + feature_num_);
     features_.push_back(std::move(feature_vec));  // 避免拷贝
     names_.push_back(name);
