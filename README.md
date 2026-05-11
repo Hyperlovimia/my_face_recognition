@@ -61,7 +61,7 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 启用活体检测时，先后台启动 `face_ai.elf`，最后一个参数传入活体模型：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel 0.18 real0 &
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 /sharefs/face_antispoof.kmodel 0.18 real0 &
 ```
 
 > 说明：`0.18` 为 REAL 概率阈值（真人分数常在 0.15～0.30 间波动时可从偏低试起，翻拍易过再提到 0.22～0.25）；`real0` 表示该 kmodel 约定 **out[0]=REAL**（与常见训练导出一致）。若你的模型确认为 **out[0]=SPOOF**，则不要加 `real0`，只要 9 个参数或仅「模型路径 + 阈值」共 10 个参数即可，详见下文「参数说明」表。
@@ -69,22 +69,22 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 暂不启用活体检测时，使用 8 参数启动 `face_ai.elf`：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 &
 ```
 
 然后后台启动视频进程：
 
 ```sh
-/data/face_video.elf 0 &
+/sharefs/face_video.elf 0 &
 ```
 
 最后以前台方式启动交互入口：
 
 ```sh
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
-启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/data/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
+启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/sharefs/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
 
 程序支持两种退出方式：
 
@@ -110,7 +110,7 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 | kmodel_recg | 人脸识别kmodel路径               | kmodel 路径         |
 | recg_thres  | 人脸识别分数下限（`cal_cosine_distance` 的 0~100 标尺）。**库内人多或易互认时推荐 `65`～`72`** | 0~100    |
 | （库内≥2 人） | `FaceRecognition::database_search` | 除超过 `recg_thres` 外，还要求 **第一名与第二名分差 ≥ 8.5**（默认 `db_top2_margin_`），否则陌生人。帧间对特征做 **短时 EMA**（仅流式 `INFER`）减轻单帧误判 |
-| db_dir      | 数据库目录，推荐 `/data/face_db` | 数据库目录路径         |
+| db_dir      | 数据库目录，推荐 `/sharefs/face_db` | 数据库目录路径         |
 | debug_mode  | 是否需要调试，0、1、2分别表示不调试、简单调试、详细调试 | 0、1、2 |
 | face_antispoof.kmodel | 可选活体模型路径，存在且加载成功时启用活体 | kmodel 路径 |
 | real_prob_threshold（第 10 个参数） | 启用活体时：REAL 概率 ≥ 该值判为真人；越高越严。默认 **0.32**（未传第 10 个时，代码内建） | 现场常试 **0.15**～`0.28`，按误拒/放过翻拍折中 |
@@ -179,7 +179,7 @@ chmod +x ./face_netd
 ```
 
 如果启动后看到 `[IPCMSG]:ioctl connect fail`，通常表示 Linux 小核正在等待 RT-Smart 侧 `face_event.elf` 提供 `face_bridge` 服务。
-此时请先确认 RT 控制台已经出现 `face_event: bridge service face_bridge port=301 ready for little-core face_netd`，并确认板端 `/data/face_event.elf` 是本项目当前版本的新二进制。
+此时请先确认 RT 控制台已经出现 `face_event: bridge service face_bridge port=301 ready for little-core face_netd`，并确认板端 `/sharefs/face_event.elf` 是本项目当前版本的新二进制。
 
 `face_netd.ini` 里至少需要修改：
 
@@ -323,8 +323,8 @@ docker compose up --build
 如果电脑端运行在 WSL / Docker 中，还必须在 Windows 管理员 PowerShell 中额外执行：
 
 ```powershell
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=127.0.0.1 connectport=1883
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=127.0.0.1 connectport=8000
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=<WSL地址> connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=<WSL地址> connectport=8000
 New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
 New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
 ```
@@ -332,13 +332,13 @@ New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allo
 重启电脑后，建议马上补做：
 
 ```powershell
-Test-NetConnection 127.0.0.1 -Port 1883
-Test-NetConnection 127.0.0.1 -Port 8000
+Test-NetConnection <WSL地址> -Port 1883
+Test-NetConnection <WSL地址> -Port 8000
 ```
 
-若不通，说明 `portproxy` 规则虽然还在，但它背后的 `127.0.0.1 -> WSL/Docker` 这一跳没有恢复；此时可用 `wsl hostname -I` 取当前 WSL IP，并把 `connectaddress` 改成该 IP 重新写入 `portproxy`。
+若不通，说明 `portproxy` 规则虽然还在，但它背后的 `<WSL地址> -> WSL/Docker` 这一跳没有恢复；此时可用 `wsl hostname -I` 取当前 WSL IP，并把 `connectaddress` 改成该 IP 重新写入 `portproxy`。
 
-若 `127.0.0.1:1883` 看起来是通的，但板端仍然卡在“已发送 MQTT `CONNECT`、始终收不到 `CONNACK`”，也建议直接改为当前 WSL IP 作为 `connectaddress`。这是因为某些环境下 `localhost` 探活成功并不等于真实 MQTT 流量已经正确转发到 Broker。
+若 此前填的WSL地址是 `127.0.0.1:1883`，而它看起来是通的，但板端仍然卡在“已发送 MQTT `CONNECT`、始终收不到 `CONNACK`”，也建议直接改为当前 WSL IP 作为 `connectaddress`。这是因为某些环境下 `localhost` 探活成功并不等于真实 MQTT 流量已经正确转发到 Broker。
 
 ### 5. 设置 `face_netd.ini`
 
@@ -360,17 +360,17 @@ Test-NetConnection 127.0.0.1 -Port 8000
 启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel &
-/data/face_video.elf 0 &
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 /sharefs/face_antispoof.kmodel &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 不启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
-/data/face_video.elf 0 &
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 正常情况下，`face_event.elf` 会打印：

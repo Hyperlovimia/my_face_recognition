@@ -545,8 +545,11 @@ export function App() {
                   </div>
                   <div className="metric-card">
                     <span className="metric-card__label">RT 桥接</span>
-                    <span className={`metric-card__value ${d.rt_connected ? "ok" : "bad"}`}>
-                      {d.rt_connected ? "已连接" : "未连接"}
+                    <span
+                      className={`metric-card__value ${d.online ? (d.rt_connected ? "ok" : "bad") : "dim"}`}
+                      title={d.online ? undefined : "小核离线时不展示 RT 桥接实时状态"}
+                    >
+                      {d.online ? (d.rt_connected ? "已连接" : "未连接") : "未知"}
                     </span>
                   </div>
                   <div className="metric-card">

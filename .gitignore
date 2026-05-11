@@ -18,3 +18,7 @@ tmp/
 /sharefs/
 /docs/
 /.vscode/
+/.codex/
+/.agents/
+/.trellis/
+AGENTS.md
