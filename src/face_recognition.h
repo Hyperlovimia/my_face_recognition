@@ -186,7 +186,7 @@ private:
     * @param len  原始数据长度
     * @return None
     */
-    void l2_normalize(float* src, float* dst, int len) const;
+    void l2_normalize(const float* src, float* dst, int len) const;
 
     /**
     * @brief 计算两特征的余弦距离
@@ -195,7 +195,7 @@ private:
     * @param feature_len  特征长度
     * @return 余弦距离
     */
-    float cal_cosine_distance(float* feature_0, float* feature_1, int feature_len);
+    float cal_cosine_distance(const float* feature_0, const float* feature_1, int feature_len);
     
     std::unique_ptr<ai2d_builder> ai2d_builder_; // ai2d构建器
     runtime_tensor ai2d_out_tensor_;             // ai2d输出tensor

@@ -16,6 +16,7 @@
 #include "ipc_osd_draw.h"
 #include "ipc_proto.h"
 #include "ipc_shm.h"
+#include "perf_stats.h"
 #include "scoped_timing.h"
 #include "video_pipeline.h"
 #include "setting.h"
@@ -92,21 +93,34 @@ static std::condition_variable g_infer_cv;
 static std::vector<uint8_t> g_infer_pending;
 static std::atomic<uint64_t> g_infer_capture_seq{0};
 static std::atomic<uint64_t> g_infer_last_displayed_seq{0};
+static int g_infer_latest_slot = -1;
+static int g_infer_inflight_slot = -1;
 static std::mutex g_infer_reply_mu;
 static ipc_ai_reply_t g_last_infer_reply{};
 static std::atomic<bool> g_infer_has_reply{false};
 
-/* 固定推理请求槽：整段 IPC_CMD_INFER 复用同一 shmid，避免每帧 shm 分配 */
-static int g_fixed_infer_shmid = -1;
-static void *g_fixed_infer_ptr = nullptr;
-static size_t g_fixed_infer_cap = 0;
-static bool g_fixed_infer_ready = false;
+struct FixedInferSlot
+{
+    int shmid = -1;
+    void *ptr = nullptr;
+    size_t cap = 0;
+    uint64_t seq = 0;
+};
+
+static constexpr size_t k_fixed_infer_slot_count = 2;
+static FixedInferSlot g_fixed_infer_slots[k_fixed_infer_slot_count];
+static bool g_fixed_infer_slots_ready = false;
 
 static std::atomic<uint64_t> g_metric_capture_frames{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_ok{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_fail{0};
 static std::atomic<uint64_t> g_metric_infer_stale{0};
 static std::atomic<uint64_t> g_metric_infer_applied{0};
+static PerfStageStats g_perf_capture_to_pending("face_video.capture_to_pending");
+static PerfStageStats g_perf_pending_to_ipc_slot("face_video.pending_to_ipc_slot");
+static PerfStageStats g_perf_send_recv_wait("face_video.send_recv_wait");
+static PerfStageStats g_perf_reply_copy("face_video.reply_copy");
+static PerfStageStats g_perf_total_time("face_video.total_time");
 /* 与 face_event 终端输入「i」一致：OSD 小窗只短时显示；dump_img 会保留到下一步输入姓名或取消 */
 static constexpr int k_register_preview_hold_ms = 2000;
 
@@ -286,29 +300,64 @@ static int open_ai_channel_retry()
     return -1;
 }
 
-/* 不持锁；调用方通过 rpc_ai_sync 或 ai_infer_worker_thread 内已持 g_ai_ch_mutex */
-static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
-                        uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply, bool use_fixed_infer_req)
+static void release_fixed_infer_slots()
 {
-    static std::atomic<uint32_t> seq{0};
-    int shmid = -1;
-    bool free_req_shm = true;
+    for (size_t i = 0; i < k_fixed_infer_slot_count; ++i)
+    {
+        if (g_fixed_infer_slots[i].ptr)
+        {
+            lwp_shmdt(g_fixed_infer_slots[i].ptr);
+            g_fixed_infer_slots[i].ptr = nullptr;
+        }
+        if (g_fixed_infer_slots[i].shmid >= 0)
+        {
+            ipc_shm_free(g_fixed_infer_slots[i].shmid);
+            g_fixed_infer_slots[i].shmid = -1;
+        }
+        g_fixed_infer_slots[i].cap = 0;
+        g_fixed_infer_slots[i].seq = 0;
+    }
+    g_fixed_infer_slots_ready = false;
+    g_infer_latest_slot = -1;
+    g_infer_inflight_slot = -1;
+}
 
-    if (use_fixed_infer_req && g_fixed_infer_ready && g_fixed_infer_ptr && g_fixed_infer_shmid >= 0 &&
-        cmd == IPC_CMD_INFER &&
-        sizeof(ipc_req_hdr_t) + frame_len <= g_fixed_infer_cap)
+static bool init_fixed_infer_slots()
+{
+    const size_t cap = sizeof(ipc_req_hdr_t) + k_ai_frame_bytes;
+    release_fixed_infer_slots();
+    for (size_t i = 0; i < k_fixed_infer_slot_count; ++i)
     {
-        if (ipc_request_encode_buffer(g_fixed_infer_ptr, g_fixed_infer_cap, cmd, frame, frame_len, tc, th, tw, reg_name,
-                                      seq.fetch_add(1)) != 0)
+        void *ptr = nullptr;
+        int shmid = ipc_shm_alloc(cap, &ptr);
+        if (shmid < 0 || !ptr)
+        {
+            release_fixed_infer_slots();
             return false;
-        shmid = g_fixed_infer_shmid;
-        free_req_shm = false;
+        }
+        g_fixed_infer_slots[i].shmid = shmid;
+        g_fixed_infer_slots[i].ptr = ptr;
+        g_fixed_infer_slots[i].cap = cap;
     }
-    else
-    {
-        if (ipc_pack_request(cmd, frame, frame_len, tc, th, tw, reg_name, seq.fetch_add(1), &shmid) != 0)
-            return false;
-    }
+    g_fixed_infer_slots_ready = true;
+    return true;
+}
+
+static int select_writable_infer_slot_locked()
+{
+    if (!g_fixed_infer_slots_ready)
+        return -1;
+    if (g_infer_inflight_slot == 0)
+        return 1;
+    if (g_infer_inflight_slot == 1)
+        return 0;
+    return (g_infer_latest_slot == 0) ? 1 : 0;
+}
+
+static bool rpc_ai_send_shmid(int ai_ch, int shmid, ipc_ai_reply_t *out_reply, bool free_req_shm, bool perf_enabled)
+{
+    if (shmid < 0)
+        return false;
 
     struct rt_channel_msg req, reply;
     memset(&req, 0, sizeof(req));
@@ -316,10 +365,12 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     req.type = RT_CHANNEL_RAW;
     req.u.d = (void *)(intptr_t)shmid;
 
+    const auto wait_start = std::chrono::steady_clock::now();
     rt_err_t ch_err = rt_channel_send_recv(ai_ch, &req, &reply);
+    g_perf_send_recv_wait.track_since(wait_start, perf_enabled);
     if (ch_err != 0)
     {
-        if (free_req_shm)
+        if (free_req_shm && shmid >= 0)
             ipc_shm_free(shmid);
         return false;
     }
@@ -330,6 +381,7 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     if (rshmid < 0)
         return false;
 
+    const auto copy_start = std::chrono::steady_clock::now();
     void *rp = lwp_shmat(rshmid, NULL);
     if (!rp)
     {
@@ -339,32 +391,49 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     memcpy(out_reply, rp, sizeof(ipc_ai_reply_t));
     lwp_shmdt(rp);
     ipc_shm_free(rshmid);
+    g_perf_reply_copy.track_since(copy_start, perf_enabled);
 
     if (out_reply->magic != IPC_MAGIC || out_reply->status != IPC_STATUS_OK)
         return false;
     return true;
 }
 
+/* 不持锁；调用方通过 rpc_ai_sync 持有 g_ai_ch_mutex。 */
+static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
+                        uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply)
+{
+    static std::atomic<uint32_t> seq{0};
+    int shmid = -1;
+    if (ipc_pack_request(cmd, frame, frame_len, tc, th, tw, reg_name, seq.fetch_add(1), &shmid) != 0)
+        return false;
+    return rpc_ai_send_shmid(ai_ch, shmid, out_reply, true, false);
+}
+
 static bool rpc_ai_sync(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
                         uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply)
 {
     std::lock_guard<std::mutex> lk(g_ai_ch_mutex);
-    return rpc_ai_impl(ai_ch, cmd, frame, frame_len, tc, th, tw, reg_name, out_reply, false);
+    return rpc_ai_impl(ai_ch, cmd, frame, frame_len, tc, th, tw, reg_name, out_reply);
 }
 
 /* 资源：ai_ch 生命周期由 video_ipc_loop 持有；isp_stop 置位后退出。线程安全：仅本线程调用 rpc_ai_impl。 */
-static void ai_infer_worker_thread(int ai_ch)
+static void ai_infer_worker_thread(int ai_ch, int debug_mode)
 {
     std::vector<uint8_t> work(k_ai_frame_bytes);
+    const bool perf_enabled = metrics_log_enabled(debug_mode);
 
     while (!isp_stop.load())
     {
         uint64_t snap = 0;
+        int slot_idx = -1;
         {
             std::unique_lock<std::mutex> lk(g_infer_pending_mu);
             g_infer_cv.wait(lk, [&] {
-                return isp_stop.load() ||
-                       (cur_state.load() == 0 && g_infer_capture_seq.load() > g_infer_last_displayed_seq.load());
+                if (isp_stop.load() || cur_state.load() != 0)
+                    return true;
+                if (g_fixed_infer_slots_ready && g_infer_latest_slot >= 0)
+                    return g_fixed_infer_slots[g_infer_latest_slot].seq > g_infer_last_displayed_seq.load();
+                return g_infer_capture_seq.load() > g_infer_last_displayed_seq.load();
             });
             if (isp_stop.load())
                 break;
@@ -373,12 +442,21 @@ static void ai_infer_worker_thread(int ai_ch)
                 /* 非识别态：不取帧推理，重新挂起 */
                 continue;
             }
-            /* 稳定快照：若 memcpy 期间又有新帧，重拷直到 seq 不变，等价于只保留最新帧 */
-            do
+            if (g_fixed_infer_slots_ready && g_infer_latest_slot >= 0)
             {
-                snap = g_infer_capture_seq.load();
-                memcpy(work.data(), g_infer_pending.data(), k_ai_frame_bytes);
-            } while (snap != g_infer_capture_seq.load());
+                slot_idx = g_infer_latest_slot;
+                snap = g_fixed_infer_slots[slot_idx].seq;
+                g_infer_inflight_slot = slot_idx;
+            }
+            else
+            {
+                /* fallback：固定槽不可用时维持旧行为 */
+                do
+                {
+                    snap = g_infer_capture_seq.load();
+                    memcpy(work.data(), g_infer_pending.data(), k_ai_frame_bytes);
+                } while (snap != g_infer_capture_seq.load());
+            }
         }
 
         ipc_ai_reply_t reply{};
@@ -387,8 +465,21 @@ static void ai_infer_worker_thread(int ai_ch)
             std::lock_guard<std::mutex> lk(g_ai_ch_mutex);
             if (isp_stop.load())
                 break;
-            ok = rpc_ai_impl(ai_ch, IPC_CMD_INFER, work.data(), k_ai_frame_bytes, AI_FRAME_CHANNEL, AI_FRAME_HEIGHT,
-                             AI_FRAME_WIDTH, nullptr, &reply, g_fixed_infer_ready);
+            if (slot_idx >= 0)
+            {
+                ok = rpc_ai_send_shmid(ai_ch, g_fixed_infer_slots[slot_idx].shmid, &reply, false, perf_enabled);
+            }
+            else
+            {
+                ok = rpc_ai_impl(ai_ch, IPC_CMD_INFER, work.data(), k_ai_frame_bytes, AI_FRAME_CHANNEL,
+                                 AI_FRAME_HEIGHT, AI_FRAME_WIDTH, nullptr, &reply);
+            }
+        }
+        if (slot_idx >= 0)
+        {
+            std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+            if (g_infer_inflight_slot == slot_idx)
+                g_infer_inflight_slot = -1;
         }
         if (isp_stop.load())
             break;
@@ -451,24 +542,23 @@ static void video_ipc_loop(int debug_mode)
     g_infer_pending.assign(k_ai_frame_bytes, 0);
     g_infer_capture_seq.store(0);
     g_infer_last_displayed_seq.store(0);
+    g_infer_latest_slot = -1;
+    g_infer_inflight_slot = -1;
     g_infer_has_reply.store(false);
     memset(&g_last_infer_reply, 0, sizeof(g_last_infer_reply));
 
-    g_fixed_infer_cap = sizeof(ipc_req_hdr_t) + k_ai_frame_bytes;
-    g_fixed_infer_shmid = ipc_shm_alloc(g_fixed_infer_cap, &g_fixed_infer_ptr);
-    g_fixed_infer_ready = (g_fixed_infer_shmid >= 0 && g_fixed_infer_ptr != nullptr);
-    if (g_fixed_infer_ready)
-        std::cout << "face_video: fixed infer request shm shmid=" << g_fixed_infer_shmid << " cap=" << g_fixed_infer_cap
-                  << std::endl;
+    if (init_fixed_infer_slots())
+        std::cout << "face_video: fixed infer request slots ready count=" << k_fixed_infer_slot_count
+                  << " cap=" << g_fixed_infer_slots[0].cap << std::endl;
     else
-        std::cout << "face_video: warn: fixed infer shm failed, fallback to per-request alloc\n";
+        std::cout << "face_video: warn: fixed infer shm slots failed, fallback to staged per-request alloc\n";
 
-    std::thread th_infer(ai_infer_worker_thread, ai_ch);
+    std::thread th_infer(ai_infer_worker_thread, ai_ch, debug_mode);
 
     uint64_t loop_tick = 0;
     while (!isp_stop)
     {
-        ScopedTiming st("total time", debug_mode);
+        ScopedPerfStage perf_stage(g_perf_total_time, metrics_log_enabled(debug_mode));
         if (pl.GetFrame(dump_res) != 0)
         {
             isp_stop = true;
@@ -494,11 +584,51 @@ static void video_ipc_loop(int debug_mode)
         else if (state == 0)
         {
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+            const bool perf_enabled = metrics_log_enabled(debug_mode);
+            const auto stage_start = std::chrono::steady_clock::now();
+            if (g_fixed_infer_slots_ready)
             {
-                std::lock_guard<std::mutex> lk(g_infer_pending_mu);
-                memcpy(g_infer_pending.data(), frame_ptr, frame_len);
-                g_infer_capture_seq.fetch_add(1);
-                g_metric_capture_frames.fetch_add(1);
+                uint64_t seq = 0;
+                int slot_idx = -1;
+                {
+                    std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                    seq = g_infer_capture_seq.load() + 1;
+                    slot_idx = select_writable_infer_slot_locked();
+                }
+                g_perf_capture_to_pending.track_since(stage_start, perf_enabled);
+
+                if (slot_idx >= 0)
+                {
+                    const auto slot_copy_start = std::chrono::steady_clock::now();
+                    FixedInferSlot &slot = g_fixed_infer_slots[slot_idx];
+                    if (ipc_request_encode_buffer(slot.ptr, slot.cap, IPC_CMD_INFER, frame_ptr, frame_len,
+                                                  AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH, nullptr,
+                                                  static_cast<uint32_t>(seq)) == 0)
+                    {
+                        g_perf_pending_to_ipc_slot.track_since(slot_copy_start, perf_enabled);
+                        {
+                            std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                            slot.seq = seq;
+                            g_infer_latest_slot = slot_idx;
+                            g_infer_capture_seq.store(seq);
+                            g_metric_capture_frames.fetch_add(1);
+                        }
+                    }
+                    else
+                    {
+                        g_perf_pending_to_ipc_slot.track_since(slot_copy_start, perf_enabled);
+                    }
+                }
+            }
+            else
+            {
+                {
+                    std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                    memcpy(g_infer_pending.data(), frame_ptr, frame_len);
+                    g_infer_capture_seq.fetch_add(1);
+                    g_metric_capture_frames.fetch_add(1);
+                }
+                g_perf_capture_to_pending.track_since(stage_start, perf_enabled);
             }
             g_infer_cv.notify_one();
             memset(&ai_reply, 0, sizeof(ai_reply));
@@ -669,7 +799,7 @@ static void video_ipc_loop(int debug_mode)
                       << " infer_rpc_fail=" << g_metric_infer_rpc_fail.load()
                       << " infer_stale=" << g_metric_infer_stale.load()
                       << " infer_applied=" << g_metric_infer_applied.load()
-                      << " fixed_infer_shm=" << (g_fixed_infer_ready ? "on" : "off") << std::endl;
+                      << " fixed_infer_shm=" << (g_fixed_infer_slots_ready ? "on" : "off") << std::endl;
         }
     }
 
@@ -704,17 +834,7 @@ static void video_ipc_loop(int debug_mode)
         }
     }
 
-    if (g_fixed_infer_ptr)
-    {
-        lwp_shmdt(g_fixed_infer_ptr);
-        g_fixed_infer_ptr = nullptr;
-    }
-    if (g_fixed_infer_shmid >= 0)
-    {
-        ipc_shm_free(g_fixed_infer_shmid);
-        g_fixed_infer_shmid = -1;
-    }
-    g_fixed_infer_ready = false;
+    release_fixed_infer_slots();
 
     rt_channel_close(ai_ch);
     int reply_ch = g_video_reply_ch.load();

@@ -368,6 +368,7 @@ void FaceRecognition::database_init(char *db_pth)
 			          << std::endl;
 			break;
 		}
+        l2_normalize(db_vec.data(), db_vec.data(), feature_num_);
 		features_.push_back(std::move(db_vec));
 		fname = face_db_join_path(db_pth, std::to_string(i) + ".name");
 		vector<char> name_vec = Utils::read_binary_file<char>(fname.c_str());
@@ -480,6 +481,7 @@ void FaceRecognition::database_add(std::string& name, char* db_path, const cv::M
     }
 
     std::vector<float> feature_vec(feature, feature + feature_num_);
+    l2_normalize(feature_vec.data(), feature_vec.data(), feature_num_);
     features_.push_back(std::move(feature_vec));  // 避免拷贝
     names_.push_back(name);
     valid_register_face_ += 1;
@@ -522,16 +524,15 @@ void FaceRecognition::database_search(FaceRecognitionInfo &result, const float *
 	float v_score;
 	float v_score_top1 = -1.f;
 	float v_score_top2 = -1.f;
-	float basef[feature_num_], testf[feature_num_];
+	float testf[feature_num_];
 	if (query_l2norm)
 		std::memcpy(testf, query_l2norm, sizeof(float) * (size_t)feature_num_);
 	else
 		l2_normalize(p_outputs_[0], testf, feature_num_);
 	for (i = 0; i < valid_register_face_; i++)
 	{
-        float* cur_feature=features_[i].data();
-        l2_normalize(cur_feature, basef, feature_num_);
-		v_score = cal_cosine_distance(testf, basef, feature_num_);
+        const float* cur_feature = features_[i].data();
+		v_score = cal_cosine_distance(testf, cur_feature, feature_num_);
         if (v_score > v_score_top1)
         {
             v_score_top2 = v_score_top1;
@@ -730,7 +731,7 @@ void FaceRecognition::get_affine_matrix(float *sparse_points)
 	image_umeyama_112(&matrix_src[0][0], &matrix_dst_[0]);
 }
 
-void FaceRecognition::l2_normalize(float *src, float *dst, int len) const
+void FaceRecognition::l2_normalize(const float *src, float *dst, int len) const
 {
 	float sum = 0;
 	for (int i = 0; i < len; ++i)
@@ -738,13 +739,15 @@ void FaceRecognition::l2_normalize(float *src, float *dst, int len) const
 		sum += src[i] * src[i];
 	}
 	sum = sqrtf(sum);
+    if (sum < 1e-6f)
+        sum = 1.0f;
 	for (int i = 0; i < len; ++i)
 	{
 		dst[i] = src[i] / sum;
 	}
 }
 
-float FaceRecognition::cal_cosine_distance(float *feature_0, float *feature_1, int feature_len)
+float FaceRecognition::cal_cosine_distance(const float *feature_0, const float *feature_1, int feature_len)
 {
 	float cosine_distance = 0;
 	// calculate the sum square
