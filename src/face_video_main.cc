@@ -517,7 +517,9 @@ static void video_ipc_loop(int debug_mode)
      * 副本保证旋转/缩放每帧从同一源重做，避免与 main.cc 单进程分支行为偏差。 */
     int display_state = 0;
     cv::Mat register_preview_src;
+    cv::Mat register_commit_src;
     auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
+    bool register_preview_persistent = false;
 
     PipeLine pl(debug_mode);
     if (pl.Create() != 0)
@@ -649,6 +651,11 @@ static void video_ipc_loop(int debug_mode)
                              ok ? default_op_message(r, "database count ready") : "database count rpc failed");
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
+            if (!register_preview_src.empty())
+                register_preview_src.release();
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
         }
         else if (state == 2)
         {
@@ -663,6 +670,8 @@ static void video_ipc_loop(int debug_mode)
             sensor_bgr.push_back(ori_img_G);
             sensor_bgr.push_back(ori_img_R);
             cv::merge(sensor_bgr, dump_img);
+            register_commit_src = dump_img.clone();
+            register_preview_persistent = true;
             cur_state = 0;
             display_state = 2;
             send_video_reply(ctrl_snapshot, true, 0, "register preview ready");
@@ -674,16 +683,17 @@ static void video_ipc_loop(int debug_mode)
                 std::lock_guard<std::mutex> lk(g_ui);
                 name_copy = register_name;
             }
+            const cv::Mat &register_src = !register_commit_src.empty() ? register_commit_src : dump_img;
             std::vector<uint8_t> chw_vec;
             std::vector<cv::Mat> bgrChannels(3);
-            cv::split(dump_img, bgrChannels);
+            cv::split(register_src, bgrChannels);
             for (auto i = 2; i > -1; i--)
             {
                 std::vector<uint8_t> data = std::vector<uint8_t>(bgrChannels[i].reshape(1, 1));
                 chw_vec.insert(chw_vec.end(), data.begin(), data.end());
             }
-            uint32_t th = (uint32_t)dump_img.rows;
-            uint32_t tw = (uint32_t)dump_img.cols;
+            uint32_t th = (uint32_t)register_src.rows;
+            uint32_t tw = (uint32_t)register_src.cols;
             uint32_t tc = 3u;
 
             ipc_ai_reply_t r{};
@@ -694,6 +704,8 @@ static void video_ipc_loop(int debug_mode)
                              register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
             if (!register_preview_src.empty())
             {
                 register_preview_src.release();
@@ -740,9 +752,13 @@ static void video_ipc_loop(int debug_mode)
                              register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 2;
+            register_preview_persistent = false;
+            register_commit_src.release();
         }
         else if (state == 6)
         {
+            register_preview_persistent = false;
+            register_commit_src.release();
             if (!register_preview_src.empty())
             {
                 register_preview_src.release();
@@ -762,18 +778,26 @@ static void video_ipc_loop(int debug_mode)
                              ok ? default_op_message(r, "database reset") : "database reset rpc failed");
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
+            if (!register_preview_src.empty())
+                register_preview_src.release();
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
         }
 
         /* 须在 state 1–6 可能 release 了 register_preview_src 之后计算，避免同一帧仍用已失效的 preview_active 去 resize 空图 */
         const auto now_after_ctrl = std::chrono::steady_clock::now();
         const bool preview_still =
-            !register_preview_src.empty() && now_after_ctrl < register_preview_deadline;
+            !register_preview_src.empty() &&
+            (register_preview_persistent || now_after_ctrl < register_preview_deadline);
 
         if (display_state == 2)
         {
             /* 首次进入注册预览：缓存 dump_img 副本，设定过期时刻；旋转/缩放每帧按源重做。 */
             register_preview_src = dump_img.clone();
-            register_preview_deadline = now_after_ctrl + std::chrono::milliseconds(k_register_preview_hold_ms);
+            register_preview_deadline = register_preview_persistent
+                                            ? std::chrono::steady_clock::time_point::max()
+                                            : now_after_ctrl + std::chrono::milliseconds(k_register_preview_hold_ms);
             render_register_preview(draw_frame, register_preview_src);
         }
         else if (preview_still)

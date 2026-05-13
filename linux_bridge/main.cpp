@@ -33,6 +33,7 @@ extern "C" {
 }
 
 #include "../src/ipc_proto.h"
+#include "ui/ui_runtime.h"
 #include "third_party/mongoose/mongoose.h"
 
 namespace fs = std::filesystem;
@@ -73,6 +74,10 @@ struct Config {
     int ipc_connect_retry_ms = 500;
     int ipc_sync_timeout_ms = 3000;
     int mqtt_keepalive_s = 15;
+    bool ui_enabled = false;
+    std::string ui_touch_device = "/dev/input/event0";
+    int ui_preview_timeout_ms = 30000;
+    std::string ui_overlay_profile = "dongshanpi_nt35516";
 };
 
 struct PublishItem {
@@ -82,10 +87,16 @@ struct PublishItem {
     bool retain = false;
 };
 
+enum class PendingCmdSource {
+    remote = 0,
+    ui = 1,
+};
+
 struct PendingCmd {
     std::string request_id;
     int cmd = IPC_BRIDGE_CMD_NONE;
     std::string name;
+    PendingCmdSource source = PendingCmdSource::remote;
 };
 
 struct Runtime {
@@ -218,6 +229,27 @@ bool parse_int(const std::string &s, int *out)
     return true;
 }
 
+bool parse_bool(const std::string &s, bool *out)
+{
+    if (!out)
+        return false;
+    std::string v;
+    v.reserve(s.size());
+    for (unsigned char ch : s)
+        v.push_back(static_cast<char>(std::tolower(ch)));
+    if (v == "1" || v == "true" || v == "yes" || v == "on")
+    {
+        *out = true;
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "no" || v == "off")
+    {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 std::string json_escape(const std::string &input)
 {
     std::ostringstream oss;
@@ -309,6 +341,14 @@ bool load_config(const std::string &path, Config *cfg)
             parse_int(value, &cfg->ipc_sync_timeout_ms);
         else if (key == "mqtt_keepalive_s")
             parse_int(value, &cfg->mqtt_keepalive_s);
+        else if (key == "ui_enabled")
+            parse_bool(value, &cfg->ui_enabled);
+        else if (key == "ui_touch_device")
+            cfg->ui_touch_device = value;
+        else if (key == "ui_preview_timeout_ms")
+            parse_int(value, &cfg->ui_preview_timeout_ms);
+        else if (key == "ui_overlay_profile")
+            cfg->ui_overlay_profile = value;
         else if (key == "face_db_dir")
             cfg->face_db_dir = value;
         else if (key == "attendance_log_base")
@@ -351,6 +391,12 @@ bool load_config(const std::string &path, Config *cfg)
         cfg->ipc_sync_timeout_ms = 3000;
     if (cfg->mqtt_keepalive_s <= 0)
         cfg->mqtt_keepalive_s = 15;
+    if (cfg->ui_touch_device.empty())
+        cfg->ui_touch_device = "/dev/input/event0";
+    if (cfg->ui_preview_timeout_ms <= 0)
+        cfg->ui_preview_timeout_ms = 30000;
+    if (cfg->ui_overlay_profile.empty())
+        cfg->ui_overlay_profile = "dongshanpi_nt35516";
     if (cfg->face_db_dir.empty())
         cfg->face_db_dir = "/sharefs/face_db";
     if (cfg->attendance_log_base.empty())
@@ -681,6 +727,21 @@ void enqueue_command(PendingCmd cmd)
         g_rt.cmd_queue.push_back(std::move(cmd));
     }
     g_rt.cmd_cv.notify_one();
+}
+
+bool is_registration_or_reset_cmd(int cmd)
+{
+    switch (static_cast<ipc_bridge_cmd_t>(cmd))
+    {
+    case IPC_BRIDGE_CMD_DB_RESET:
+    case IPC_BRIDGE_CMD_REGISTER_CURRENT:
+    case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
+    case IPC_BRIDGE_CMD_REGISTER_COMMIT:
+    case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool pop_command_blocking(PendingCmd *out)
@@ -1081,6 +1142,22 @@ void publish_reply_failure(const std::string &request_id, int cmd, const std::st
     publish_reply_mqtt(request_id, bridge_cmd_name(cmd), false, -1, message, "");
 }
 
+void publish_reply_failure(const PendingCmd &cmd, const std::string &message)
+{
+    if (cmd.source == PendingCmdSource::ui)
+    {
+        bridge_cmd_result_t result{};
+        result.magic = IPC_MAGIC;
+        result.cmd = cmd.cmd;
+        result.ok = 0;
+        strncpy(result.request_id, cmd.request_id.c_str(), sizeof(result.request_id) - 1);
+        strncpy(result.message, message.c_str(), sizeof(result.message) - 1);
+        ui_on_bridge_result(result);
+        return;
+    }
+    publish_reply_failure(cmd.request_id, cmd.cmd, message);
+}
+
 /** Same JSONL shape as RT face_event; written under attendance_log_base when TF is mounted on Linux.
  *  Mirrors ipc events when big-core /sd is unavailable or returns EINVAL. */
 static void append_attendance_jsonl_linux_tf(const bridge_event_t &ev)
@@ -1157,6 +1234,7 @@ static void append_attendance_jsonl_linux_tf(const bridge_event_t &ev)
 void handle_bridge_event(const bridge_event_t &ev)
 {
     append_attendance_jsonl_linux_tf(ev);
+    ui_on_bridge_event(ev);
 
     std::ostringstream oss;
     oss << "{\"schema\":\"" << kSchema << "\""
@@ -1192,8 +1270,12 @@ void handle_bridge_result(const bridge_cmd_result_t &result)
     if (result.ok && result.cmd == IPC_BRIDGE_CMD_DB_RESET)
         g_rt.db_count.store(0);
 
-    publish_reply_mqtt(result.request_id, bridge_cmd_name(result.cmd), static_cast<bool>(result.ok), result.count,
-                        std::string(result.message), "");
+    ui_on_bridge_result(result);
+    if (std::strncmp(result.request_id, "ui_", 3) != 0)
+    {
+        publish_reply_mqtt(result.request_id, bridge_cmd_name(result.cmd), static_cast<bool>(result.ok), result.count,
+                           std::string(result.message), "");
+    }
 
     mark_rt_seen();
 
@@ -1336,7 +1418,7 @@ void command_worker_thread()
         const int ipc_id = g_rt.ipc_id.load();
         if (ipc_id < 0 || !g_rt.rt_connected.load() || !kd_ipcmsg_is_connect(ipc_id))
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd, "rt bridge disconnected");
+            publish_reply_failure(cmd, "rt bridge disconnected");
             g_rt.status_dirty.store(true);
             continue;
         }
@@ -1351,7 +1433,7 @@ void command_worker_thread()
                                                            sizeof(req));
         if (!msg)
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd, "failed to allocate ipc message");
+            publish_reply_failure(cmd, "failed to allocate ipc message");
             continue;
         }
 
@@ -1361,8 +1443,7 @@ void command_worker_thread()
 
         if (ret != K_SUCCESS || !resp)
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd,
-                                  ret == K_IPCMSG_ETIMEOUT ? "bridge ack timeout" : "bridge ack failed");
+            publish_reply_failure(cmd, ret == K_IPCMSG_ETIMEOUT ? "bridge ack timeout" : "bridge ack failed");
             if (resp)
                 kd_ipcmsg_destroy_message(resp);
             continue;
@@ -1370,7 +1451,7 @@ void command_worker_thread()
 
         if (resp->u32BodyLen < sizeof(bridge_cmd_ack_t) || !resp->pBody)
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd, "invalid bridge ack");
+            publish_reply_failure(cmd, "invalid bridge ack");
             kd_ipcmsg_destroy_message(resp);
             continue;
         }
@@ -1381,14 +1462,14 @@ void command_worker_thread()
 
         if (ack.magic != IPC_MAGIC)
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd, "bridge ack magic mismatch");
+            publish_reply_failure(cmd, "bridge ack magic mismatch");
             continue;
         }
 
         mark_rt_seen();
         if (!ack.accepted)
         {
-            publish_reply_failure(cmd.request_id, cmd.cmd, ack.reason[0] ? ack.reason : "bridge rejected");
+            publish_reply_failure(cmd, ack.reason[0] ? ack.reason : "bridge rejected");
             continue;
         }
 
@@ -1472,6 +1553,11 @@ void parse_and_enqueue_command(mg_str json)
         publish_reply_failure(request_id_s, IPC_BRIDGE_CMD_NONE, "unsupported command");
         return;
     }
+    if (ui_is_session_active() && is_registration_or_reset_cmd(bridge_cmd))
+    {
+        publish_reply_failure(request_id_s, bridge_cmd, "registration session busy");
+        return;
+    }
     if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_CURRENT && name_s.empty())
     {
         publish_reply_failure(request_id_s, bridge_cmd, "name is required");
@@ -1483,7 +1569,7 @@ void parse_and_enqueue_command(mg_str json)
         return;
     }
 
-    enqueue_command(PendingCmd{request_id_s, bridge_cmd, name_s});
+    enqueue_command(PendingCmd{request_id_s, bridge_cmd, name_s, PendingCmdSource::remote});
 }
 
 void mqtt_send_login(mg_connection *c)
@@ -1835,6 +1921,17 @@ int main(int argc, char **argv)
 
     mg_mgr_init(&g_mgr);
 
+    runtime_config ui_cfg;
+    ui_cfg.enabled = g_rt.cfg.ui_enabled;
+    ui_cfg.touch_device = g_rt.cfg.ui_touch_device;
+    ui_cfg.preview_timeout_ms = g_rt.cfg.ui_preview_timeout_ms;
+    ui_cfg.overlay_profile = g_rt.cfg.ui_overlay_profile;
+    ui_cfg.submit_command = [](const std::string &request_id, int cmd, const std::string &name) {
+        enqueue_command(PendingCmd{request_id, cmd, name, PendingCmdSource::ui});
+    };
+    ui_cfg.log_message = [](const std::string &message) { std::cout << message << std::endl; };
+    ui_runtime_start(ui_cfg);
+
     std::thread ipc_thread(ipc_supervisor_thread);
     std::thread cmd_thread(command_worker_thread);
 
@@ -1865,6 +1962,7 @@ int main(int argc, char **argv)
     if (ipc_thread.joinable())
         ipc_thread.join();
 
+    ui_runtime_stop();
     shutdown_mqtt_gracefully();
     mg_mgr_free(&g_mgr);
 
