@@ -31,11 +31,11 @@ RT-Smart 大核三进程
 
 ## 编译
 
-在开发机 SDK 环境中执行：
+在开发机宿主机环境中执行：
 
 ```bash
 cd /home/hyperlovimia/k230_sdk
-docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
+make prepare_toolchain
 ```
 
 ```bash
@@ -44,6 +44,7 @@ cd src/reference/ai_poc/my_face_recognition
 ```
 
 项目必须位于 `k230_sdk/src/reference/ai_poc/my_face_recognition`。
+`build_app.sh` 会优先使用 `k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin`。
 
 生成的编译产物在 `k230_bin` 目录中。将以下文件按需同步到板端 `/data`：
 
@@ -284,9 +285,7 @@ http://<电脑IP>:8000
 ### 1. 开发机编译 RT-Smart 三进程
 
 ```bash
-cd /home/hyperlovimia/k230_sdk
-docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
-cd src/reference/ai_poc/my_face_recognition
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 ./build_app.sh
 ```
 

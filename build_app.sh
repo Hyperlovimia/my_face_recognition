@@ -16,23 +16,45 @@ export MPP_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/mpp/"
 export NNCASE_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/nncase/"
 export OPENCV_SRC_DIR="${SDK_SRC_ROOT_DIR}/src/big/utils/lib/opencv/"
 
-# Cross-compile RISC-V musl 工具链：优先用 SDK 根目录下 toolchain/（本机/完整 SDK 树），
-# 再兼容 Docker 里挂载的 /opt/toolchain。
 K230_RISCV_BIN="${SDK_SRC_ROOT_DIR}/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
-if [ -d "${K230_RISCV_BIN}" ]; then
-    export PATH="${K230_RISCV_BIN}:${PATH}"
-else
-    export PATH="${PATH}:/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
-fi
+K230_DOCKER_RISCV_BIN="/opt/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
 
-if ! command -v riscv64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+setup_toolchain_path() {
+    if [ -d "${K230_RISCV_BIN}" ]; then
+        export PATH="${K230_RISCV_BIN}:${PATH}"
+    elif [ -d "${K230_DOCKER_RISCV_BIN}" ]; then
+        export PATH="${K230_DOCKER_RISCV_BIN}:${PATH}"
+    fi
+}
+
+ensure_toolchain_ready() {
+    if command -v riscv64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+        return 0
+    fi
+
     echo "[ERROR] riscv64-unknown-linux-musl-gcc is not in PATH."
-    echo "  Put the K230 riscv64 musl toolchain under:"
+    echo "  Expected one of these toolchain locations:"
     echo "    ${K230_RISCV_BIN}"
-    echo "  (same layout as a full k230_sdk checkout), or in Docker mount:"
-    echo "    -v \$(pwd)/toolchain:/opt/toolchain   (run from <k230_sdk_root>)"
+    echo "    ${K230_DOCKER_RISCV_BIN}"
+    echo "  Please run: cd ${SDK_SRC_ROOT_DIR} && make prepare_toolchain"
     exit 1
-fi
+}
+
+path_not_writable() {
+    local path="$1"
+    [ -e "${path}" ] && [ ! -w "${path}" ]
+}
+
+ensure_workspace_writable() {
+    if path_not_writable "${BUILD_DIR}" || path_not_writable "${K230_BIN_DIR}"; then
+        echo "[ERROR] Existing build/output directories are not writable:"
+        path_not_writable "${BUILD_DIR}" && echo "  ${BUILD_DIR}"
+        path_not_writable "${K230_BIN_DIR}" && echo "  ${K230_BIN_DIR}"
+        echo "  Please fix ownership first, for example:"
+        echo "    sudo chown -R $(id -u):$(id -g) ${BUILD_DIR} ${K230_BIN_DIR}"
+        exit 1
+    fi
+}
 
 # =======================
 # Output directories
@@ -41,6 +63,10 @@ BUILD_DIR="${SCRIPTPATH}/build"
 K230_BIN_DIR="${SCRIPTPATH}/k230_bin"
 mkdir -p "${BUILD_DIR}"
 mkdir -p "${K230_BIN_DIR}"
+
+setup_toolchain_path
+ensure_toolchain_ready
+ensure_workspace_writable
 
 # =======================
 # Build function
