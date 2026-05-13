@@ -94,6 +94,7 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 - 低电平点亮
 - 开门保持：`3s`
 - 默认不驱动第二路蜂鸣器/继电器 GPIO
+- 默认关闭写后 `GPIO_READ_VALUE` 自校验，避免板载 LED 场景因输出脚读回不可靠误判 `FAULT`
 
 这些值由 [src/door_control_config.h](/home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/src/door_control_config.h) 的编译期宏控制。若目标板接线、极性或时长不同，请修改该头文件后重新执行 `./build_app.sh`。
 

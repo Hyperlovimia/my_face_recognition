@@ -32,7 +32,7 @@
 #endif
 
 #ifndef FACE_DOOR_VERIFY_READBACK
-#define FACE_DOOR_VERIFY_READBACK 1
+#define FACE_DOOR_VERIFY_READBACK 0
 #endif
 
 #endif
