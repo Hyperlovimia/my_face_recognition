@@ -35,4 +35,8 @@
 #define FACE_DOOR_VERIFY_READBACK 0
 #endif
 
+#ifndef FACE_DOOR_FORCE_IOMUX_GPIO
+#define FACE_DOOR_FORCE_IOMUX_GPIO 1
+#endif
+
 #endif

@@ -32,7 +32,7 @@
 - 点亮保持 `3s`
 - 到时自动熄灭，表示“门关闭”
 - `stranger` 与 `liveness_fail` 仍只打印日志和写考勤，不驱动 LED
-- 若 GPIO 初始化失败、写失败或读回校验失败，则进入 `FAULT`，停止后续动作，但不影响识别、日志和桥接链路
+- 若 GPIO 初始化失败、写失败或 pinmux 配置失败，则进入 `FAULT`，停止后续动作，但不影响识别、日志和桥接链路
 
 ## 3. 代码改动
 
@@ -61,9 +61,9 @@
   - `KD_GPIO_DM_OUTPUT`
   - `KD_GPIO_WRITE_LOW`
   - `KD_GPIO_WRITE_HIGH`
-  - `KD_GPIO_READ_VALUE`
 - 通过工作线程 + `condition_variable` 实现一次性开门窗口
 - 开门窗口内重复 `recognized` 不续期，避免 LED 常亮、也避免未来迁回继电器时变成“门常开”
+- 在输出 GPIO 初始化前，显式把 `IO6` pinmux 强制切到 GPIO 功能，避免板级默认复用不是 GPIO 时“日志成功但 LED 不亮”
 
 ### 3.2 `face_event` 接入门状态控制
 
@@ -114,7 +114,8 @@
 #define FACE_DOOR_RELAY_ACTIVE_HIGH 0
 #define FACE_DOOR_BUZZER_PIN -1
 #define FACE_DOOR_HOLD_MS 3000
-#define FACE_DOOR_VERIFY_READBACK 1
+#define FACE_DOOR_VERIFY_READBACK 0
+#define FACE_DOOR_FORCE_IOMUX_GPIO 1
 ```
 
 说明：
@@ -122,6 +123,8 @@
 - `FACE_DOOR_RELAY_PIN` 现在语义上等同于“门状态输出 GPIO”，当前映射到 `LED1`
 - `FACE_DOOR_RELAY_ACTIVE_HIGH = 0` 表示低电平有效，对应 `LED1` 低电平点亮
 - `FACE_DOOR_BUZZER_PIN = -1` 表示第二路输出关闭
+- `FACE_DOOR_VERIFY_READBACK = 0` 表示默认关闭“输出脚自读回校验”
+- `FACE_DOOR_FORCE_IOMUX_GPIO = 1` 表示初始化时强制将 `IO6` 切换到 GPIO 复用
 - 代码同步调整为“第二路输出可选”，当 `pin < 0` 时直接跳过配置和写入
 
 因此当前板端行为变为：
@@ -129,7 +132,57 @@
 - 识别成功 -> `GPIO6` 输出低电平 -> `LED1` 点亮 -> 表示门打开
 - 3 秒后 -> `GPIO6` 输出高电平 -> `LED1` 熄灭 -> 表示门关闭
 
-## 5. 文档更新
+## 5. Bug 修复补充
+
+在首次切换到板载 `LED1` 方案后，现场出现过一个典型问题：
+
+- 串口日志已经出现 `door unlock` / `door relock`
+- 说明识别事件、状态机和 3 秒自动回锁逻辑都已生效
+- 但 `LED1` 实际没有点亮
+
+同时还出现过另一类日志：
+
+- `face_event: door control faulted, ignore recognized event name=...`
+
+这说明门控模块已提前进入 `FAULT`，后续识别成功事件虽然还能被 `face_event` 正常打印和桥接，但不会再驱动 LED。
+
+最终定位到有两个板级相关原因：
+
+1. **输出脚自读回校验不适合板载 LED 场景**
+
+- 最初版本在 GPIO 输出后使用 `GPIO_READ_VALUE` 立即读回做自校验
+- 但 K230 SDK 自带 GPIO 用例更常见的是“一个输出脚接另一个输入脚再读”，并不是“同一个输出脚自读自身”
+- 对板载 `LED1(GPIO6)` 这种场景，输出后立即自读并不稳定，可能被误判为故障并转入 `FAULT`
+
+因此后续修复中将：
+
+- `FACE_DOOR_VERIFY_READBACK` 默认改为 `0`
+- 不再把输出脚自读回作为默认故障判定依据
+
+2. **`IO6` 在 `k230_canmv_dongshanpi` 板级默认 pinmux 中不是 GPIO**
+
+- 本地 DTS 检查发现，`k230_canmv_dongshanpi.dts` 中 `IO6` 默认 `SEL=1`
+- 同文件中，真正配置成 GPIO 的脚通常是 `SEL=0`
+- 这解释了为什么“软件日志成功，但 LED 没亮”：GPIO 控制已执行，但 pad 本身并未复用到 GPIO 功能
+
+因此后续修复中在 `DoorControl::init()` 前半段增加：
+
+- 使用 `/dev/mem + mmap` 访问 `IOMUX`
+- 将 `IO6` 的 `SEL` 显式切换为 GPIO
+- 同时打开 `OE/IE`
+- 启动日志增加 `iomux pin 6 forced to gpio old=... new=...`
+
+修复后现场现象变为：
+
+- `recognized`
+- `door unlock ...`
+- `LED1` 点亮约 3 秒
+- `door relock reason=timeout`
+- `LED1` 熄灭
+
+说明该问题已经从“软件逻辑故障”收敛并修复为“板级 pinmux + 不合适的默认校验策略”问题。
+
+## 6. 文档更新
 
 修改文件：
 
@@ -141,9 +194,11 @@
 - `LED1` 使用 `BANK0_GPIO6`
 - 低电平点亮
 - 默认保持 `3s`
+- 默认关闭写后 `GPIO_READ_VALUE` 自校验
+- 默认强制 `IO6` pinmux 切换到 GPIO
 - 若后续接入其它执行器，可修改 `src/door_control_config.h` 后重新编译
 
-## 6. 日志与留痕
+## 7. 日志与留痕
 
 本轮没有改动 `attendance_log` JSON 结构本身，但门状态控制会额外写入 `meta` 事件，便于后续回溯：
 
@@ -152,14 +207,15 @@
 - `door_relock ...`
 - `door_fault ...`
 - `door_control_disabled`
+- `iomux pin 6 forced to gpio old=... new=...`（串口启动日志）
 
 这意味着即使现场只有 LED 指示，也可以通过日志确认：
 
 - 什么时候识别触发了“开门”
 - 什么时候自动“关门”
-- 是否发生了 GPIO 故障
+- 是否发生了 GPIO / pinmux 故障
 
-## 7. 构建验证
+## 8. 构建验证
 
 本轮已在宿主机完成交叉编译验证。
 
@@ -178,7 +234,7 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
   - `build/bin/face_event.elf`
   - `k230_bin/face_event.elf`
 
-## 8. 当前结论
+## 9. 当前结论
 
 本轮已经把“识别成功后执行开门动作”的闭环，在无外部执行器的板卡条件下落成了可观察版本：
 
@@ -189,5 +245,8 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
   - 超时恢复
   - 异常容错
   - 日志留痕
+- 同时额外覆盖了板载 LED 场景下的两个易踩坑：
+  - 输出脚自读回误判 `FAULT`
+  - pad 默认 pinmux 不是 GPIO 导致“日志成功但灯不亮”
 
 后续如果板子新增真实继电器、蜂鸣器或其它门锁执行器，只需要调整 `src/door_control_config.h` 中的 GPIO 编号与极性，并重新编译，即可复用本轮已经完成的状态机与容错框架，无需再改动 `face_event` 主流程。

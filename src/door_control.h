@@ -44,6 +44,7 @@ private:
     void perform_relock(const char *reason_tag);
 
     bool open_gpio_device();
+    bool configure_iomux_gpio(int pin, std::string *error_out);
     bool configure_outputs();
     bool set_outputs(bool active, std::string *error_out);
     bool set_single_pin(int pin, bool active_high, bool active, std::string *error_out);

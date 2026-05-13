@@ -2,10 +2,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <cstring>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -17,7 +19,15 @@ namespace
 {
 
 constexpr char k_gpio_dev_path[] = "/dev/gpio";
+constexpr char k_mem_dev_path[] = "/dev/mem";
 constexpr int k_max_gpio_pin = 71;
+constexpr off_t k_iomux_base_addr = 0x91105000;
+constexpr size_t k_iomux_map_size = 0x1000;
+constexpr uint32_t k_iomux_sel_shift = 11;
+constexpr uint32_t k_iomux_sel_mask = (0x7u << k_iomux_sel_shift);
+constexpr uint32_t k_iomux_oe_mask = (0x1u << 7);
+constexpr uint32_t k_iomux_ie_mask = (0x1u << 8);
+constexpr uint32_t k_iomux_gpio_func = 0u;
 
 /* Local mirror of RT-Smart /dev/gpio userspace ABI. */
 typedef struct
@@ -91,10 +101,23 @@ bool DoorControl::init(const std::string &log_base)
     if (!open_gpio_device())
         return false;
 
+    std::string error;
+    if (!configure_iomux_gpio(relay_pin_, &error))
+    {
+        enter_fault("configure relay iomux failed: " + error);
+        return false;
+    }
+
+    if (output_enabled(buzzer_pin_) && !configure_iomux_gpio(buzzer_pin_, &error))
+    {
+        enter_fault("configure aux iomux failed: " + error);
+        return false;
+    }
+
     if (!configure_outputs())
         return false;
 
-    std::string error;
+    error.clear();
     if (!set_outputs(false, &error))
     {
         enter_fault("initial safe lock failed: " + error);
@@ -299,6 +322,66 @@ bool DoorControl::open_gpio_device()
     oss << "open " << k_gpio_dev_path << " failed errno=" << errno;
     enter_fault(oss.str());
     return false;
+}
+
+bool DoorControl::configure_iomux_gpio(int pin, std::string *error_out)
+{
+    if (!output_enabled(pin) || FACE_DOOR_FORCE_IOMUX_GPIO == 0)
+        return true;
+
+    const int mem_fd = open(k_mem_dev_path, O_RDWR | O_SYNC);
+    if (mem_fd < 0)
+    {
+        if (error_out)
+        {
+            std::ostringstream oss;
+            oss << "open " << k_mem_dev_path << " failed errno=" << errno;
+            *error_out = oss.str();
+        }
+        return false;
+    }
+
+    void *mapped = mmap(nullptr, k_iomux_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, k_iomux_base_addr);
+    if (mapped == MAP_FAILED)
+    {
+        if (error_out)
+        {
+            std::ostringstream oss;
+            oss << "mmap iomux failed errno=" << errno;
+            *error_out = oss.str();
+        }
+        close(mem_fd);
+        return false;
+    }
+
+    volatile uint32_t *regs = reinterpret_cast<volatile uint32_t *>(mapped);
+    const size_t reg_idx = static_cast<size_t>(pin);
+    const uint32_t old_val = regs[reg_idx];
+    uint32_t new_val = old_val;
+    new_val &= ~k_iomux_sel_mask;
+    new_val |= (k_iomux_gpio_func << k_iomux_sel_shift);
+    new_val |= k_iomux_oe_mask;
+    new_val |= k_iomux_ie_mask;
+    regs[reg_idx] = new_val;
+    const uint32_t verify_val = regs[reg_idx];
+
+    munmap(mapped, k_iomux_map_size);
+    close(mem_fd);
+
+    if ((verify_val & k_iomux_sel_mask) != 0)
+    {
+        if (error_out)
+        {
+            std::ostringstream oss;
+            oss << "iomux verify failed pin=" << pin << " reg=0x" << std::hex << verify_val;
+            *error_out = oss.str();
+        }
+        return false;
+    }
+
+    std::cout << "face_event: iomux pin " << pin << " forced to gpio old=0x" << std::hex << old_val
+              << " new=0x" << verify_val << std::dec << std::endl;
+    return true;
 }
 
 bool DoorControl::configure_outputs()
