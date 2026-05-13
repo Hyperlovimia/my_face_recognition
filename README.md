@@ -87,6 +87,16 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 
 启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/sharefs/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
 
+当前版本默认在 `face_event.elf` 内启用“门状态指示”控制：
+
+- 门打开状态映射到板载 `LED1`
+- `LED1` 使用 `BANK0_GPIO6`
+- 低电平点亮
+- 开门保持：`3s`
+- 默认不驱动第二路蜂鸣器/继电器 GPIO
+
+这些值由 [src/door_control_config.h](/home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/src/door_control_config.h) 的编译期宏控制。若目标板接线、极性或时长不同，请修改该头文件后重新执行 `./build_app.sh`。
+
 程序支持两种退出方式：
 
 - 输入 `q` 后回车，走正常清理退出
@@ -131,6 +141,18 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 > 注：
 > 注册截图时请确保画面中仅有一张清晰可见的人脸。
 > 姓名应使用可识别英文字符，避免特殊符号。
+
+## 门锁联动
+
+`face_event.elf` 现在会直接消费 `face_ai -> face_event` 的识别事件并驱动门状态指示 GPIO：
+
+- 仅 `recognized` 事件会触发开门
+- `stranger` 与 `liveness_fail` 只保留日志/告警，不驱动 GPIO
+- 授权用户开门后，板载 `LED1(GPIO6)` 点亮，`3s` 后自动熄灭
+- 开门窗口内重复识别不会续期开门，避免人脸常驻导致门常开
+- 若 `/dev/gpio` 初始化失败、写失败或读回校验不一致，门锁控制会进入 `FAULT`，后续仅保留识别与日志功能，不再继续驱动 GPIO
+
+门锁动作和故障会额外写入考勤 JSONL 的 `meta` 记录，例如 `door_unlock`、`door_relock`、`door_fault`。
 
 ## 远程桥接能力
 

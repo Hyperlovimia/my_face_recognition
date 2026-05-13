@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "attendance_log.h"
+#include "door_control.h"
 #include "ipc_proto.h"
 #include "ipc_shm.h"
 #include "ipc_lwp_user.h"
@@ -39,6 +40,7 @@ typedef struct
 static constexpr size_t k_bridge_pending_cap = 32;
 static bridge_inflight_t g_bridge_inflight{};
 static std::deque<bridge_cmd_req_t> g_bridge_pending;
+static DoorControl g_door_control;
 
 static void copy_cstr(char *dst, size_t dst_size, const char *src)
 {
@@ -547,6 +549,8 @@ static void evt_recv_loop(const std::string &log_base, int evt_ch)
             attendance_log_append_ipc_evt(log_base, ev, nullptr);
         }
 
+        g_door_control.handle_ipc_event(*ev);
+
         std::cout << "face_event: bridge event " << evt_kind_name(ev->evt_kind) << " score=" << ev->score
                   << " name=" << ev->name << std::endl;
         forward_bridge_event(ev);
@@ -717,6 +721,7 @@ static void stdin_loop()
 static void shutdown_event_process(int evt_ch, int reply_ch, const std::string &log_base)
 {
     g_evt_stop.store(true);
+    g_door_control.shutdown();
 
     auto wake_channel = [](int ch) {
         if (ch < 0)
@@ -752,6 +757,8 @@ int main(int argc, char **argv)
 {
     const std::string log_base = attendance_log_resolve_base_dir(argc, argv);
     attendance_log_append_meta(log_base, "face_event_started", nullptr);
+    if (!g_door_control.init(log_base))
+        std::cout << "face_event: door control init finished in state=" << g_door_control.state_name() << std::endl;
 
     int evt_ch = rt_channel_open(IPC_FACE_EVT_CHANNEL, O_CREAT);
     if (evt_ch < 0)
