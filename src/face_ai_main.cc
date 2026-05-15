@@ -886,20 +886,33 @@ int main(int argc, char **argv)
                                                      fas_register_eff_floor(fas_real_thresh));
                 if (det_results.size() == 1 && reply.num_faces >= 1 && reg_ok_live)
                 {
-                    std::string reg_name(hdr->register_name);
-                    cv::Mat snap_landscape;
+                    const FaceRecognitionInfo &reg_result = rec_results.front();
+                    if (reg_result.id >= 0)
                     {
-                        const int hh = static_cast<int>(hdr->tensor_h);
-                        const int ww = static_cast<int>(hdr->tensor_w);
-                        const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
-                        cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
-                        cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
-                        cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
-                        cv::merge(std::vector<cv::Mat>{mb, mg, mr}, snap_landscape);
+                        std::string reject_msg = "register rejected: face already registered";
+                        if (!reg_result.name.empty() && reg_result.name != "unknown")
+                            reject_msg += " (" + reg_result.name + ")";
+                        set_reply_op(&reply, IPC_OP_RESULT_FAIL, reject_msg.c_str());
+                        std::cout << "face_ai: register rejected (already registered): "
+                                  << (reg_result.name.empty() ? "<unnamed>" : reg_result.name) << std::endl;
                     }
-                    face_recg.database_add(reg_name, db_dir, snap_landscape);
-                    set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
-                    std::cout << "face_ai: register ok: " << reg_name << std::endl;
+                    else
+                    {
+                        std::string reg_name(hdr->register_name);
+                        cv::Mat snap_landscape;
+                        {
+                            const int hh = static_cast<int>(hdr->tensor_h);
+                            const int ww = static_cast<int>(hdr->tensor_w);
+                            const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
+                            cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
+                            cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
+                            cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
+                            cv::merge(std::vector<cv::Mat>{mb, mg, mr}, snap_landscape);
+                        }
+                        face_recg.database_add(reg_name, db_dir, snap_landscape);
+                        set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
+                        std::cout << "face_ai: register ok: " << reg_name << std::endl;
+                    }
                 }
                 else if (det_results.size() == 1 && fas && reply.num_faces >= 1 && !reg_ok_live)
                 {
