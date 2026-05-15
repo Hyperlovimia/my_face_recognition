@@ -17,6 +17,7 @@
 #define IPC_FACE_BRIDGE_SERVICE "face_bridge"
 #define IPC_FACE_BRIDGE_PORT 301u
 #define IPC_FACE_BRIDGE_MODULE 1u
+#define IPC_IMPORT_STAGE_DIR "/sharefs/face_bridge/import_staging"
 
 #define IPC_MAX_FACES 8
 #define IPC_NAME_MAX 64
@@ -29,6 +30,7 @@ typedef enum {
     IPC_CMD_DB_RESET = 2,
     IPC_CMD_REGISTER_COMMIT = 3,
     IPC_CMD_SHUTDOWN = 4,
+    IPC_CMD_IMPORT_IMAGE = 5,
 } ipc_cmd_t;
 
 /* ipc_ai_reply_t.status：成功为 IPC_STATUS_OK；错误应答若仍通过 reply shmid 返回则填非 0 */
@@ -127,6 +129,8 @@ typedef enum {
     IPC_BRIDGE_CMD_REGISTER_COMMIT = 6,
     /** 放弃注册并关闭预览小窗(对应 video state 6) */
     IPC_BRIDGE_CMD_REGISTER_CANCEL = 7,
+    /** Linux 小核扫描 TF 卡 staged 图片并逐张下发给 RT 导入 */
+    IPC_BRIDGE_CMD_IMPORT_FACES = 8,
 } ipc_bridge_cmd_t;
 
 typedef enum {

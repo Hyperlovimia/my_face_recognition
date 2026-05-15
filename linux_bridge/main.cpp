@@ -16,8 +16,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -55,6 +57,9 @@ constexpr size_t kMaxQueueDepth = 512;
 constexpr int kHeartbeatMinMs = 200;
 constexpr int kHeartbeatMaxMs = 120000;
 constexpr int kHeartbeatDefaultMs = 1000;
+constexpr const char *kImportSourceDir = "/mnt/tf/faces_import";
+constexpr size_t kImportErrorDetailLimit = 20;
+constexpr int kImportChildResultTimeoutMs = 120000;
 
 struct Config {
     std::string device_id = "k230-dev-01";
@@ -129,6 +134,13 @@ struct Runtime {
 
     /** serialize TF attendance JSONL writes from ipc callback thread */
     std::mutex attendance_sd_log_mu;
+    std::atomic<bool> import_active{false};
+
+    std::mutex internal_reply_mu;
+    std::condition_variable internal_reply_cv;
+    std::set<std::string> internal_requests;
+    std::map<std::string, bridge_cmd_result_t> internal_results;
+    std::atomic<uint64_t> internal_request_seq{0};
 };
 
 Runtime g_rt;
@@ -471,6 +483,130 @@ void publish_reply_mqtt(const std::string &request_id, const std::string &cmd_la
     enqueue_publish(topic_up_reply(), oss.str(), 1, false);
 }
 
+const char *bridge_cmd_name(int cmd);
+
+struct ImportErrorDetail {
+    std::string file;
+    std::string name;
+    std::string message;
+};
+
+std::string json_escape_bounded(const std::string &input, size_t max_items)
+{
+    if (input.size() <= max_items)
+        return json_escape(input);
+    return json_escape(input.substr(0, max_items));
+}
+
+std::string import_name_from_path(const fs::path &path)
+{
+    std::string name = trim(path.stem().string());
+    if (name.size() >= IPC_NAME_MAX)
+        name.resize(IPC_NAME_MAX - 1);
+    return name;
+}
+
+bool is_supported_import_extension(const fs::path &path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png";
+}
+
+std::string import_stage_file_path(const std::string &request_id)
+{
+    return std::string(IPC_IMPORT_STAGE_DIR) + "/" + request_id + ".img";
+}
+
+std::string next_internal_import_request_id()
+{
+    const uint64_t seq = g_rt.internal_request_seq.fetch_add(1) + 1;
+    return "imp_" + std::to_string(now_ms()) + "_" + std::to_string(seq);
+}
+
+void publish_local_result(const PendingCmd &cmd, bool ok, int count, const std::string &message,
+                          const std::string &extra_tail = "")
+{
+    if (cmd.source == PendingCmdSource::ui)
+    {
+        bridge_cmd_result_t result{};
+        result.magic = IPC_MAGIC;
+        result.cmd = cmd.cmd;
+        result.count = count;
+        result.ok = ok ? 1 : 0;
+        strncpy(result.request_id, cmd.request_id.c_str(), sizeof(result.request_id) - 1);
+        strncpy(result.message, message.c_str(), sizeof(result.message) - 1);
+        ui_on_bridge_result(result);
+        return;
+    }
+    publish_reply_mqtt(cmd.request_id, bridge_cmd_name(cmd.cmd), ok, count, message, extra_tail);
+}
+
+bool is_internal_request_id(const std::string &request_id)
+{
+    std::lock_guard<std::mutex> lk(g_rt.internal_reply_mu);
+    return g_rt.internal_requests.find(request_id) != g_rt.internal_requests.end();
+}
+
+void register_internal_request(const std::string &request_id)
+{
+    std::lock_guard<std::mutex> lk(g_rt.internal_reply_mu);
+    g_rt.internal_requests.insert(request_id);
+    g_rt.internal_results.erase(request_id);
+}
+
+bool take_internal_result(const std::string &request_id, bridge_cmd_result_t *out, int timeout_ms)
+{
+    if (!out)
+        return false;
+    std::unique_lock<std::mutex> lk(g_rt.internal_reply_mu);
+    const auto pred = [&] { return g_rt.internal_results.find(request_id) != g_rt.internal_results.end() || g_rt.stop.load(); };
+    if (!g_rt.internal_reply_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred))
+        return false;
+    auto it = g_rt.internal_results.find(request_id);
+    if (it == g_rt.internal_results.end())
+        return false;
+    *out = it->second;
+    g_rt.internal_results.erase(it);
+    g_rt.internal_requests.erase(request_id);
+    return true;
+}
+
+void stash_internal_result(const bridge_cmd_result_t &result)
+{
+    std::lock_guard<std::mutex> lk(g_rt.internal_reply_mu);
+    if (g_rt.internal_requests.find(result.request_id) == g_rt.internal_requests.end())
+        return;
+    g_rt.internal_results[result.request_id] = result;
+    g_rt.internal_reply_cv.notify_all();
+}
+
+std::string format_import_summary(int success_count, int total_count, int failed_count)
+{
+    std::ostringstream oss;
+    oss << "Imported " << success_count << "/" << total_count << " faces";
+    if (failed_count > 0)
+        oss << " (" << failed_count << " failed)";
+    return oss.str();
+}
+
+std::string build_import_reply_extra(int total_count, int failed_count, int db_count_after,
+                                     const std::vector<ImportErrorDetail> &errors)
+{
+    std::ostringstream oss;
+    oss << ",\"total\":" << total_count << ",\"failed\":" << failed_count << ",\"db_count_after\":" << db_count_after
+        << ",\"errors\":[";
+    for (size_t i = 0; i < errors.size(); ++i)
+    {
+        if (i != 0)
+            oss << ",";
+        oss << "{\"file\":\"" << json_escape(errors[i].file) << "\",\"name\":\"" << json_escape(errors[i].name)
+            << "\",\"message\":\"" << json_escape(errors[i].message) << "\"}";
+    }
+    oss << "]";
+    return oss.str();
+}
+
 struct FaceGalleryEntry {
     int slot = 0;
     std::string name;
@@ -703,6 +839,90 @@ void handle_attendance_log_fetch_local(const std::string &request_id, long max_b
                         truncated ? "ok (tail bytes truncated)" : "ok", extra.str());
 }
 
+bool ensure_import_stage_dir(std::string *error_out)
+{
+    std::error_code ec;
+    if (fs::exists(IPC_IMPORT_STAGE_DIR, ec))
+    {
+        if (ec || !fs::is_directory(IPC_IMPORT_STAGE_DIR, ec))
+        {
+            if (error_out)
+                *error_out = "import staging path is not a directory";
+            return false;
+        }
+        return true;
+    }
+    if (fs::create_directories(IPC_IMPORT_STAGE_DIR, ec))
+        return true;
+    if (!ec && fs::exists(IPC_IMPORT_STAGE_DIR))
+        return true;
+    if (error_out)
+        *error_out = "cannot create import staging dir";
+    return false;
+}
+
+std::vector<fs::path> scan_import_source_files(std::string *error_out)
+{
+    std::vector<fs::path> files;
+    std::error_code ec;
+    if (!fs::exists(kImportSourceDir, ec) || ec)
+    {
+        if (error_out)
+            *error_out = "import source dir not found";
+        return files;
+    }
+    if (!fs::is_directory(kImportSourceDir, ec) || ec)
+    {
+        if (error_out)
+            *error_out = "import source path is not a directory";
+        return files;
+    }
+
+    for (const auto &de : fs::directory_iterator(kImportSourceDir, ec))
+    {
+        if (ec)
+            break;
+        if (!de.is_regular_file(ec) || ec)
+            continue;
+        if (!is_supported_import_extension(de.path()))
+            continue;
+        files.push_back(de.path());
+    }
+    std::sort(files.begin(), files.end(), [](const fs::path &lhs, const fs::path &rhs) {
+        return lhs.filename().string() < rhs.filename().string();
+    });
+    if (files.empty() && error_out)
+        *error_out = "no importable images found";
+    return files;
+}
+
+bool copy_file_to_import_stage(const fs::path &src, const std::string &request_id, std::string *error_out)
+{
+    std::ifstream ifs(src, std::ios::binary);
+    if (!ifs)
+    {
+        if (error_out)
+            *error_out = "cannot open source image";
+        return false;
+    }
+    const std::string dst = import_stage_file_path(request_id);
+    std::ofstream ofs(dst, std::ios::binary | std::ios::trunc);
+    if (!ofs)
+    {
+        if (error_out)
+            *error_out = "cannot create staged image";
+        return false;
+    }
+    ofs << ifs.rdbuf();
+    if (!ofs.good())
+    {
+        if (error_out)
+            *error_out = "cannot write staged image";
+        return false;
+    }
+    return true;
+}
+
 bool pop_publish(PublishItem *out)
 {
     if (!out)
@@ -729,7 +949,20 @@ void enqueue_command(PendingCmd cmd)
     g_rt.cmd_cv.notify_one();
 }
 
-bool is_registration_or_reset_cmd(int cmd)
+bool is_library_write_cmd(int cmd);
+
+bool has_pending_library_write_cmd()
+{
+    std::lock_guard<std::mutex> lk(g_rt.cmd_mu);
+    for (const auto &cmd : g_rt.cmd_queue)
+    {
+        if (is_library_write_cmd(cmd.cmd))
+            return true;
+    }
+    return false;
+}
+
+bool is_library_write_cmd(int cmd)
 {
     switch (static_cast<ipc_bridge_cmd_t>(cmd))
     {
@@ -738,6 +971,7 @@ bool is_registration_or_reset_cmd(int cmd)
     case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
     case IPC_BRIDGE_CMD_REGISTER_COMMIT:
     case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+    case IPC_BRIDGE_CMD_IMPORT_FACES:
         return true;
     default:
         return false;
@@ -773,6 +1007,8 @@ const char *bridge_cmd_name(int cmd)
         return "register_commit";
     case IPC_BRIDGE_CMD_REGISTER_CANCEL:
         return "register_cancel";
+    case IPC_BRIDGE_CMD_IMPORT_FACES:
+        return "import_faces";
     case IPC_BRIDGE_CMD_SHUTDOWN:
         return "shutdown";
     default:
@@ -796,6 +1032,8 @@ bool bridge_cmd_from_string(const std::string &cmd, int *out)
         *out = IPC_BRIDGE_CMD_REGISTER_COMMIT;
     else if (cmd == "register_cancel" || cmd == "register-cancel")
         *out = IPC_BRIDGE_CMD_REGISTER_CANCEL;
+    else if (cmd == "import_faces" || cmd == "import-faces")
+        *out = IPC_BRIDGE_CMD_IMPORT_FACES;
     else if (cmd == "shutdown")
         *out = IPC_BRIDGE_CMD_SHUTDOWN;
     else
@@ -1137,6 +1375,194 @@ static void attendance_wall_clock_prime_from_pc_async()
         .detach();
 }
 
+void cancel_internal_request(const std::string &request_id)
+{
+    std::lock_guard<std::mutex> lk(g_rt.internal_reply_mu);
+    g_rt.internal_requests.erase(request_id);
+    g_rt.internal_results.erase(request_id);
+}
+
+bool dispatch_bridge_command_ack(const PendingCmd &cmd, std::string *error_out)
+{
+    const int ipc_id = g_rt.ipc_id.load();
+    if (ipc_id < 0 || !g_rt.rt_connected.load() || !kd_ipcmsg_is_connect(ipc_id))
+    {
+        if (error_out)
+            *error_out = "rt bridge disconnected";
+        return false;
+    }
+
+    bridge_cmd_req_t req{};
+    req.magic = IPC_MAGIC;
+    req.cmd = static_cast<int32_t>(cmd.cmd);
+    strncpy(req.request_id, cmd.request_id.c_str(), sizeof(req.request_id) - 1);
+    strncpy(req.name, cmd.name.c_str(), sizeof(req.name) - 1);
+
+    k_ipcmsg_message_t *msg =
+        kd_ipcmsg_create_message(IPC_FACE_BRIDGE_MODULE, IPC_BRIDGE_MSG_CMD_REQ, &req, sizeof(req));
+    if (!msg)
+    {
+        if (error_out)
+            *error_out = "failed to allocate ipc message";
+        return false;
+    }
+
+    k_ipcmsg_message_t *resp = nullptr;
+    const k_s32 ret = kd_ipcmsg_send_sync(ipc_id, msg, &resp, g_rt.cfg.ipc_sync_timeout_ms);
+    kd_ipcmsg_destroy_message(msg);
+
+    if (ret != K_SUCCESS || !resp)
+    {
+        if (error_out)
+            *error_out = (ret == K_IPCMSG_ETIMEOUT) ? "bridge ack timeout" : "bridge ack failed";
+        if (resp)
+            kd_ipcmsg_destroy_message(resp);
+        return false;
+    }
+
+    if (resp->u32BodyLen < sizeof(bridge_cmd_ack_t) || !resp->pBody)
+    {
+        if (error_out)
+            *error_out = "invalid bridge ack";
+        kd_ipcmsg_destroy_message(resp);
+        return false;
+    }
+
+    bridge_cmd_ack_t ack{};
+    memcpy(&ack, resp->pBody, sizeof(ack));
+    kd_ipcmsg_destroy_message(resp);
+
+    if (ack.magic != IPC_MAGIC)
+    {
+        if (error_out)
+            *error_out = "bridge ack magic mismatch";
+        return false;
+    }
+
+    mark_rt_seen();
+    if (!ack.accepted)
+    {
+        if (error_out)
+            *error_out = ack.reason[0] ? ack.reason : "bridge rejected";
+        return false;
+    }
+
+    std::cout << "face_netd: accepted command " << bridge_cmd_name(cmd.cmd) << " request_id=" << cmd.request_id
+              << std::endl;
+    return true;
+}
+
+void record_import_error(std::vector<ImportErrorDetail> *errors, const fs::path &file_path, const std::string &name,
+                         const std::string &message)
+{
+    if (!errors || errors->size() >= kImportErrorDetailLimit)
+        return;
+    errors->push_back(ImportErrorDetail{file_path.filename().string(), name, message});
+}
+
+void handle_import_faces_local(const PendingCmd &cmd)
+{
+    if (g_rt.import_active.exchange(true))
+    {
+        publish_local_result(cmd, false, 0, "Import already in progress");
+        return;
+    }
+
+    const auto import_done = [] { g_rt.import_active.store(false); };
+
+    std::string stage_error;
+    if (!ensure_import_stage_dir(&stage_error))
+    {
+        import_done();
+        publish_local_result(cmd, false, 0, stage_error.empty() ? "cannot prepare import staging dir" : stage_error);
+        return;
+    }
+
+    std::string scan_error;
+    const std::vector<fs::path> files = scan_import_source_files(&scan_error);
+    if (files.empty())
+    {
+        import_done();
+        publish_local_result(cmd, false, 0, scan_error.empty() ? "no importable images found" : scan_error,
+                             build_import_reply_extra(0, 0, g_rt.db_count.load(), {}));
+        return;
+    }
+
+    const int total_count = static_cast<int>(files.size());
+    int success_count = 0;
+    int failed_count = 0;
+    std::vector<ImportErrorDetail> errors;
+
+    for (size_t idx = 0; idx < files.size(); ++idx)
+    {
+        const fs::path &file_path = files[idx];
+        const std::string name = import_name_from_path(file_path);
+        ui_on_local_import_progress(cmd.request_id, static_cast<int>(idx + 1), total_count);
+
+        if (name.empty())
+        {
+            ++failed_count;
+            record_import_error(&errors, file_path, name, "empty name after trimming filename");
+            continue;
+        }
+
+        const std::string child_request_id = next_internal_import_request_id();
+        register_internal_request(child_request_id);
+
+        std::string copy_error;
+        if (!copy_file_to_import_stage(file_path, child_request_id, &copy_error))
+        {
+            cancel_internal_request(child_request_id);
+            ++failed_count;
+            record_import_error(&errors, file_path, name, copy_error.empty() ? "cannot stage import file" : copy_error);
+            continue;
+        }
+
+        PendingCmd child_cmd{};
+        child_cmd.request_id = child_request_id;
+        child_cmd.cmd = IPC_BRIDGE_CMD_IMPORT_FACES;
+        child_cmd.name = name;
+        child_cmd.source = PendingCmdSource::remote;
+
+        std::string dispatch_error;
+        if (!dispatch_bridge_command_ack(child_cmd, &dispatch_error))
+        {
+            cancel_internal_request(child_request_id);
+            std::error_code rm_ec;
+            fs::remove(import_stage_file_path(child_request_id), rm_ec);
+            ++failed_count;
+            record_import_error(&errors, file_path, name,
+                                dispatch_error.empty() ? "cannot dispatch import request" : dispatch_error);
+            continue;
+        }
+
+        bridge_cmd_result_t child_result{};
+        if (!take_internal_result(child_request_id, &child_result, kImportChildResultTimeoutMs))
+        {
+            ++failed_count;
+            record_import_error(&errors, file_path, name, "timed out waiting for import result");
+            continue;
+        }
+
+        if (child_result.ok)
+            ++success_count;
+        else
+        {
+            ++failed_count;
+            record_import_error(&errors, file_path, name,
+                                child_result.message[0] ? child_result.message : "import failed");
+        }
+    }
+
+    const int db_count_after = static_cast<int>(scan_face_db_dir(g_rt.cfg.face_db_dir).size());
+    g_rt.db_count.store(db_count_after);
+    import_done();
+
+    const bool ok = success_count > 0;
+    const std::string summary = format_import_summary(success_count, total_count, failed_count);
+    publish_local_result(cmd, ok, success_count, summary, build_import_reply_extra(total_count, failed_count, db_count_after, errors));
+}
+
 void publish_reply_failure(const std::string &request_id, int cmd, const std::string &message)
 {
     publish_reply_mqtt(request_id, bridge_cmd_name(cmd), false, -1, message, "");
@@ -1144,18 +1570,7 @@ void publish_reply_failure(const std::string &request_id, int cmd, const std::st
 
 void publish_reply_failure(const PendingCmd &cmd, const std::string &message)
 {
-    if (cmd.source == PendingCmdSource::ui)
-    {
-        bridge_cmd_result_t result{};
-        result.magic = IPC_MAGIC;
-        result.cmd = cmd.cmd;
-        result.ok = 0;
-        strncpy(result.request_id, cmd.request_id.c_str(), sizeof(result.request_id) - 1);
-        strncpy(result.message, message.c_str(), sizeof(result.message) - 1);
-        ui_on_bridge_result(result);
-        return;
-    }
-    publish_reply_failure(cmd.request_id, cmd.cmd, message);
+    publish_local_result(cmd, false, -1, message);
 }
 
 /** Same JSONL shape as RT face_event; written under attendance_log_base when TF is mounted on Linux.
@@ -1265,6 +1680,12 @@ void handle_bridge_event(const bridge_event_t &ev)
 
 void handle_bridge_result(const bridge_cmd_result_t &result)
 {
+    if (is_internal_request_id(result.request_id))
+    {
+        stash_internal_result(result);
+        return;
+    }
+
     if (result.ok && result.cmd == IPC_BRIDGE_CMD_DB_COUNT)
         g_rt.db_count.store(result.count);
     if (result.ok && result.cmd == IPC_BRIDGE_CMD_DB_RESET)
@@ -1435,66 +1856,18 @@ void command_worker_thread()
         if (!pop_command_blocking(&cmd))
             break;
 
-        const int ipc_id = g_rt.ipc_id.load();
-        if (ipc_id < 0 || !g_rt.rt_connected.load() || !kd_ipcmsg_is_connect(ipc_id))
+        if (cmd.cmd == IPC_BRIDGE_CMD_IMPORT_FACES)
         {
-            publish_reply_failure(cmd, "rt bridge disconnected");
+            handle_import_faces_local(cmd);
+            continue;
+        }
+
+        std::string dispatch_error;
+        if (!dispatch_bridge_command_ack(cmd, &dispatch_error))
+        {
+            publish_reply_failure(cmd, dispatch_error.empty() ? "rt bridge disconnected" : dispatch_error);
             g_rt.status_dirty.store(true);
-            continue;
         }
-
-        bridge_cmd_req_t req{};
-        req.magic = IPC_MAGIC;
-        req.cmd = static_cast<int32_t>(cmd.cmd);
-        strncpy(req.request_id, cmd.request_id.c_str(), sizeof(req.request_id) - 1);
-        strncpy(req.name, cmd.name.c_str(), sizeof(req.name) - 1);
-
-        k_ipcmsg_message_t *msg = kd_ipcmsg_create_message(IPC_FACE_BRIDGE_MODULE, IPC_BRIDGE_MSG_CMD_REQ, &req,
-                                                           sizeof(req));
-        if (!msg)
-        {
-            publish_reply_failure(cmd, "failed to allocate ipc message");
-            continue;
-        }
-
-        k_ipcmsg_message_t *resp = nullptr;
-        const k_s32 ret = kd_ipcmsg_send_sync(ipc_id, msg, &resp, g_rt.cfg.ipc_sync_timeout_ms);
-        kd_ipcmsg_destroy_message(msg);
-
-        if (ret != K_SUCCESS || !resp)
-        {
-            publish_reply_failure(cmd, ret == K_IPCMSG_ETIMEOUT ? "bridge ack timeout" : "bridge ack failed");
-            if (resp)
-                kd_ipcmsg_destroy_message(resp);
-            continue;
-        }
-
-        if (resp->u32BodyLen < sizeof(bridge_cmd_ack_t) || !resp->pBody)
-        {
-            publish_reply_failure(cmd, "invalid bridge ack");
-            kd_ipcmsg_destroy_message(resp);
-            continue;
-        }
-
-        bridge_cmd_ack_t ack{};
-        memcpy(&ack, resp->pBody, sizeof(ack));
-        kd_ipcmsg_destroy_message(resp);
-
-        if (ack.magic != IPC_MAGIC)
-        {
-            publish_reply_failure(cmd, "bridge ack magic mismatch");
-            continue;
-        }
-
-        mark_rt_seen();
-        if (!ack.accepted)
-        {
-            publish_reply_failure(cmd, ack.reason[0] ? ack.reason : "bridge rejected");
-            continue;
-        }
-
-        std::cout << "face_netd: accepted command " << bridge_cmd_name(cmd.cmd) << " request_id=" << cmd.request_id
-                  << std::endl;
     }
 }
 
@@ -1573,9 +1946,11 @@ void parse_and_enqueue_command(mg_str json)
         publish_reply_failure(request_id_s, IPC_BRIDGE_CMD_NONE, "unsupported command");
         return;
     }
-    if (ui_is_session_active() && is_registration_or_reset_cmd(bridge_cmd))
+    if ((ui_is_session_active() || g_rt.import_active.load() || has_pending_library_write_cmd()) &&
+        is_library_write_cmd(bridge_cmd))
     {
-        publish_reply_failure(request_id_s, bridge_cmd, "registration session busy");
+        publish_reply_failure(request_id_s, bridge_cmd,
+                              g_rt.import_active.load() ? "import already in progress" : "library write command busy");
         return;
     }
     if (bridge_cmd == IPC_BRIDGE_CMD_REGISTER_CURRENT && name_s.empty())
@@ -1947,6 +2322,14 @@ int main(int argc, char **argv)
     ui_cfg.preview_timeout_ms = g_rt.cfg.ui_preview_timeout_ms;
     ui_cfg.overlay_profile = g_rt.cfg.ui_overlay_profile;
     ui_cfg.submit_command = [](const std::string &request_id, int cmd, const std::string &name) {
+        if (is_library_write_cmd(cmd) &&
+            (g_rt.import_active.load() || has_pending_library_write_cmd() || ui_is_session_active()))
+        {
+            PendingCmd rejected{request_id, cmd, name, PendingCmdSource::ui};
+            publish_local_result(rejected, false, -1,
+                                 g_rt.import_active.load() ? "Import already in progress" : "Library write command busy");
+            return;
+        }
         enqueue_command(PendingCmd{request_id, cmd, name, PendingCmdSource::ui});
     };
     ui_cfg.log_message = [](const std::string &message) { std::cout << message << std::endl; };

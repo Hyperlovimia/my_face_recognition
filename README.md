@@ -343,6 +343,15 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_p
 docker compose up --build
 ```
 
+如果 server_pc 内的文件有所更改，执行
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+
+docker compose down
+docker compose build --no-cache face-web
+docker compose up -d --force-recreate
+```
+
 如果电脑端运行在 WSL / Docker 中，还必须在 Windows 管理员 PowerShell 中额外执行：
 
 ```powershell

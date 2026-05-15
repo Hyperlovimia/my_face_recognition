@@ -578,7 +578,7 @@ int main(int argc, char **argv)
             reply.num_faces = 0;
             set_reply_op(&reply, IPC_OP_RESULT_OK, "database reset");
         }
-        else if (hdr->cmd == IPC_CMD_INFER || hdr->cmd == IPC_CMD_REGISTER_COMMIT)
+        else if (hdr->cmd == IPC_CMD_INFER || hdr->cmd == IPC_CMD_REGISTER_COMMIT || hdr->cmd == IPC_CMD_IMPORT_IMAGE)
         {
             size_t expect = (size_t)hdr->tensor_c * hdr->tensor_h * hdr->tensor_w;
             if (hdr->frame_bytes != expect || hdr->frame_bytes == 0)
@@ -665,7 +665,7 @@ int main(int argc, char **argv)
                 const float det_thresh_cfg = face_det.det_conf_thresh();
                 const float det_weak_floor = (std::max)(0.24f, det_thresh_cfg * 0.68f);
                 const bool det_weak =
-                    (hdr->cmd != IPC_CMD_REGISTER_COMMIT) && (det_results[i].score < det_weak_floor);
+                    (hdr->cmd == IPC_CMD_INFER) && (det_results[i].score < det_weak_floor);
                 const bool suppress_infer_evt = det_weak;
 
                 FaceRecognitionInfo recg_result;
@@ -732,7 +732,7 @@ int main(int argc, char **argv)
                     }
 
                     const bool skip_recg_infer =
-                        fas && !is_live &&
+                        fas && !is_live && hdr->cmd != IPC_CMD_IMPORT_IMAGE &&
                         !(hdr->cmd == IPC_CMD_REGISTER_COMMIT &&
                           live_real >= fas_register_eff_floor(fas_real_thresh));
 
@@ -910,6 +910,39 @@ int main(int argc, char **argv)
                 {
                     set_reply_op(&reply, IPC_OP_RESULT_FAIL, "register failed: need exactly one face");
                     std::cout << "face_ai: register failed (need exactly one face)\n";
+                }
+            }
+            else if (hdr->cmd == IPC_CMD_IMPORT_IMAGE)
+            {
+                if (det_results.size() == 1 && reply.num_faces >= 1)
+                {
+                    std::string reg_name(hdr->register_name);
+                    cv::Mat import_bgr;
+                    {
+                        const int hh = static_cast<int>(hdr->tensor_h);
+                        const int ww = static_cast<int>(hdr->tensor_w);
+                        const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
+                        cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
+                        cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
+                        cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
+                        cv::merge(std::vector<cv::Mat>{mb, mg, mr}, import_bgr);
+                    }
+                    face_recg.database_add_import(reg_name, db_dir, import_bgr);
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_OK, "import ok");
+                    std::cout << "face_ai: import ok: " << reg_name << std::endl;
+                }
+                else if (det_results.empty())
+                {
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "import failed: need exactly one face");
+                    std::cout << "face_ai: import failed (no face)\n";
+                }
+                else
+                {
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "import failed: need exactly one face");
+                    std::cout << "face_ai: import failed (multiple faces)\n";
                 }
             }
         }

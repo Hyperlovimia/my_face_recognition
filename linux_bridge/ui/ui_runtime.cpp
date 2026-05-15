@@ -179,12 +179,19 @@ void on_delete_click(lv_event_t *)
 
 void on_import_click(lv_event_t *)
 {
-    std::lock_guard<std::mutex> lk(g_ui.mu);
-    if (g_ui.session != UiSessionState::idle)
-        return;
-    g_ui.status_text = "Import is not available in this project";
-    g_ui.last_activity_ms = monotonic_ms();
-    g_ui.dirty = true;
+    bool can_submit = false;
+    {
+        std::lock_guard<std::mutex> lk(g_ui.mu);
+        if (g_ui.session == UiSessionState::idle && g_ui.cfg.submit_command && !g_ui.active)
+        {
+            g_ui.status_text = "Importing 0/0...";
+            g_ui.last_activity_ms = monotonic_ms();
+            g_ui.dirty = true;
+            can_submit = true;
+        }
+    }
+    if (can_submit)
+        submit_local_command(IPC_BRIDGE_CMD_IMPORT_FACES, "");
 }
 
 void on_cancel_click(lv_event_t *)
@@ -353,16 +360,25 @@ void create_edit_screen()
     lv_obj_align_to(g_name_ta, g_keyboard, LV_ALIGN_OUT_TOP_MID, 0, -10);
 }
 
-void apply_snapshot_to_ui(UiSessionState session, const std::string &status, const std::string &request_id)
+void apply_snapshot_to_ui(UiSessionState session, const std::string &status, const std::string &request_id, bool active)
 {
     if (session == UiSessionState::idle)
     {
         if (lv_scr_act() != g_main_screen)
             lv_scr_load(g_main_screen);
         lv_label_set_text(g_main_status, status.c_str());
-        lv_obj_clear_state(g_signup_btn, LV_STATE_DISABLED);
-        lv_obj_clear_state(g_import_btn, LV_STATE_DISABLED);
-        lv_obj_clear_state(g_delete_btn, LV_STATE_DISABLED);
+        if (active)
+        {
+            lv_obj_add_state(g_signup_btn, LV_STATE_DISABLED);
+            lv_obj_add_state(g_import_btn, LV_STATE_DISABLED);
+            lv_obj_add_state(g_delete_btn, LV_STATE_DISABLED);
+        }
+        else
+        {
+            lv_obj_clear_state(g_signup_btn, LV_STATE_DISABLED);
+            lv_obj_clear_state(g_import_btn, LV_STATE_DISABLED);
+            lv_obj_clear_state(g_delete_btn, LV_STATE_DISABLED);
+        }
         return;
     }
 
@@ -459,6 +475,7 @@ void ui_thread_main()
         std::string request_id;
         bool have_shared_info = false;
         bridge_ui_shared_info_t shared_info{};
+        bool active = false;
         {
             std::lock_guard<std::mutex> lk(g_ui.mu);
             session = g_ui.session;
@@ -466,6 +483,7 @@ void ui_thread_main()
             request_id = g_ui.active_request_id;
             g_ui.dirty = false;
             have_shared_info = g_ui.have_shared_info;
+            active = g_ui.active;
             if (have_shared_info)
                 shared_info = g_ui.shared_info;
             if (!have_shared_info && !g_ui.logged_waiting_for_surface)
@@ -519,7 +537,7 @@ void ui_thread_main()
 
         if (!status.empty() || g_last_session != session)
         {
-            apply_snapshot_to_ui(session, status, request_id);
+            apply_snapshot_to_ui(session, status, request_id, active);
             g_last_session = session;
         }
 
@@ -601,6 +619,11 @@ void ui_on_bridge_result(const bridge_cmd_result_t &result)
         set_idle_status_locked(result.message[0] ? result.message
                                                  : (result.ok ? "Database cleared" : "Database clear failed"));
     }
+    else if (cmd == IPC_BRIDGE_CMD_IMPORT_FACES)
+    {
+        set_idle_status_locked(result.message[0] ? result.message
+                                                 : (result.ok ? "Import complete" : "Import failed"));
+    }
 }
 
 void ui_on_bridge_event(const bridge_event_t &ev)
@@ -629,6 +652,16 @@ void ui_on_shared_info(const bridge_ui_shared_info_t &info)
     g_ui.shared_info = info;
     g_ui.have_shared_info = true;
     g_ui.logged_waiting_for_surface = false;
+    g_ui.dirty = true;
+}
+
+void ui_on_local_import_progress(const std::string &request_id, int current, int total)
+{
+    std::lock_guard<std::mutex> lk(g_ui.mu);
+    if (g_ui.active_request_id != request_id)
+        return;
+    g_ui.status_text = "Importing " + std::to_string(current) + "/" + std::to_string(total) + "...";
+    g_ui.last_activity_ms = monotonic_ms();
     g_ui.dirty = true;
 }
 

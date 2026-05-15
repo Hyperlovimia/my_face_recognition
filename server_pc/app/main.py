@@ -421,6 +421,8 @@ class FaceWebState:
             db_count = 0
         elif ok and cmd == "db_face_list":
             db_count = count
+        elif cmd == "import_faces":
+            db_count = int(payload.get("db_count_after", row["db_count"] if row else -1))
         else:
             db_count = int(row["db_count"]) if row else -1
         self._upsert_device(
@@ -772,6 +774,11 @@ async def api_cmd_register_commit(device_id: str, body: RegisterCurrentBody) -> 
 @app.post("/api/devices/{device_id}/commands/register-cancel", status_code=202)
 async def api_cmd_register_cancel(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "register_cancel")
+
+
+@app.post("/api/devices/{device_id}/commands/import-faces", status_code=202)
+async def api_cmd_import_faces(device_id: str) -> dict[str, Any]:
+    return state.publish_command(device_id, "import_faces")
 
 
 @app.post("/api/devices/{device_id}/commands/shutdown", status_code=202)

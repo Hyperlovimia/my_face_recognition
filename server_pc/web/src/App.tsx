@@ -268,7 +268,7 @@ export function App() {
         if (msg.type === "reply") {
           const p = msg.payload as Record<string, unknown>;
           const cmd = typeof p.cmd === "string" ? p.cmd : "";
-          if (cmd === "db_reset") {
+          if (cmd === "db_reset" || cmd === "import_faces") {
             await syncBoardFaceForDevice(msg.device_id);
             return;
           }
@@ -521,6 +521,18 @@ export function App() {
                         <SlIcon name="person-plus" slot="prefix" />
                         注册人脸（抓拍预览）
                       </SlButton>
+
+                      <button
+                        type="button"
+                        className="btn--primary"
+                        style={{ width: "100%" }}
+                        disabled={!selectedDevice}
+                        onClick={() => {
+                          void postCmd("import-faces");
+                        }}
+                      >
+                        导入 TF 人脸
+                      </button>
 
                       <button
                         type="button"

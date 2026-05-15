@@ -5,12 +5,15 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "ipc_osd_draw.h"
@@ -22,6 +25,8 @@
 #include "setting.h"
 
 namespace {
+
+namespace fs = std::filesystem;
 
 /* 与 main.cc 的单进程分支保持一致：OSD 消费 ARGB8888 字节序，
  * 且当前视频管线的三通道语义是 RGB 而非 BGR，故逐像素手工重排。 */
@@ -70,6 +75,65 @@ void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
 
     const cv::Rect roi(preview_padding, preview_padding, preview_width, preview_height);
     resized_preview_argb.copyTo(draw_frame(roi));
+}
+
+std::string import_stage_file_path(const char *request_id)
+{
+    if (!request_id || request_id[0] == '\0')
+        return {};
+    return std::string(IPC_IMPORT_STAGE_DIR) + "/" + request_id + ".img";
+}
+
+bool read_binary_file_all(const std::string &path, std::vector<uint8_t> *out)
+{
+    if (!out)
+        return false;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (buf.empty())
+        return false;
+    *out = std::move(buf);
+    return true;
+}
+
+cv::Mat letterbox_bgr_to_ai_frame(const cv::Mat &src_bgr)
+{
+    cv::Mat canvas(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3, cv::Scalar(114, 114, 114));
+    if (src_bgr.empty() || src_bgr.cols <= 0 || src_bgr.rows <= 0)
+        return canvas;
+
+    const double scale_x = static_cast<double>(AI_FRAME_WIDTH) / static_cast<double>(src_bgr.cols);
+    const double scale_y = static_cast<double>(AI_FRAME_HEIGHT) / static_cast<double>(src_bgr.rows);
+    const double scale = std::min(scale_x, scale_y);
+    const int resized_w = std::max(1, static_cast<int>(src_bgr.cols * scale));
+    const int resized_h = std::max(1, static_cast<int>(src_bgr.rows * scale));
+
+    cv::Mat resized;
+    cv::resize(src_bgr, resized, cv::Size(resized_w, resized_h));
+    const int ofs_x = (AI_FRAME_WIDTH - resized_w) / 2;
+    const int ofs_y = (AI_FRAME_HEIGHT - resized_h) / 2;
+    resized.copyTo(canvas(cv::Rect(ofs_x, ofs_y, resized_w, resized_h)));
+    return canvas;
+}
+
+std::vector<uint8_t> bgr_mat_to_chw_rgb(const cv::Mat &bgr)
+{
+    std::vector<uint8_t> chw_vec;
+    if (bgr.empty())
+        return chw_vec;
+
+    const size_t plane_bytes = static_cast<size_t>(bgr.rows) * static_cast<size_t>(bgr.cols);
+    chw_vec.reserve(plane_bytes * 3u);
+    std::vector<cv::Mat> bgr_channels(3);
+    cv::split(bgr, bgr_channels);
+    for (int i = 2; i >= 0; --i)
+    {
+        const std::vector<uint8_t> data = std::vector<uint8_t>(bgr_channels[i].reshape(1, 1));
+        chw_vec.insert(chw_vec.end(), data.begin(), data.end());
+    }
+    return chw_vec;
 }
 
 }  // namespace
@@ -160,6 +224,15 @@ static const char *register_commit_reply_message(const ipc_ai_reply_t &r, bool r
     if (r.op_message[0] != '\0')
         return r.op_message;
     return rpc_ok ? "register rejected" : "register rpc failed";
+}
+
+static const char *import_image_reply_message(const ipc_ai_reply_t &r, bool rpc_ok)
+{
+    if (rpc_ok && r.op_result == IPC_OP_RESULT_OK)
+        return default_op_message(r, "import processed");
+    if (r.op_message[0] != '\0')
+        return r.op_message;
+    return rpc_ok ? "import rejected" : "import rpc failed";
 }
 
 static bool is_remote_ctrl(const ipc_video_ctrl_t &ctrl)
@@ -949,6 +1022,53 @@ static void video_ipc_loop(int debug_mode)
             if (!register_preview_src.empty())
                 register_preview_src.release();
             register_preview_deadline = std::chrono::steady_clock::time_point::min();
+        }
+        else if (state == 7)
+        {
+            const std::string stage_path = import_stage_file_path(ctrl_snapshot.request_id);
+            if (stage_path.empty())
+            {
+                send_video_reply(ctrl_snapshot, false, -1, "import staging request id missing");
+                cur_state = 0;
+                display_state = 0;
+            }
+            else
+            {
+                std::vector<uint8_t> raw;
+                if (!read_binary_file_all(stage_path, &raw))
+                {
+                    send_video_reply(ctrl_snapshot, false, -1, "import staged image missing or empty");
+                    cur_state = 0;
+                    display_state = 0;
+                }
+                else
+                {
+                    cv::Mat decoded = cv::imdecode(raw, cv::IMREAD_COLOR);
+                    if (decoded.empty())
+                    {
+                        send_video_reply(ctrl_snapshot, false, -1, "import staged image decode failed");
+                        cur_state = 0;
+                        display_state = 0;
+                    }
+                    else
+                    {
+                        const cv::Mat ai_input_bgr = letterbox_bgr_to_ai_frame(decoded);
+                        const std::vector<uint8_t> chw_vec = bgr_mat_to_chw_rgb(ai_input_bgr);
+                        ipc_ai_reply_t r{};
+                        const char *import_name =
+                            ctrl_snapshot.register_name[0] ? ctrl_snapshot.register_name : register_name.c_str();
+                        const bool ok =
+                            rpc_ai_sync(ai_ch, IPC_CMD_IMPORT_IMAGE, chw_vec.data(), chw_vec.size(), AI_FRAME_CHANNEL,
+                                        AI_FRAME_HEIGHT, AI_FRAME_WIDTH, import_name, &r);
+                        send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, ok ? r.count : -1,
+                                         import_image_reply_message(r, ok));
+                        cur_state = 0;
+                        display_state = 0;
+                    }
+                }
+                std::error_code rm_ec;
+                fs::remove(stage_path, rm_ec);
+            }
         }
 
         /* 须在 state 1–6 可能 release 了 register_preview_src 之后计算，避免同一帧仍用已失效的 preview_active 去 resize 空图 */

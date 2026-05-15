@@ -106,6 +106,12 @@ public:
     void database_add(std::string& name, char* db_path, const cv::Mat &full_isp_bgr_landscape);
 
     /**
+     * @brief 从静态导入图片入库：保存特征与原始导入图缩放后的 JPEG，不额外做 camera/OSD 方向旋转
+     * @param import_bgr 已解码的 BGR 图像；为空时回退到 aligned_face_to_bgr
+     */
+    void database_add_import(std::string& name, char* db_path, const cv::Mat &import_bgr);
+
+    /**
      * @brief 人脸数据库重置，清除所有数据库人脸特征
      * @param db_pth 数据库目录
      * @return None

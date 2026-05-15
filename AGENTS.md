@@ -51,9 +51,9 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 > `build_app.sh` 会优先使用 `k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin`
 > 编译完成后，可在 `k230_bin/` 目录下看到可执行程序与配套测试文件
 
-## 调试流程
+### Web 前端
 
-小核通过 ssh 建立连接，大核目前只能通过串口建立连接
 ```sh
-ssh root@192.168.230.8  # 连接 linux 小核
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+docker compose up --build
 ```

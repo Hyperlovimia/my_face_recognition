@@ -160,6 +160,8 @@ static const char *bridge_cmd_name(int32_t cmd)
         return "register_commit";
     case IPC_BRIDGE_CMD_REGISTER_CANCEL:
         return "register_cancel";
+    case IPC_BRIDGE_CMD_IMPORT_FACES:
+        return "import_faces";
     case IPC_BRIDGE_CMD_SHUTDOWN:
         return "shutdown";
     default:
@@ -198,6 +200,8 @@ static int bridge_cmd_to_state(ipc_bridge_cmd_t cmd)
         return 3;
     case IPC_BRIDGE_CMD_REGISTER_CANCEL:
         return 6;
+    case IPC_BRIDGE_CMD_IMPORT_FACES:
+        return 7;
     default:
         return 0;
     }
@@ -214,6 +218,7 @@ static bool is_supported_bridge_cmd(int32_t c)
     case IPC_BRIDGE_CMD_REGISTER_PREVIEW:
     case IPC_BRIDGE_CMD_REGISTER_COMMIT:
     case IPC_BRIDGE_CMD_REGISTER_CANCEL:
+    case IPC_BRIDGE_CMD_IMPORT_FACES:
         return true;
     default:
         return false;

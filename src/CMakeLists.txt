@@ -30,7 +30,7 @@ target_link_libraries(face_recognition.elf ${nncase_link} ${mpp_link} ${opencv_l
 
 # 三进程：视频采集与显示
 add_executable(face_video.elf face_video_main.cc ipc_shm.cc ipc_lwp_syscall.c ipc_osd_draw.cc video_pipeline.cc)
-target_link_libraries(face_video.elf ${mpp_link} ${opencv_link})
+target_link_libraries(face_video.elf ${nncase_link} ${mpp_link} ${opencv_link})
 
 # 三进程：AI 推理（含可选活体 FaceAntiSpoof）
 add_executable(face_ai.elf ${face_ai_src})
