@@ -427,8 +427,8 @@ bool resolve_profile(const std::string &profile, k230_ui_port_config *cfg)
     cfg->logical_height = static_cast<int>(UI_OVERLAY_SHARED_HEIGHT);
     cfg->screen_width = 1080;
     cfg->screen_height = 1920;
-    cfg->flip_x = true;
-    cfg->flip_y = true;
+    cfg->flip_x = false;
+    cfg->flip_y = false;
     return true;
 }
 

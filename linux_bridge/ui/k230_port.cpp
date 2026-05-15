@@ -381,6 +381,8 @@ void map_touch_point(int *x, int *y)
 
     int mx = *x;
     int my = *y;
+    const int logical_width = std::max(1, g_port.cfg.logical_width);
+    const int logical_height = std::max(1, g_port.cfg.logical_height);
 
     const int raw_min_x = g_port.have_abs_x_range ? g_port.raw_min_x : 0;
     const int raw_max_x = g_port.have_abs_x_range ? g_port.raw_max_x : (g_port.cfg.screen_width - 1);
@@ -394,14 +396,27 @@ void map_touch_point(int *x, int *y)
     if (g_port.cfg.flip_y)
         my = raw_max_y - (my - raw_min_y);
 
+    const bool raw_already_matches_logical =
+        (mx >= 0 && mx <= logical_width + 8) && (my >= 0 && my <= logical_height + 8) &&
+        ((raw_span_x > logical_width * 2) || (raw_span_y > logical_height * 2));
+
+    if (raw_already_matches_logical)
+    {
+        mx = std::max(0, std::min(mx, logical_width - 1));
+        my = std::max(0, std::min(my, logical_height - 1));
+        *x = mx;
+        *y = my;
+        return;
+    }
+
     mx = std::max(raw_min_x, std::min(mx, raw_max_x));
     my = std::max(raw_min_y, std::min(my, raw_max_y));
 
-    mx = static_cast<int>((static_cast<int64_t>(mx - raw_min_x) * (g_port.cfg.logical_width - 1)) / raw_span_x);
-    my = static_cast<int>((static_cast<int64_t>(my - raw_min_y) * (g_port.cfg.logical_height - 1)) / raw_span_y);
+    mx = static_cast<int>((static_cast<int64_t>(mx - raw_min_x) * (logical_width - 1)) / raw_span_x);
+    my = static_cast<int>((static_cast<int64_t>(my - raw_min_y) * (logical_height - 1)) / raw_span_y);
 
-    mx = std::max(0, std::min(mx, g_port.cfg.logical_width - 1));
-    my = std::max(0, std::min(my, g_port.cfg.logical_height - 1));
+    mx = std::max(0, std::min(mx, logical_width - 1));
+    my = std::max(0, std::min(my, logical_height - 1));
     *x = mx;
     *y = my;
 }
