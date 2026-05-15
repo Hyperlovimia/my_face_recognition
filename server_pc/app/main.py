@@ -449,8 +449,11 @@ class FaceWebState:
                 (device_id,),
             ).fetchone()
 
-    def get_recent_commands(self, device_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def get_command_page(self, device_id: str, limit: int, offset: int = 0) -> dict[str, Any]:
         with self.db_lock:
+            total = int(
+                self.db.execute("SELECT COUNT(*) FROM commands WHERE device_id = ?", (device_id,)).fetchone()[0]
+            )
             rows = self.db.execute(
                 """
                 SELECT request_id, cmd, status, ok, count, message, requested_at, updated_at
@@ -458,10 +461,19 @@ class FaceWebState:
                 WHERE device_id = ?
                 ORDER BY updated_at DESC
                 LIMIT ?
+                OFFSET ?
                 """,
-                (device_id, limit),
+                (device_id, limit, offset),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return {
+            "commands": [dict(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_recent_commands(self, device_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.get_command_page(device_id, limit)["commands"]
 
     def get_command_by_request_id(self, request_id: str) -> dict[str, Any] | None:
         with self.db_lock:
@@ -475,8 +487,9 @@ class FaceWebState:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_events(self, device_id: str, limit: int) -> list[dict[str, Any]]:
+    def get_event_page(self, device_id: str, limit: int, offset: int = 0) -> dict[str, Any]:
         with self.db_lock:
+            total = int(self.db.execute("SELECT COUNT(*) FROM events WHERE device_id = ?", (device_id,)).fetchone()[0])
             rows = self.db.execute(
                 """
                 SELECT evt_kind, face_id, name, score, ts_ms, created_at
@@ -484,15 +497,24 @@ class FaceWebState:
                 WHERE device_id = ?
                 ORDER BY id DESC
                 LIMIT ?
+                OFFSET ?
                 """,
-                (device_id, limit),
+                (device_id, limit, offset),
             ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
             d["ts_ms"] = event_ts_ms_for_ui(int(d.get("ts_ms") or 0), d.get("created_at"))
             out.append(d)
-        return out
+        return {
+            "events": out,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_events(self, device_id: str, limit: int) -> list[dict[str, Any]]:
+        return self.get_event_page(device_id, limit)["events"]
 
     def clear_web_data(self) -> dict[str, int]:
         with self.db_lock:
@@ -637,11 +659,26 @@ async def api_device_state(device_id: str) -> dict[str, Any]:
     return {"device": dict(row), "recent_commands": state.get_recent_commands(device_id)}
 
 
-@app.get("/api/devices/{device_id}/events")
-async def api_device_events(device_id: str, limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+@app.get("/api/devices/{device_id}/commands")
+async def api_device_commands(
+    device_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=100000),
+) -> dict[str, Any]:
     if state.get_device_state(device_id) is None:
         raise HTTPException(status_code=404, detail="device not found")
-    return {"events": state.get_events(device_id, limit)}
+    return state.get_command_page(device_id, limit, offset)
+
+
+@app.get("/api/devices/{device_id}/events")
+async def api_device_events(
+    device_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=100000),
+) -> dict[str, Any]:
+    if state.get_device_state(device_id) is None:
+        raise HTTPException(status_code=404, detail="device not found")
+    return state.get_event_page(device_id, limit, offset)
 
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

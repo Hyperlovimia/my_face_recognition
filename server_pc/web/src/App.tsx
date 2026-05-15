@@ -9,6 +9,7 @@ import type { SdAttendanceLogResponse } from "./api";
 
 /** 设备未校时时 ts_ms 接近 1970；优先信任服务端时间 */
 const MIN_SANE_DEVICE_TS_MS = 1_000_000_000_000;
+const PAGE_SIZE = 20;
 
 /** 解析服务端 ISO8601 created_at（兼容 Safari 对高位小数秒的挑剔） */
 function parseIsoToMs(iso: string): number | null {
@@ -69,14 +70,55 @@ function todayLocalYmd(): string {
   return `${y}-${m}-${day}`;
 }
 
+function totalPages(total: number): number {
+  return Math.max(1, Math.ceil(total / PAGE_SIZE));
+}
+
+function PaginationControls({
+  page,
+  total,
+  onPageChange,
+}: {
+  page: number;
+  total: number;
+  onPageChange: (page: number) => void;
+}) {
+  const pages = totalPages(total);
+  if (total <= PAGE_SIZE) {
+    return null;
+  }
+  return (
+    <div className="list-pagination" aria-label="分页">
+      <span className="list-pagination__summary">
+        第 {page} / {pages} 页 · 共 {total} 条
+      </span>
+      <div className="list-pagination__actions">
+        <button type="button" className="list-pagination__btn" disabled={page <= 1} onClick={() => onPageChange(page - 1)}>
+          上一页
+        </button>
+        <button
+          type="button"
+          className="list-pagination__btn"
+          disabled={page >= pages}
+          onClick={() => onPageChange(page + 1)}
+        >
+          下一页
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const [devices, setDevices] = useState<DeviceRow[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
-  const [deviceState, setDeviceState] = useState<{
-    device: DeviceRow;
-    recent_commands: CommandRow[];
-  } | null>(null);
-  const [events, setEvents] = useState<EventRow[]>([]);
+  const [deviceState, setDeviceState] = useState<{ device: DeviceRow } | null>(null);
+  const [commandRows, setCommandRows] = useState<CommandRow[]>([]);
+  const [commandTotal, setCommandTotal] = useState(0);
+  const [commandPage, setCommandPage] = useState(1);
+  const [eventRows, setEventRows] = useState<EventRow[]>([]);
+  const [eventTotal, setEventTotal] = useState(0);
+  const [eventPage, setEventPage] = useState(1);
   const [wsStatus, setWsStatus] = useState<"ok" | "bad">("bad");
   const [registerOpen, setRegisterOpen] = useState(false);
   const [regName, setRegName] = useState("");
@@ -92,6 +134,8 @@ export function App() {
   const dismissProgrammatic = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const sessionRef = useRef(false);
+  const commandPageRef = useRef(1);
+  const eventPageRef = useRef(1);
   const wsRef = useRef<WebSocket | null>(null);
   const connectWsRef = useRef<() => void>(() => {});
 
@@ -102,6 +146,14 @@ export function App() {
   useEffect(() => {
     sessionRef.current = registerSessionOpen;
   }, [registerSessionOpen]);
+
+  useEffect(() => {
+    commandPageRef.current = commandPage;
+  }, [commandPage]);
+
+  useEffect(() => {
+    eventPageRef.current = eventPage;
+  }, [eventPage]);
 
   const loadDevices = useCallback(async (): Promise<string | null> => {
     const data = await api.getDevices();
@@ -119,16 +171,63 @@ export function App() {
     return nextSelect;
   }, []);
 
-  const loadSelected = useCallback(async (deviceId: string | null) => {
+  const loadDeviceState = useCallback(async (deviceId: string | null) => {
     if (!deviceId) {
       setDeviceState(null);
-      setEvents([]);
       return;
     }
-    const [st, ev] = await Promise.all([api.getDeviceState(deviceId), api.getDeviceEvents(deviceId, 100)]);
-    setDeviceState({ device: st.device, recent_commands: st.recent_commands });
-    setEvents(ev.events);
+    const st = await api.getDeviceState(deviceId);
+    setDeviceState({ device: st.device });
   }, []);
+
+  const loadCommandPage = useCallback(async (deviceId: string, page: number) => {
+    const requestedPage = Math.max(1, page);
+    let data = await api.getDeviceCommands(deviceId, PAGE_SIZE, (requestedPage - 1) * PAGE_SIZE);
+    const safePage = Math.min(requestedPage, totalPages(data.total));
+    if (safePage !== requestedPage) {
+      data = await api.getDeviceCommands(deviceId, PAGE_SIZE, (safePage - 1) * PAGE_SIZE);
+      setCommandPage(safePage);
+    }
+    setCommandRows(data.items);
+    setCommandTotal(data.total);
+  }, []);
+
+  const loadEventPage = useCallback(async (deviceId: string, page: number) => {
+    const requestedPage = Math.max(1, page);
+    let data = await api.getDeviceEvents(deviceId, PAGE_SIZE, (requestedPage - 1) * PAGE_SIZE);
+    const safePage = Math.min(requestedPage, totalPages(data.total));
+    if (safePage !== requestedPage) {
+      data = await api.getDeviceEvents(deviceId, PAGE_SIZE, (safePage - 1) * PAGE_SIZE);
+      setEventPage(safePage);
+    }
+    setEventRows(data.items);
+    setEventTotal(data.total);
+  }, []);
+
+  const loadSelected = useCallback(
+    async (
+      deviceId: string | null,
+      pages?: {
+        commandPage?: number;
+        eventPage?: number;
+      },
+    ) => {
+      if (!deviceId) {
+        setDeviceState(null);
+        setCommandRows([]);
+        setCommandTotal(0);
+        setEventRows([]);
+        setEventTotal(0);
+        return;
+      }
+      await Promise.all([
+        loadDeviceState(deviceId),
+        loadCommandPage(deviceId, pages?.commandPage ?? commandPageRef.current),
+        loadEventPage(deviceId, pages?.eventPage ?? eventPageRef.current),
+      ]);
+    },
+    [loadCommandPage, loadDeviceState, loadEventPage],
+  );
 
   useEffect(() => {
     void loadDevices();
@@ -136,10 +235,11 @@ export function App() {
 
   useEffect(() => {
     if (selectedDevice) {
-      void loadSelected(selectedDevice);
+      setCommandPage(1);
+      setEventPage(1);
+      void loadSelected(selectedDevice, { commandPage: 1, eventPage: 1 });
     } else {
-      setDeviceState(null);
-      setEvents([]);
+      void loadSelected(null);
     }
   }, [selectedDevice, loadSelected]);
 
@@ -255,10 +355,7 @@ export function App() {
         return;
       }
       if (msg.type === "event") {
-        setEvents((prev) => {
-          const next = [msg.payload, ...prev];
-          return next.slice(0, 100);
-        });
+        await loadEventPage(msg.device_id, eventPageRef.current);
       } else if (msg.type === "status" && msg.device) {
         setDevices((prev) => prev.map((d) => (d.device_id === msg.device_id ? msg.device! : d)));
         setDeviceState((prev) =>
@@ -276,7 +373,7 @@ export function App() {
         await loadSelected(msg.device_id);
       }
     };
-  }, [loadDevices, loadSelected, syncBoardFaceForDevice]);
+  }, [loadDevices, loadEventPage, loadSelected, syncBoardFaceForDevice]);
 
   useEffect(() => {
     connectWsRef.current = connectWs;
@@ -296,6 +393,24 @@ export function App() {
   const onDeviceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     setSelectedDevice(e.target.value || null);
   };
+
+  const onCommandPageChange = useCallback(
+    (page: number) => {
+      if (!selectedDevice) return;
+      setCommandPage(page);
+      void loadCommandPage(selectedDevice, page);
+    },
+    [loadCommandPage, selectedDevice],
+  );
+
+  const onEventPageChange = useCallback(
+    (page: number) => {
+      if (!selectedDevice) return;
+      setEventPage(page);
+      void loadEventPage(selectedDevice, page);
+    },
+    [loadEventPage, selectedDevice],
+  );
 
   const onClearWeb = async () => {
     if (!confirm("确定要清空当前网页保存的本地设备、命令和事件记录吗？这不会清空开发板的人脸库。")) {
@@ -627,32 +742,35 @@ export function App() {
             <div className="panel__head">
               <h2 className="panel__title">指令流水</h2>
             </div>
-            {(deviceState?.recent_commands ?? []).length === 0 ? (
+            {commandRows.length === 0 ? (
               <p className="empty-state">无记录（下发命令后在此追踪状态）</p>
             ) : (
-              <div className="data-table">
-                <div className="data-table__thead">
-                  <span>命令 / 说明</span>
-                  <span>状态</span>
-                </div>
-                {(deviceState?.recent_commands ?? []).map((row) => (
-                  <div className="data-table__row" key={row.request_id}>
-                    <div>
-                      <div className="data-table__primary">{escapeHtml(row.cmd)}</div>
-                      <p className="data-table__secondary">{escapeHtml(row.message || "—")}</p>
-                    </div>
-                    <div className="data-table__meta">
-                      <span
-                        className={`badge ${row.ok === 1 ? "ok" : row.ok === 0 ? "bad" : ""}`}
-                        title="服务端记录的状态"
-                      >
-                        {escapeHtml(row.status)}
-                      </span>
-                      <span className="data-table__rid">{escapeHtml(row.request_id)}</span>
-                    </div>
+              <>
+                <div className="data-table">
+                  <div className="data-table__thead">
+                    <span>命令 / 说明</span>
+                    <span>状态</span>
                   </div>
-                ))}
-              </div>
+                  {commandRows.map((row) => (
+                    <div className="data-table__row" key={row.request_id}>
+                      <div>
+                        <div className="data-table__primary">{escapeHtml(row.cmd)}</div>
+                        <p className="data-table__secondary">{escapeHtml(row.message || "—")}</p>
+                      </div>
+                      <div className="data-table__meta">
+                        <span
+                          className={`badge ${row.ok === 1 ? "ok" : row.ok === 0 ? "bad" : ""}`}
+                          title="服务端记录的状态"
+                        >
+                          {escapeHtml(row.status)}
+                        </span>
+                        <span className="data-table__rid">{escapeHtml(row.request_id)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <PaginationControls page={commandPage} total={commandTotal} onPageChange={onCommandPageChange} />
+              </>
             )}
           </section>
 
@@ -660,32 +778,35 @@ export function App() {
             <div className="panel__head">
               <h2 className="panel__title">识别事件</h2>
             </div>
-            {events.length === 0 ? (
+            {eventRows.length === 0 ? (
               <p className="empty-state">无最近事件</p>
             ) : (
-              <div className="data-table data-table--events">
-                <div className="data-table__thead">
-                  <span>类型 / 人员</span>
-                  <span>分数</span>
-                  <span>时间</span>
-                </div>
-                {events.map((ev, idx) => (
-                  <div className="data-table__row" key={`${ev.ts_ms}-${idx}`}>
-                    <div>
-                      <div className="data-table__primary" style={{ fontFamily: "inherit" }}>
-                        {escapeHtml(ev.evt_kind)}
-                      </div>
-                      <p className="data-table__secondary">
-                        {escapeHtml(ev.name || "unknown")} / id {escapeHtml(ev.face_id)}
-                      </p>
-                    </div>
-                    <div className="data-table__secondary">{Number(ev.score).toFixed(3)}</div>
-                    <div className="data-table__meta">
-                      {escapeHtml(fmtTs(eventDisplayMs_ms(ev)))}
-                    </div>
+              <>
+                <div className="data-table data-table--events">
+                  <div className="data-table__thead">
+                    <span>类型 / 人员</span>
+                    <span>分数</span>
+                    <span>时间</span>
                   </div>
-                ))}
-              </div>
+                  {eventRows.map((ev, idx) => (
+                    <div className="data-table__row" key={`${ev.ts_ms}-${idx}`}>
+                      <div>
+                        <div className="data-table__primary" style={{ fontFamily: "inherit" }}>
+                          {escapeHtml(ev.evt_kind)}
+                        </div>
+                        <p className="data-table__secondary">
+                          {escapeHtml(ev.name || "unknown")} / id {escapeHtml(ev.face_id)}
+                        </p>
+                      </div>
+                      <div className="data-table__secondary">{Number(ev.score).toFixed(3)}</div>
+                      <div className="data-table__meta">
+                        {escapeHtml(fmtTs(eventDisplayMs_ms(ev)))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <PaginationControls page={eventPage} total={eventTotal} onPageChange={onEventPageChange} />
+              </>
             )}
           </section>
         </div>

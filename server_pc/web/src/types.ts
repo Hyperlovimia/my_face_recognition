@@ -22,6 +22,13 @@ export type CommandRow = {
   message: string | null;
 };
 
+export type PagedRows<T> = {
+  total: number;
+  limit: number;
+  offset: number;
+  items: T[];
+};
+
 export type EventRow = {
   evt_kind: string;
   face_id: number;

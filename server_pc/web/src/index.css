@@ -622,6 +622,52 @@ body {
   font-size: 0.875rem;
 }
 
+.list-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.8rem 1.1rem 1rem;
+  border-top: 1px solid var(--line);
+  background: #fcfdff;
+}
+
+.list-pagination__summary {
+  font-size: 0.78rem;
+  color: var(--ink-muted);
+}
+
+.list-pagination__actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.list-pagination__btn {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease;
+}
+
+.list-pagination__btn:hover:not(:disabled) {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.list-pagination__btn:disabled {
+  cursor: not-allowed;
+  color: var(--ink-faint);
+  background: #f8fafc;
+}
+
 /* Shoelace overrides + dialog */
 .panel--control-only {
   max-width: 40rem;
@@ -826,6 +872,19 @@ sl-input::part(base) {
 }
 
 @media (max-width: 640px) {
+  .list-pagination {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .list-pagination__summary {
+    text-align: center;
+  }
+
+  .list-pagination__actions {
+    justify-content: center;
+  }
+
   .app-header {
     padding: 0.75rem 1rem;
   }
