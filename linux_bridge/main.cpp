@@ -1286,6 +1286,16 @@ void handle_bridge_result(const bridge_cmd_result_t &result)
     }
 }
 
+void handle_bridge_ui_shared_info(const bridge_ui_shared_info_t &info)
+{
+    ui_on_shared_info(info);
+    mark_rt_seen();
+    std::cout << "face_netd: received UI shared overlay info phys=0x" << std::hex
+              << static_cast<unsigned long long>(info.ui_phys_addr) << std::dec << " bytes=" << info.ui_bytes
+              << " generation=" << info.ui_generation << " geometry=" << info.ui_width << "x" << info.ui_height
+              << " stride=" << info.ui_stride << std::endl;
+}
+
 void bridge_ipc_handler(k_s32, k_ipcmsg_message_t *msg)
 {
     if (!msg || msg->bIsResp || !msg->pBody)
@@ -1309,6 +1319,16 @@ void bridge_ipc_handler(k_s32, k_ipcmsg_message_t *msg)
         if (result.magic != IPC_MAGIC)
             return;
         handle_bridge_result(result);
+        return;
+    }
+
+    if (msg->u32CMD == IPC_BRIDGE_MSG_UI_SHARED_INFO && msg->u32BodyLen >= sizeof(bridge_ui_shared_info_t))
+    {
+        bridge_ui_shared_info_t info{};
+        memcpy(&info, msg->pBody, sizeof(info));
+        if (info.magic != IPC_MAGIC)
+            return;
+        handle_bridge_ui_shared_info(info);
     }
 }
 

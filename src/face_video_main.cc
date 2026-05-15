@@ -85,6 +85,23 @@ static ipc_video_ctrl_t g_last_ctrl{};
 static ipc_video_ctrl_t g_shutdown_ctrl{};
 static bool g_shutdown_ctrl_valid = false;
 
+struct UiOverlayRtMapping
+{
+    bool attached = false;
+    uint64_t phys_addr = 0;
+    uint32_t bytes = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    uint32_t generation = 0;
+    void *map_base = nullptr;
+    ui_overlay_shared_header_t *header = nullptr;
+    uint8_t *slots[UI_OVERLAY_SHARED_SLOT_COUNT]{};
+};
+
+static std::mutex g_ui_overlay_mu;
+static UiOverlayRtMapping g_ui_overlay{};
+
 /* 异步推理（仅 state==0）：采集线程只提交最新帧；独立线程 rpc，避免阻塞 GetFrame/VO。 */
 static constexpr size_t k_ai_frame_bytes = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
 static std::mutex g_ai_ch_mutex; /* 所有对 face_ai 的 rpc_ai 必须经此互斥（单通道 + 对端单线程） */
@@ -216,6 +233,144 @@ static bool send_video_reply(const ipc_video_ctrl_t &ctrl, bool ok, int32_t coun
     return false;
 }
 
+static void clear_ui_overlay_mapping_locked()
+{
+    if (g_ui_overlay.map_base && g_ui_overlay.bytes > 0)
+        kd_mpi_sys_munmap(g_ui_overlay.map_base, g_ui_overlay.bytes);
+    g_ui_overlay = UiOverlayRtMapping{};
+}
+
+static bool attach_ui_overlay_locked(const ipc_video_ctrl_t &ctrl)
+{
+    if (ctrl.ui_phys_addr == 0 || ctrl.ui_bytes < ui_overlay_shared_total_bytes_unaligned())
+    {
+        std::cerr << "face_video: invalid UI_ATTACH payload phys=0x" << std::hex
+                  << static_cast<unsigned long long>(ctrl.ui_phys_addr) << std::dec << " bytes=" << ctrl.ui_bytes
+                  << std::endl;
+        return false;
+    }
+
+    if (g_ui_overlay.attached && g_ui_overlay.phys_addr == ctrl.ui_phys_addr &&
+        g_ui_overlay.generation == ctrl.ui_generation && g_ui_overlay.bytes == ctrl.ui_bytes)
+        return true;
+
+    clear_ui_overlay_mapping_locked();
+
+    void *mapped = kd_mpi_sys_mmap(ctrl.ui_phys_addr, ctrl.ui_bytes);
+    if (!mapped)
+    {
+        std::cerr << "face_video: kd_mpi_sys_mmap UI overlay failed phys=0x" << std::hex
+                  << static_cast<unsigned long long>(ctrl.ui_phys_addr) << std::dec << " bytes=" << ctrl.ui_bytes
+                  << std::endl;
+        return false;
+    }
+
+    auto *header = static_cast<ui_overlay_shared_header_t *>(mapped);
+    if (header->magic != UI_OVERLAY_SHARED_MAGIC || header->version != UI_OVERLAY_SHARED_VERSION)
+    {
+        std::cerr << "face_video: invalid UI shared header magic=0x" << std::hex << header->magic << std::dec
+                  << " version=" << header->version << std::endl;
+        kd_mpi_sys_munmap(mapped, ctrl.ui_bytes);
+        return false;
+    }
+
+    if (header->width != ctrl.ui_width || header->height != ctrl.ui_height || header->stride != ctrl.ui_stride ||
+        header->slot_count != UI_OVERLAY_SHARED_SLOT_COUNT || header->generation != ctrl.ui_generation)
+    {
+        std::cerr << "face_video: UI shared header mismatch hdr=" << header->width << "x" << header->height
+                  << " stride=" << header->stride << " slots=" << header->slot_count
+                  << " generation=" << header->generation << " ctrl=" << ctrl.ui_width << "x" << ctrl.ui_height
+                  << " stride=" << ctrl.ui_stride << " generation=" << ctrl.ui_generation << std::endl;
+        kd_mpi_sys_munmap(mapped, ctrl.ui_bytes);
+        return false;
+    }
+
+    g_ui_overlay.attached = true;
+    g_ui_overlay.phys_addr = ctrl.ui_phys_addr;
+    g_ui_overlay.bytes = ctrl.ui_bytes;
+    g_ui_overlay.width = ctrl.ui_width;
+    g_ui_overlay.height = ctrl.ui_height;
+    g_ui_overlay.stride = ctrl.ui_stride;
+    g_ui_overlay.generation = ctrl.ui_generation;
+    g_ui_overlay.map_base = mapped;
+    g_ui_overlay.header = header;
+    uint8_t *slot_base = static_cast<uint8_t *>(mapped) + sizeof(ui_overlay_shared_header_t);
+    const size_t slot_bytes = ui_overlay_shared_slot_bytes();
+    for (size_t i = 0; i < UI_OVERLAY_SHARED_SLOT_COUNT; ++i)
+        g_ui_overlay.slots[i] = slot_base + i * slot_bytes;
+
+    std::cout << "face_video: UI overlay attached phys=0x" << std::hex
+              << static_cast<unsigned long long>(g_ui_overlay.phys_addr) << std::dec << " bytes=" << g_ui_overlay.bytes
+              << " generation=" << g_ui_overlay.generation << " geometry=" << g_ui_overlay.width << "x"
+              << g_ui_overlay.height << " stride=" << g_ui_overlay.stride << std::endl;
+    return true;
+}
+
+static inline uint8_t alpha_blend_channel(uint8_t src, uint8_t src_a, uint8_t dst, uint8_t dst_a, uint8_t out_a)
+{
+    if (out_a == 0)
+        return 0;
+    const uint32_t src_p = static_cast<uint32_t>(src) * src_a;
+    const uint32_t dst_p = (static_cast<uint32_t>(dst) * dst_a * (255u - src_a) + 127u) / 255u;
+    return static_cast<uint8_t>((src_p + dst_p + out_a / 2u) / out_a);
+}
+
+static void blend_ui_overlay(cv::Mat &draw_frame)
+{
+    std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+    if (!g_ui_overlay.attached || !g_ui_overlay.header)
+        return;
+
+    const ui_overlay_shared_header_t &hdr = *g_ui_overlay.header;
+    if (hdr.magic != UI_OVERLAY_SHARED_MAGIC || hdr.version != UI_OVERLAY_SHARED_VERSION ||
+        hdr.width != g_ui_overlay.width || hdr.height != g_ui_overlay.height || hdr.stride != g_ui_overlay.stride ||
+        hdr.slot_count != UI_OVERLAY_SHARED_SLOT_COUNT || hdr.generation != g_ui_overlay.generation)
+        return;
+
+    uint32_t front = hdr.front_index;
+    if (front >= UI_OVERLAY_SHARED_SLOT_COUNT)
+        front = 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint8_t *src_base = g_ui_overlay.slots[front];
+    if (!src_base)
+        return;
+
+    for (int y = 0; y < draw_frame.rows; ++y)
+    {
+        cv::Vec4b *dst_row = draw_frame.ptr<cv::Vec4b>(y);
+        const uint8_t *src_row = src_base + static_cast<size_t>(g_ui_overlay.stride) * y;
+        for (int x = 0; x < draw_frame.cols; ++x)
+        {
+            const uint8_t src_a = src_row[0];
+            if (src_a == 0)
+            {
+                src_row += 4;
+                continue;
+            }
+
+            cv::Vec4b &dst = dst_row[x];
+            if (src_a == 255)
+            {
+                dst[0] = src_row[0];
+                dst[1] = src_row[1];
+                dst[2] = src_row[2];
+                dst[3] = src_row[3];
+                src_row += 4;
+                continue;
+            }
+
+            const uint8_t dst_a = dst[0];
+            const uint8_t out_a = static_cast<uint8_t>(
+                src_a + (static_cast<uint32_t>(dst_a) * (255u - src_a) + 127u) / 255u);
+            dst[1] = alpha_blend_channel(src_row[1], src_a, dst[1], dst_a, out_a);
+            dst[2] = alpha_blend_channel(src_row[2], src_a, dst[2], dst_a, out_a);
+            dst[3] = alpha_blend_channel(src_row[3], src_a, dst[3], dst_a, out_a);
+            dst[0] = out_a;
+            src_row += 4;
+        }
+    }
+}
+
 static void ctrl_recv_loop()
 {
     int ch = rt_channel_open(IPC_FACE_VIDEO_CTRL, O_CREAT);
@@ -255,6 +410,17 @@ static void ctrl_recv_loop()
         ipc_video_ctrl_t *c = (ipc_video_ctrl_t *)p;
         if (c->magic != IPC_MAGIC)
         {
+            lwp_shmdt(p);
+            ipc_shm_free(shmid);
+            continue;
+        }
+
+        if ((ipc_video_ctrl_op_t)c->op == IPC_VIDEO_CTRL_OP_UI_ATTACH)
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+                attach_ui_overlay_locked(*c);
+            }
             lwp_shmdt(p);
             ipc_shm_free(shmid);
             continue;
@@ -813,6 +979,7 @@ static void video_ipc_loop(int debug_mode)
             ipc_draw_faces_osd(draw_frame, &ai_reply);
         }
 
+        blend_ui_overlay(draw_frame);
         pl.InsertFrame(draw_frame.data);
         pl.ReleaseFrame(dump_res);
 
@@ -865,6 +1032,10 @@ static void video_ipc_loop(int debug_mode)
     if (reply_ch >= 0)
         rt_channel_close(reply_ch);
     g_video_reply_ch.store(-1);
+    {
+        std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+        clear_ui_overlay_mapping_locked();
+    }
     pl.Destroy();
 }
 

@@ -20,6 +20,8 @@
 #include "ipc_shm.h"
 #include "ipc_lwp_user.h"
 #include "k_ipcmsg.h"
+#include "mpi_sys_api.h"
+#include "ui_overlay_shared.h"
 
 static_assert(IPC_BRIDGE_CMD_REGISTER_PREVIEW == 5, "wire value must match linux_bridge register_preview");
 
@@ -42,6 +44,17 @@ static bridge_inflight_t g_bridge_inflight{};
 static std::deque<bridge_cmd_req_t> g_bridge_pending;
 static DoorControl g_door_control;
 
+struct UiOverlaySharedRt {
+    uint64_t phys_addr = 0;
+    void *virt_addr = nullptr;
+    uint32_t bytes = 0;
+    uint32_t generation = 0;
+    bool ready = false;
+};
+
+static UiOverlaySharedRt g_ui_overlay{};
+static std::mutex g_ui_overlay_mu;
+
 static void copy_cstr(char *dst, size_t dst_size, const char *src)
 {
     if (!dst || dst_size == 0)
@@ -57,6 +70,78 @@ static uint64_t now_realtime_ms()
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
         return 0;
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static uint32_t next_ui_overlay_generation()
+{
+    const uint64_t now = now_realtime_ms();
+    const uint32_t gen = static_cast<uint32_t>((now ^ (now >> 20)) & 0xffffffffu);
+    return gen ? gen : 1u;
+}
+
+static bool ui_overlay_allocate()
+{
+    std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+    if (g_ui_overlay.ready)
+        return true;
+
+    g_ui_overlay.bytes = ui_overlay_shared_total_bytes_aligned();
+    g_ui_overlay.generation = next_ui_overlay_generation();
+    int ret = kd_mpi_sys_mmz_alloc(&g_ui_overlay.phys_addr, &g_ui_overlay.virt_addr, "face_ui_overlay", "anonymous",
+                                   g_ui_overlay.bytes);
+    if (ret != 0 || g_ui_overlay.phys_addr == 0 || !g_ui_overlay.virt_addr)
+    {
+        std::cerr << "face_event: kd_mpi_sys_mmz_alloc ui overlay failed ret=" << ret << std::endl;
+        g_ui_overlay = UiOverlaySharedRt{};
+        return false;
+    }
+
+    std::memset(g_ui_overlay.virt_addr, 0, g_ui_overlay.bytes);
+    auto *hdr = static_cast<ui_overlay_shared_header_t *>(g_ui_overlay.virt_addr);
+    hdr->magic = UI_OVERLAY_SHARED_MAGIC;
+    hdr->version = UI_OVERLAY_SHARED_VERSION;
+    hdr->width = UI_OVERLAY_SHARED_WIDTH;
+    hdr->height = UI_OVERLAY_SHARED_HEIGHT;
+    hdr->stride = UI_OVERLAY_SHARED_STRIDE;
+    hdr->slot_count = UI_OVERLAY_SHARED_SLOT_COUNT;
+    hdr->front_index = 0;
+    hdr->seq = 0;
+    hdr->generation = g_ui_overlay.generation;
+    hdr->flags = UI_OVERLAY_SHARED_FLAG_READY;
+
+    g_ui_overlay.ready = true;
+    std::cout << "face_event: ui overlay shared buffer ready phys=0x" << std::hex
+              << static_cast<unsigned long long>(g_ui_overlay.phys_addr) << std::dec << " bytes=" << g_ui_overlay.bytes
+              << " generation=" << g_ui_overlay.generation << " geometry=" << UI_OVERLAY_SHARED_WIDTH << "x"
+              << UI_OVERLAY_SHARED_HEIGHT << " stride=" << UI_OVERLAY_SHARED_STRIDE << std::endl;
+    return true;
+}
+
+static void ui_overlay_free()
+{
+    std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+    if (g_ui_overlay.phys_addr && g_ui_overlay.virt_addr)
+        kd_mpi_sys_mmz_free(g_ui_overlay.phys_addr, g_ui_overlay.virt_addr);
+    g_ui_overlay = UiOverlaySharedRt{};
+}
+
+static bool fill_bridge_ui_shared_info(bridge_ui_shared_info_t *out)
+{
+    if (!out)
+        return false;
+    std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+    if (!g_ui_overlay.ready)
+        return false;
+
+    std::memset(out, 0, sizeof(*out));
+    out->magic = IPC_MAGIC;
+    out->ui_phys_addr = g_ui_overlay.phys_addr;
+    out->ui_bytes = g_ui_overlay.bytes;
+    out->ui_width = UI_OVERLAY_SHARED_WIDTH;
+    out->ui_height = UI_OVERLAY_SHARED_HEIGHT;
+    out->ui_stride = UI_OVERLAY_SHARED_STRIDE;
+    out->ui_generation = g_ui_overlay.generation;
+    return true;
 }
 
 static const char *bridge_cmd_name(int32_t cmd)
@@ -151,6 +236,8 @@ static void print_help()
     std::cout << "=======================================\n" << std::endl;
 }
 
+static bool send_video_ctrl_message(const ipc_video_ctrl_t &ctrl, char *reason, size_t reason_cap);
+
 static void connect_video_ctrl_thread()
 {
     while (!g_evt_stop.load())
@@ -166,15 +253,29 @@ static void connect_video_ctrl_thread()
         {
             g_video_ch.store(ch);
             std::cout << "face_event: connected to " << IPC_FACE_VIDEO_CTRL << " (ch=" << ch << ")" << std::endl;
+            char reason[IPC_OP_MESSAGE_MAX] = {0};
+            bridge_ui_shared_info_t info{};
+            if (fill_bridge_ui_shared_info(&info))
+            {
+                ipc_video_ctrl_t attach{};
+                attach.magic = IPC_MAGIC;
+                attach.op = IPC_VIDEO_CTRL_OP_UI_ATTACH;
+                attach.ui_phys_addr = info.ui_phys_addr;
+                attach.ui_bytes = info.ui_bytes;
+                attach.ui_width = info.ui_width;
+                attach.ui_height = info.ui_height;
+                attach.ui_stride = info.ui_stride;
+                attach.ui_generation = info.ui_generation;
+                if (!send_video_ctrl_message(attach, reason, sizeof(reason)))
+                    std::cerr << "face_event: failed to send UI_ATTACH to face_video reason=" << reason << std::endl;
+            }
             continue;
         }
         usleep(100000);
     }
 }
 
-static bool send_video_ctrl(ipc_video_ctrl_op_t op, int32_t state, const char *reg_name,
-                            ipc_video_ctrl_source_t source, ipc_bridge_cmd_t bridge_cmd, const char *request_id,
-                            char *reason, size_t reason_cap)
+static bool send_video_ctrl_message(const ipc_video_ctrl_t &ctrl, char *reason, size_t reason_cap)
 {
     int ch = g_video_ch.load();
     if (ch < 0)
@@ -193,16 +294,7 @@ static bool send_video_ctrl(ipc_video_ctrl_op_t op, int32_t state, const char *r
     }
 
     ipc_video_ctrl_t *c = (ipc_video_ctrl_t *)p;
-    memset(c, 0, sizeof(*c));
-    c->magic = IPC_MAGIC;
-    c->op = (int32_t)op;
-    c->state = state;
-    c->source = (int32_t)source;
-    c->bridge_cmd = (int32_t)bridge_cmd;
-    if (reg_name)
-        strncpy(c->register_name, reg_name, IPC_NAME_MAX - 1);
-    if (request_id)
-        strncpy(c->request_id, request_id, IPC_REQUEST_ID_MAX - 1);
+    std::memcpy(c, &ctrl, sizeof(*c));
     lwp_shmdt(p);
 
     struct rt_channel_msg msg;
@@ -224,6 +316,23 @@ static bool send_video_ctrl(ipc_video_ctrl_op_t op, int32_t state, const char *r
     copy_cstr(reason, reason_cap, "send_video_ctrl failed");
     std::cerr << "face_event: send_video_ctrl failed after " << k_send_retries << " retries, shm freed\n";
     return false;
+}
+
+static bool send_video_ctrl(ipc_video_ctrl_op_t op, int32_t state, const char *reg_name,
+                            ipc_video_ctrl_source_t source, ipc_bridge_cmd_t bridge_cmd, const char *request_id,
+                            char *reason, size_t reason_cap)
+{
+    ipc_video_ctrl_t ctrl{};
+    ctrl.magic = IPC_MAGIC;
+    ctrl.op = (int32_t)op;
+    ctrl.state = state;
+    ctrl.source = (int32_t)source;
+    ctrl.bridge_cmd = (int32_t)bridge_cmd;
+    if (reg_name)
+        strncpy(ctrl.register_name, reg_name, IPC_NAME_MAX - 1);
+    if (request_id)
+        strncpy(ctrl.request_id, request_id, IPC_REQUEST_ID_MAX - 1);
+    return send_video_ctrl_message(ctrl, reason, reason_cap);
 }
 
 static void clear_bridge_inflight_locked()
@@ -255,6 +364,15 @@ static bool send_bridge_payload(uint32_t msg_kind, const void *body, uint32_t bo
         return false;
     }
     return true;
+}
+
+static void maybe_send_bridge_ui_shared_info()
+{
+    bridge_ui_shared_info_t info{};
+    if (!fill_bridge_ui_shared_info(&info))
+        return;
+    if (!send_bridge_payload(IPC_BRIDGE_MSG_UI_SHARED_INFO, &info, sizeof(info)))
+        std::cerr << "face_event: failed to send UI shared info to bridge\n";
 }
 
 static void bridge_publish_cmd_failed(const bridge_cmd_req_t &req, const char *fail_msg)
@@ -491,6 +609,7 @@ static void bridge_service_loop()
         g_bridge_connected.store(true);
         std::cout << "face_event: bridge connected service=" << IPC_FACE_BRIDGE_SERVICE << " port="
                   << IPC_FACE_BRIDGE_PORT << " id=" << bridge_id << std::endl;
+        maybe_send_bridge_ui_shared_info();
 
         kd_ipcmsg_run(bridge_id);
 
@@ -780,6 +899,7 @@ int main(int argc, char **argv)
     printf("face_event: stdin 在此输入；单串口建议先后台启动 face_ai、face_video，再前台启动本进程。\n");
     printf("face_event: bridge service %s port=%u ready for little-core face_netd\n", IPC_FACE_BRIDGE_SERVICE,
            IPC_FACE_BRIDGE_PORT);
+    ui_overlay_allocate();
 
     std::thread th_conn(connect_video_ctrl_thread);
     std::thread th_evt([&]() { evt_recv_loop(log_base, evt_ch); });
@@ -797,6 +917,7 @@ int main(int argc, char **argv)
     th_reply.join();
     th_conn.join();
     th_bridge.join();
+    ui_overlay_free();
 
     return 0;
 }

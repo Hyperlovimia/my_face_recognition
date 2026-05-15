@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 
+#include "ui_overlay_shared.h"
+
 #define IPC_MAGIC 0xFACECAFEu
 
 #define IPC_FACE_AI_CHANNEL "face_ai_req"
@@ -131,11 +133,13 @@ typedef enum {
     IPC_BRIDGE_MSG_CMD_REQ = 1,
     IPC_BRIDGE_MSG_EVENT = 2,
     IPC_BRIDGE_MSG_CMD_RESULT = 3,
+    IPC_BRIDGE_MSG_UI_SHARED_INFO = 4,
 } ipc_bridge_msg_kind_t;
 
 typedef enum {
     IPC_VIDEO_CTRL_OP_SET = 0,
     IPC_VIDEO_CTRL_OP_QUIT = 1,
+    IPC_VIDEO_CTRL_OP_UI_ATTACH = 2,
 } ipc_video_ctrl_op_t;
 
 typedef struct {
@@ -146,6 +150,12 @@ typedef struct {
     int32_t bridge_cmd; /* ipc_bridge_cmd_t */
     char request_id[IPC_REQUEST_ID_MAX];
     char register_name[IPC_NAME_MAX];
+    uint64_t ui_phys_addr;
+    uint32_t ui_bytes;
+    uint32_t ui_width;
+    uint32_t ui_height;
+    uint32_t ui_stride;
+    uint32_t ui_generation;
 } ipc_video_ctrl_t;
 
 typedef struct {
@@ -181,6 +191,16 @@ typedef struct {
     uint64_t ts_ms; /* realtime ms */
     char name[IPC_NAME_MAX];
 } bridge_event_t;
+
+typedef struct {
+    uint32_t magic;
+    uint64_t ui_phys_addr;
+    uint32_t ui_bytes;
+    uint32_t ui_width;
+    uint32_t ui_height;
+    uint32_t ui_stride;
+    uint32_t ui_generation;
+} bridge_ui_shared_info_t;
 
 typedef struct {
     uint32_t magic;

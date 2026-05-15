@@ -19,6 +19,7 @@ bool ui_runtime_start(const runtime_config &cfg);
 void ui_runtime_stop();
 void ui_on_bridge_result(const bridge_cmd_result_t &result);
 void ui_on_bridge_event(const bridge_event_t &ev);
+void ui_on_shared_info(const bridge_ui_shared_info_t &info);
 bool ui_is_session_active();
 
 #endif

@@ -34,12 +34,15 @@ struct UiSharedState {
     std::atomic<bool> stop{false};
     bool dirty = true;
     bool active = false;
+    bool have_shared_info = false;
+    bool logged_waiting_for_surface = false;
     UiSessionState session = UiSessionState::idle;
     std::string status_text = "Tap Register to add face";
     std::string active_request_id;
     uint64_t last_activity_ms = 0;
     uint64_t request_seq = 0;
     int preview_timeout_ms = 30000;
+    bridge_ui_shared_info_t shared_info{};
 };
 
 UiSharedState g_ui;
@@ -346,13 +349,11 @@ bool resolve_profile(const std::string &profile, k230_ui_port_config *cfg)
         return false;
     if (profile != "dongshanpi_nt35516")
         return false;
-    cfg->drm_device = "/dev/dri/card0";
     cfg->touch_device = g_ui.cfg.touch_device.empty() ? "/dev/input/event0" : g_ui.cfg.touch_device.c_str();
-    cfg->overlay_width = 1080;
-    cfg->overlay_height = 960;
-    cfg->offset_x = 0;
-    cfg->offset_y = 0;
-    cfg->align_bottom = true;
+    cfg->logical_width = static_cast<int>(UI_OVERLAY_SHARED_WIDTH);
+    cfg->logical_height = static_cast<int>(UI_OVERLAY_SHARED_HEIGHT);
+    cfg->screen_width = 1080;
+    cfg->screen_height = 1920;
     cfg->flip_x = true;
     cfg->flip_y = true;
     return true;
@@ -368,29 +369,75 @@ void ui_thread_main()
         return;
     }
 
-    lv_init();
-    if (!k230_ui_port_init(&port_cfg))
-    {
-        ui_log("face_netd_ui: k230_ui_port_init failed");
-        g_ui.running.store(false);
-        return;
-    }
-
-    create_main_screen();
-    create_edit_screen();
-    lv_scr_load(g_main_screen);
+    bool lvgl_inited = false;
+    bool port_ready = false;
+    bool screens_created = false;
+    uint32_t active_generation = 0;
+    bool surface_change_logged = false;
 
     while (!g_ui.stop.load())
     {
         UiSessionState session = UiSessionState::idle;
         std::string status;
         std::string request_id;
+        bool have_shared_info = false;
+        bridge_ui_shared_info_t shared_info{};
         {
             std::lock_guard<std::mutex> lk(g_ui.mu);
             session = g_ui.session;
             status = g_ui.status_text;
             request_id = g_ui.active_request_id;
             g_ui.dirty = false;
+            have_shared_info = g_ui.have_shared_info;
+            if (have_shared_info)
+                shared_info = g_ui.shared_info;
+            if (!have_shared_info && !g_ui.logged_waiting_for_surface)
+            {
+                ui_log("face_netd_ui: waiting for RT shared overlay info");
+                g_ui.logged_waiting_for_surface = true;
+            }
+        }
+
+        if (!port_ready)
+        {
+            if (!have_shared_info)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            port_cfg.shared_info = shared_info;
+            if (!lvgl_inited)
+            {
+                lv_init();
+                lvgl_inited = true;
+            }
+            if (!k230_ui_port_init(&port_cfg))
+            {
+                ui_log("face_netd_ui: k230_ui_port_init failed");
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            if (!screens_created)
+            {
+                create_main_screen();
+                create_edit_screen();
+                screens_created = true;
+            }
+            lv_scr_load(g_main_screen);
+            active_generation = shared_info.ui_generation;
+            port_ready = true;
+            ui_log("face_netd_ui: shared overlay ready generation=" + std::to_string(active_generation));
+        }
+
+        if (have_shared_info && shared_info.ui_generation != active_generation)
+        {
+            if (!surface_change_logged)
+            {
+                ui_log("face_netd_ui: shared overlay generation changed, keeping current surface until restart");
+                surface_change_logged = true;
+            }
         }
 
         if (!status.empty() || g_last_session != session)
@@ -404,7 +451,8 @@ void ui_thread_main()
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    k230_ui_port_deinit();
+    if (port_ready)
+        k230_ui_port_deinit();
     g_ui.running.store(false);
 }
 
@@ -489,6 +537,21 @@ void ui_on_bridge_event(const bridge_event_t &ev)
         g_ui.status_text = "Liveness failed. Align face and retry.";
     else
         g_ui.status_text = "Tap Register to add face";
+    g_ui.dirty = true;
+}
+
+void ui_on_shared_info(const bridge_ui_shared_info_t &info)
+{
+    if (info.magic != IPC_MAGIC)
+        return;
+
+    std::lock_guard<std::mutex> lk(g_ui.mu);
+    if (g_ui.have_shared_info && std::memcmp(&g_ui.shared_info, &info, sizeof(info)) == 0)
+        return;
+
+    g_ui.shared_info = info;
+    g_ui.have_shared_info = true;
+    g_ui.logged_waiting_for_surface = false;
     g_ui.dirty = true;
 }
 

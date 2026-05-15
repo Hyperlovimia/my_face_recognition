@@ -4,20 +4,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "../../src/ipc_proto.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct k230_ui_port_config {
-    const char *drm_device;
     const char *touch_device;
-    int overlay_width;
-    int overlay_height;
-    int offset_x;
-    int offset_y;
-    bool align_bottom;
+    int logical_width;
+    int logical_height;
+    int screen_width;
+    int screen_height;
     bool flip_x;
     bool flip_y;
+    bridge_ui_shared_info_t shared_info;
 };
 
 bool k230_ui_port_init(const struct k230_ui_port_config *cfg);
