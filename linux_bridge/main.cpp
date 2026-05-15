@@ -2322,8 +2322,7 @@ int main(int argc, char **argv)
     ui_cfg.preview_timeout_ms = g_rt.cfg.ui_preview_timeout_ms;
     ui_cfg.overlay_profile = g_rt.cfg.ui_overlay_profile;
     ui_cfg.submit_command = [](const std::string &request_id, int cmd, const std::string &name) {
-        if (is_library_write_cmd(cmd) &&
-            (g_rt.import_active.load() || has_pending_library_write_cmd() || ui_is_session_active()))
+        if (is_library_write_cmd(cmd) && (g_rt.import_active.load() || has_pending_library_write_cmd()))
         {
             PendingCmd rejected{request_id, cmd, name, PendingCmdSource::ui};
             publish_local_result(rejected, false, -1,
