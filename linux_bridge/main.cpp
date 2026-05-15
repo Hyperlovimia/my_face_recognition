@@ -692,7 +692,7 @@ void handle_db_face_list_local(const std::string &request_id)
 
 void handle_db_face_image_local(const std::string &request_id, long slot)
 {
-    constexpr size_t k_max_bytes = 512 * 1024;
+    constexpr size_t k_max_bytes = 4 * 1024 * 1024;
     if (slot < 1 || slot > 4096)
     {
         publish_reply_mqtt(request_id, "db_face_image", false, 0, "invalid slot", "");
