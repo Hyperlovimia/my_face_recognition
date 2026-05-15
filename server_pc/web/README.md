@@ -49,12 +49,21 @@ npm run build
 
 然后在本机或容器内启动 `uvicorn` 即可。`vite` 的 `emptyOutDir` 会清空并重建 `server_pc/static`（**不要**把数据库放在 `static/` 里）。
 
+运行前还需要提供管理员密码环境变量，否则 `face-web` 会拒绝启动：
+
+```bash
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
+```
+
+网页登录成功后会话保存在服务端内存中，因此 `face-web` 进程重启后需要重新登录。
+
 ## 开发调试（热更新 + 代理 API）
 
 终端 1（项目根在 `…/my_face_recognition/server_pc`）：
 
 ```bash
 cd server_pc
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 

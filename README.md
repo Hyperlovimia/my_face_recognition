@@ -235,10 +235,17 @@ python3 ./scripts/gen_ui_admin_pin_hash.py
 - `Mosquitto` 作为 MQTT Broker
 - `FastAPI + Paho MQTT + SQLite`
 - 网页为 **React + Vite + TypeScript**（源码在 `server_pc/web/`，构建生成到 `server_pc/static/`），WebSocket 实时更新
+- Web 管理端现在带单管理员登录：首次进入先显示登录页，输入 `FACE_WEB_ADMIN_PASSWORD` 后才能进入面板；点击右上角“退出登录”可回到登录页
 
-启动：在 `server_pc` 下执行 `docker compose up --build` 即可。`Dockerfile` 为**多阶段**：构建阶段在镜像内 `npm install` / `npm run build`（需能拉取 `node:20-bookworm-slim`；可先 `docker pull node:20-bookworm-slim` 缓存在本机）。若**无法**访问 Docker Hub，可改为在宿主机用本机 Node 在 `server_pc/web` 里打好 `static/`，并改用本仓库的 `Dockerfile.prebuilt`（只复制 `static/`，不装 Node 镜像，见同目录下文件说明）或等价的单阶段 `COPY static`。
+启动前必须先设置管理员密码环境变量，例如：
 
-若**不用 Docker**、直接本机起 `uvicorn`，需先在 `server_pc/web` 执行 `npm install && npm run build`，或开发时用 Vite 代理（见 `server_pc/web/README.md`）。
+```bash
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
+```
+
+然后在 `server_pc` 下执行 `docker compose up --build` 即可。`Dockerfile` 为**多阶段**：构建阶段在镜像内 `npm install` / `npm run build`（需能拉取 `node:20-bookworm-slim`；可先 `docker pull node:20-bookworm-slim` 缓存在本机）。若**无法**访问 Docker Hub，可改为在宿主机用本机 Node 在 `server_pc/web` 里打好 `static/`，并改用本仓库的 `Dockerfile.prebuilt`（只复制 `static/`，不装 Node 镜像，见同目录下文件说明）或等价的单阶段 `COPY static`。
+
+若**不用 Docker**、直接本机起 `uvicorn`，同样必须先设置 `FACE_WEB_ADMIN_PASSWORD`，并先在 `server_pc/web` 执行 `npm install && npm run build`，或开发时用 Vite 代理（见 `server_pc/web/README.md`）。`face-web` 进程重启后，内存中的登录会话会失效，浏览器需要重新登录。
 
 ### 如果 `server_pc` 运行在 WSL / Docker 中
 
@@ -350,6 +357,7 @@ Linux 小核侧至少需要同步到 `/sharefs/face_bridge`：
 
 ```bash
 cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
 docker compose up --build
 ```
 

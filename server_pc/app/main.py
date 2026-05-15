@@ -1,8 +1,10 @@
 import asyncio
 import base64
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 import threading
@@ -13,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,6 +28,11 @@ MQTT_HOST = os.getenv("FACE_MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("FACE_MQTT_PORT", "1883"))
 MQTT_KEEPALIVE = int(os.getenv("FACE_MQTT_KEEPALIVE", "30"))
 SCHEMA = "k230.face.bridge.v1"
+SESSION_COOKIE_NAME = "face_web_session"
+ADMIN_PASSWORD = os.getenv("FACE_WEB_ADMIN_PASSWORD", "").strip()
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError("FACE_WEB_ADMIN_PASSWORD is required for face-web startup")
 
 
 def now_iso() -> str:
@@ -97,6 +104,32 @@ def json_dumps(data: Any) -> str:
 
 class RegisterCurrentBody(BaseModel):
     name: str = Field(..., min_length=1, max_length=63)
+
+
+class LoginBody(BaseModel):
+    password: str = Field(..., min_length=1, max_length=4096)
+
+
+class AuthSessionStore:
+    def __init__(self) -> None:
+        self._sessions: set[str] = set()
+        self._lock = threading.Lock()
+
+    def create(self) -> str:
+        session_id = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions.add(session_id)
+        return session_id
+
+    def has(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions
+
+    def delete(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            self._sessions.discard(session_id)
 
 
 class ConnectionManager:
@@ -593,6 +626,7 @@ class FaceWebState:
 
 
 state = FaceWebState()
+auth_sessions = AuthSessionStore()
 
 
 async def await_mqtt_command_done(request_id: str, timeout_s: float) -> dict[str, Any] | None:
@@ -612,6 +646,39 @@ def mqtt_reply_body(reply_json: str | None) -> dict[str, Any]:
         return json.loads(reply_json)
     except json.JSONDecodeError:
         return {}
+
+
+def request_cookie_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    scheme = forwarded_proto or request.url.scheme.lower()
+    return scheme == "https"
+
+
+def set_session_cookie(response: Response, request: Request, session_id: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=request_cookie_secure(request),
+        path="/",
+    )
+
+
+def clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        secure=request_cookie_secure(request),
+        samesite="lax",
+    )
+
+
+def require_auth(request: Request) -> str:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not session_id or not auth_sessions.has(session_id):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return session_id
 
 
 @asynccontextmanager
@@ -636,7 +703,31 @@ async def favicon() -> Response:
     return Response(status_code=204)
 
 
-@app.get("/api/server-time")
+@app.post("/api/auth/login")
+async def api_auth_login(body: LoginBody, request: Request, response: Response) -> dict[str, Any]:
+    if not hmac.compare_digest(body.password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    session_id = auth_sessions.create()
+    set_session_cookie(response, request, session_id)
+    return {"ok": True}
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(request: Request, response: Response) -> dict[str, Any]:
+    auth_sessions.delete(request.cookies.get(SESSION_COOKIE_NAME))
+    clear_session_cookie(response, request)
+    return {"ok": True}
+
+
+@app.get("/api/auth/session")
+async def api_auth_session(request: Request) -> dict[str, Any]:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not session_id or not auth_sessions.has(session_id):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"authenticated": True}
+
+
+@app.get("/api/server-time", dependencies=[Depends(require_auth)])
 async def api_server_time() -> dict[str, Any]:
     """板端 Linux 小核未校时时，face_netd 用此接口推算考勤目录日期（与 DB 里 server_now_ms / created_at 思路一致）。"""
     return {
@@ -646,12 +737,12 @@ async def api_server_time() -> dict[str, Any]:
     }
 
 
-@app.get("/api/devices")
+@app.get("/api/devices", dependencies=[Depends(require_auth)])
 async def api_devices() -> dict[str, Any]:
     return {"devices": state.list_devices()}
 
 
-@app.get("/api/devices/{device_id}/state")
+@app.get("/api/devices/{device_id}/state", dependencies=[Depends(require_auth)])
 async def api_device_state(device_id: str) -> dict[str, Any]:
     row = state.get_device_state(device_id)
     if row is None:
@@ -659,7 +750,7 @@ async def api_device_state(device_id: str) -> dict[str, Any]:
     return {"device": dict(row), "recent_commands": state.get_recent_commands(device_id)}
 
 
-@app.get("/api/devices/{device_id}/commands")
+@app.get("/api/devices/{device_id}/commands", dependencies=[Depends(require_auth)])
 async def api_device_commands(
     device_id: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -670,7 +761,7 @@ async def api_device_commands(
     return state.get_command_page(device_id, limit, offset)
 
 
-@app.get("/api/devices/{device_id}/events")
+@app.get("/api/devices/{device_id}/events", dependencies=[Depends(require_auth)])
 async def api_device_events(
     device_id: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -683,7 +774,7 @@ async def api_device_events(
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-@app.get("/api/devices/{device_id}/sd-attendance-log")
+@app.get("/api/devices/{device_id}/sd-attendance-log", dependencies=[Depends(require_auth)])
 async def api_sd_attendance_log(
     device_id: str,
     timeout_sec: float = Query(default=25.0, ge=3.0, le=120.0),
@@ -726,7 +817,7 @@ async def api_sd_attendance_log(
     }
 
 
-@app.get("/api/devices/{device_id}/face-gallery")
+@app.get("/api/devices/{device_id}/face-gallery", dependencies=[Depends(require_auth)])
 async def api_face_gallery(
     device_id: str,
     timeout_sec: float = Query(default=20.0, ge=3.0, le=120.0),
@@ -747,7 +838,7 @@ async def api_face_gallery(
     return {"entries": entries}
 
 
-@app.get("/api/devices/{device_id}/face-gallery/{slot}/photo.jpg")
+@app.get("/api/devices/{device_id}/face-gallery/{slot}/photo.jpg", dependencies=[Depends(require_auth)])
 async def api_face_gallery_photo(
     device_id: str,
     slot: int,
@@ -775,7 +866,7 @@ async def api_face_gallery_photo(
     return Response(content=raw, media_type="image/jpeg")
 
 
-@app.post("/api/web-data/clear")
+@app.post("/api/web-data/clear", dependencies=[Depends(require_auth)])
 async def api_clear_web_data() -> dict[str, Any]:
     cleared = state.clear_web_data()
     if state.loop:
@@ -783,48 +874,52 @@ async def api_clear_web_data() -> dict[str, Any]:
     return {"status": "ok", "cleared": cleared}
 
 
-@app.post("/api/devices/{device_id}/commands/db-count", status_code=202)
+@app.post("/api/devices/{device_id}/commands/db-count", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_db_count(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "db_count")
 
 
-@app.post("/api/devices/{device_id}/commands/db-reset", status_code=202)
+@app.post("/api/devices/{device_id}/commands/db-reset", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_db_reset(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "db_reset")
 
 
-@app.post("/api/devices/{device_id}/commands/register-current", status_code=202)
+@app.post("/api/devices/{device_id}/commands/register-current", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_register_current(device_id: str, body: RegisterCurrentBody) -> dict[str, Any]:
     return state.publish_command(device_id, "register_current", name=body.name.strip())
 
 
-@app.post("/api/devices/{device_id}/commands/register-preview", status_code=202)
+@app.post("/api/devices/{device_id}/commands/register-preview", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_register_preview(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "register_preview")
 
 
-@app.post("/api/devices/{device_id}/commands/register-commit", status_code=202)
+@app.post("/api/devices/{device_id}/commands/register-commit", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_register_commit(device_id: str, body: RegisterCurrentBody) -> dict[str, Any]:
     return state.publish_command(device_id, "register_commit", name=body.name.strip())
 
 
-@app.post("/api/devices/{device_id}/commands/register-cancel", status_code=202)
+@app.post("/api/devices/{device_id}/commands/register-cancel", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_register_cancel(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "register_cancel")
 
 
-@app.post("/api/devices/{device_id}/commands/import-faces", status_code=202)
+@app.post("/api/devices/{device_id}/commands/import-faces", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_import_faces(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "import_faces")
 
 
-@app.post("/api/devices/{device_id}/commands/shutdown", status_code=202)
+@app.post("/api/devices/{device_id}/commands/shutdown", status_code=202, dependencies=[Depends(require_auth)])
 async def api_cmd_shutdown(device_id: str) -> dict[str, Any]:
     return state.publish_command(device_id, "shutdown")
 
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
+    session_id = websocket.cookies.get(SESSION_COOKIE_NAME, "")
+    if not session_id or not auth_sessions.has(session_id):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     await state.ws.connect(websocket)
     try:
         await websocket.send_text(json_dumps({"type": "snapshot", "devices": state.list_devices()}))
