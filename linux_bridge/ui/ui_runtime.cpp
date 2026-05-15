@@ -73,6 +73,7 @@ lv_obj_t *g_main_status = nullptr;
 lv_obj_t *g_pin_status = nullptr;
 lv_obj_t *g_edit_status = nullptr;
 lv_obj_t *g_manage_btn = nullptr;
+lv_obj_t *g_exit_manage_btn = nullptr;
 lv_obj_t *g_signup_btn = nullptr;
 lv_obj_t *g_import_btn = nullptr;
 lv_obj_t *g_delete_btn = nullptr;
@@ -263,6 +264,14 @@ void on_manage_click(lv_event_t *)
         clear_pin_input();
         g_ui.dirty = true;
     }
+}
+
+void on_exit_manage_click(lv_event_t *)
+{
+    std::lock_guard<std::mutex> lk(g_ui.mu);
+    if (g_ui.auth != AdminAuthState::unlocked || g_ui.session != UiSessionState::idle || g_ui.active)
+        return;
+    lock_management_locked("Management locked");
 }
 
 void on_register_click(lv_event_t *)
@@ -552,6 +561,20 @@ void create_main_screen()
     lv_obj_set_style_text_font(manage_label, &lv_font_montserrat_48, LV_PART_MAIN);
     lv_obj_center(manage_label);
 
+    g_exit_manage_btn = lv_btn_create(g_main_screen);
+    lv_obj_set_size(g_exit_manage_btn, 220, 46);
+    lv_obj_align(g_exit_manage_btn, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_style_radius(g_exit_manage_btn, 18, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_exit_manage_btn, lv_color_hex(0x1d2d3f), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_exit_manage_btn, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_exit_manage_btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(g_exit_manage_btn, on_exit_manage_click, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *exit_label = lv_label_create(g_exit_manage_btn);
+    lv_label_set_text(exit_label, "Exit Manage");
+    lv_obj_set_style_text_font(exit_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_center(exit_label);
+    lv_obj_add_flag(g_exit_manage_btn, LV_OBJ_FLAG_HIDDEN);
+
     g_import_btn = create_icon_action(g_main_screen, "import.png", "Import", -160, on_import_click);
     g_signup_btn = create_icon_action(g_main_screen, "signup.png", "Signup", 0, on_register_click);
     g_delete_btn = create_icon_action(g_main_screen, "delete.png", "Delete", 160, on_delete_click);
@@ -648,6 +671,7 @@ void apply_main_screen_snapshot(AdminAuthState auth, const std::string &status, 
     if (show_manage_only)
     {
         lv_obj_clear_flag(g_manage_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_exit_manage_btn, LV_OBJ_FLAG_HIDDEN);
         hide_actions(true);
         if (auth == AdminAuthState::unavailable)
             lv_obj_add_state(g_manage_btn, LV_STATE_DISABLED);
@@ -657,6 +681,7 @@ void apply_main_screen_snapshot(AdminAuthState auth, const std::string &status, 
     }
 
     lv_obj_add_flag(g_manage_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_exit_manage_btn, LV_OBJ_FLAG_HIDDEN);
     hide_actions(false);
     lv_obj_clear_state(g_manage_btn, LV_STATE_DISABLED);
     if (active)
@@ -664,12 +689,14 @@ void apply_main_screen_snapshot(AdminAuthState auth, const std::string &status, 
         lv_obj_add_state(g_signup_btn, LV_STATE_DISABLED);
         lv_obj_add_state(g_import_btn, LV_STATE_DISABLED);
         lv_obj_add_state(g_delete_btn, LV_STATE_DISABLED);
+        lv_obj_add_state(g_exit_manage_btn, LV_STATE_DISABLED);
     }
     else
     {
         lv_obj_clear_state(g_signup_btn, LV_STATE_DISABLED);
         lv_obj_clear_state(g_import_btn, LV_STATE_DISABLED);
         lv_obj_clear_state(g_delete_btn, LV_STATE_DISABLED);
+        lv_obj_clear_state(g_exit_manage_btn, LV_STATE_DISABLED);
     }
 }
 
