@@ -23,6 +23,7 @@
 
 [K230 SDK 官方文档](https://www.kendryte.com/k230/zh/main/index.html)
 [K230核间通讯API参考](https://www.kendryte.com/k230/zh/main/01_software/board/cdk/K230_%E6%A0%B8%E9%97%B4%E9%80%9A%E8%AE%AF_API%E5%8F%82%E8%80%83.html)
+[K230 GUI实战 - LVGL移植教程](https://www.kendryte.com/k230/zh/main/02_applications/tutorials/K230_GUI%E5%AE%9E%E6%88%98_LVGL%E7%A7%BB%E6%A4%8D%E6%95%99%E7%A8%8B.html)
 
 ## 项目构建流程
 

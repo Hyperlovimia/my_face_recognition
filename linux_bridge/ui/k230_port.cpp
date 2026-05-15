@@ -7,14 +7,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 extern "C" {
@@ -22,6 +25,27 @@ extern "C" {
 }
 
 namespace {
+
+struct TouchDeviceInfo {
+    std::string path;
+    std::string name;
+    std::string probe_error;
+    int fd = -1;
+    int raw_min_x = 0;
+    int raw_max_x = 0;
+    int raw_min_y = 0;
+    int raw_max_y = 0;
+    bool have_abs_x_range = false;
+    bool have_abs_y_range = false;
+    bool has_abs_x = false;
+    bool has_abs_y = false;
+    bool has_mt_x = false;
+    bool has_mt_y = false;
+    bool has_btn_touch = false;
+    bool has_btn_tool_finger = false;
+    bool has_mt_tracking = false;
+    bool has_pressure = false;
+};
 
 struct PortRuntime {
     k230_ui_port_config cfg{};
@@ -35,6 +59,16 @@ struct PortRuntime {
     int raw_touch_x = 0;
     int raw_touch_y = 0;
     int touch_state = LV_INDEV_STATE_REL;
+    int raw_min_x = 0;
+    int raw_max_x = 0;
+    int raw_min_y = 0;
+    int raw_max_y = 0;
+    bool have_abs_x_range = false;
+    bool have_abs_y_range = false;
+    bool have_btn_touch = false;
+    bool have_btn_tool_finger = false;
+    bool have_mt_tracking = false;
+    bool touch_down_logged = false;
     bool inited = false;
     void *draw_buf_mem = nullptr;
     lv_disp_draw_buf_t draw_buf_dsc{};
@@ -44,6 +78,185 @@ struct PortRuntime {
 };
 
 PortRuntime g_port;
+
+template <size_t N>
+bool test_bit(const unsigned long (&bits)[N], int bit)
+{
+    const size_t bits_per_word = sizeof(unsigned long) * 8u;
+    const size_t word = static_cast<size_t>(bit) / bits_per_word;
+    const size_t shift = static_cast<size_t>(bit) % bits_per_word;
+    if (word >= N)
+        return false;
+    return (bits[word] & (1UL << shift)) != 0;
+}
+
+void close_touch_device_info(TouchDeviceInfo *info)
+{
+    if (!info)
+        return;
+    if (info->fd >= 0)
+        close(info->fd);
+    info->fd = -1;
+}
+
+bool probe_abs_range(int fd, unsigned int code, int *out_min, int *out_max)
+{
+    if (fd < 0 || !out_min || !out_max)
+        return false;
+
+    struct input_absinfo abs_info {};
+    if (ioctl(fd, EVIOCGABS(code), &abs_info) != 0)
+        return false;
+    *out_min = abs_info.minimum;
+    *out_max = abs_info.maximum;
+    return *out_max > *out_min;
+}
+
+bool probe_touch_device(const std::string &path, TouchDeviceInfo *out)
+{
+    if (!out)
+        return false;
+
+    *out = TouchDeviceInfo{};
+    out->path = path;
+    out->fd = open(path.c_str(), O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (out->fd < 0)
+    {
+        out->probe_error = std::strerror(errno);
+        return false;
+    }
+
+    char name_buf[128] = {0};
+    if (ioctl(out->fd, EVIOCGNAME(sizeof(name_buf)), name_buf) >= 0)
+        out->name = name_buf;
+
+    unsigned long ev_bits[(EV_MAX + (sizeof(unsigned long) * 8)) / (sizeof(unsigned long) * 8)] = {0};
+    if (ioctl(out->fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0)
+    {
+        out->probe_error = std::string("EVIOCGBIT failed: ") + std::strerror(errno);
+        close_touch_device_info(out);
+        return false;
+    }
+
+    if (test_bit(ev_bits, EV_KEY))
+    {
+        unsigned long key_bits[(KEY_MAX + (sizeof(unsigned long) * 8)) / (sizeof(unsigned long) * 8)] = {0};
+        if (ioctl(out->fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) >= 0)
+        {
+            out->has_btn_touch = test_bit(key_bits, BTN_TOUCH);
+            out->has_btn_tool_finger = test_bit(key_bits, BTN_TOOL_FINGER);
+        }
+    }
+
+    if (test_bit(ev_bits, EV_ABS))
+    {
+        unsigned long abs_bits[(ABS_MAX + (sizeof(unsigned long) * 8)) / (sizeof(unsigned long) * 8)] = {0};
+        if (ioctl(out->fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) >= 0)
+        {
+            out->has_abs_x = test_bit(abs_bits, ABS_X);
+            out->has_abs_y = test_bit(abs_bits, ABS_Y);
+            out->has_mt_x = test_bit(abs_bits, ABS_MT_POSITION_X);
+            out->has_mt_y = test_bit(abs_bits, ABS_MT_POSITION_Y);
+            out->has_mt_tracking = test_bit(abs_bits, ABS_MT_TRACKING_ID);
+            out->has_pressure = test_bit(abs_bits, ABS_PRESSURE);
+        }
+    }
+
+    if (out->has_mt_x)
+        out->have_abs_x_range = probe_abs_range(out->fd, ABS_MT_POSITION_X, &out->raw_min_x, &out->raw_max_x);
+    if (!out->have_abs_x_range && out->has_abs_x)
+        out->have_abs_x_range = probe_abs_range(out->fd, ABS_X, &out->raw_min_x, &out->raw_max_x);
+
+    if (out->has_mt_y)
+        out->have_abs_y_range = probe_abs_range(out->fd, ABS_MT_POSITION_Y, &out->raw_min_y, &out->raw_max_y);
+    if (!out->have_abs_y_range && out->has_abs_y)
+        out->have_abs_y_range = probe_abs_range(out->fd, ABS_Y, &out->raw_min_y, &out->raw_max_y);
+
+    return true;
+}
+
+bool is_touch_candidate(const TouchDeviceInfo &info)
+{
+    const bool has_position = (info.has_mt_x || info.has_abs_x) && (info.has_mt_y || info.has_abs_y);
+    const bool has_press_signal =
+        info.has_btn_touch || info.has_btn_tool_finger || info.has_mt_tracking || info.has_pressure;
+    return has_position && has_press_signal;
+}
+
+void apply_touch_device_info(const TouchDeviceInfo &info)
+{
+    g_port.touch_fd = info.fd;
+    g_port.raw_min_x = info.raw_min_x;
+    g_port.raw_max_x = info.raw_max_x;
+    g_port.raw_min_y = info.raw_min_y;
+    g_port.raw_max_y = info.raw_max_y;
+    g_port.have_abs_x_range = info.have_abs_x_range;
+    g_port.have_abs_y_range = info.have_abs_y_range;
+    g_port.have_btn_touch = info.has_btn_touch;
+    g_port.have_btn_tool_finger = info.has_btn_tool_finger;
+    g_port.have_mt_tracking = info.has_mt_tracking;
+    g_port.touch_down_logged = false;
+}
+
+void log_touch_caps(const char *prefix, const TouchDeviceInfo &info)
+{
+    std::fprintf(stderr,
+                 "%s dev=%s name=\"%s\" abs=%d/%d mt=%d/%d btn_touch=%d btn_tool_finger=%d tracking=%d pressure=%d raw_x=[%d,%d] raw_y=[%d,%d]\n",
+                 prefix, info.path.c_str(), info.name.c_str(), info.has_abs_x ? 1 : 0, info.has_abs_y ? 1 : 0,
+                 info.has_mt_x ? 1 : 0, info.has_mt_y ? 1 : 0, info.has_btn_touch ? 1 : 0,
+                 info.has_btn_tool_finger ? 1 : 0, info.has_mt_tracking ? 1 : 0, info.has_pressure ? 1 : 0,
+                 info.raw_min_x, info.raw_max_x, info.raw_min_y, info.raw_max_y);
+}
+
+std::vector<std::string> enumerate_input_event_nodes()
+{
+    std::vector<std::string> paths;
+    DIR *dir = opendir("/dev/input");
+    if (!dir)
+        return paths;
+
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr)
+    {
+        if (std::strncmp(entry->d_name, "event", 5) != 0)
+            continue;
+        paths.emplace_back(std::string("/dev/input/") + entry->d_name);
+    }
+    closedir(dir);
+
+    std::sort(paths.begin(), paths.end(), [](const std::string &a, const std::string &b) {
+        const auto parse_idx = [](const std::string &path) {
+            const size_t pos = path.find("event");
+            if (pos == std::string::npos)
+                return -1;
+            return std::atoi(path.c_str() + pos + 5);
+        };
+        return parse_idx(a) < parse_idx(b);
+    });
+    return paths;
+}
+
+bool try_open_touch_device(const std::string &path, bool explicit_choice)
+{
+    TouchDeviceInfo info;
+    if (!probe_touch_device(path, &info))
+    {
+        std::fprintf(stderr, "face_netd_ui: probe input dev=%s failed: %s\n", path.c_str(),
+                     info.probe_error.empty() ? "unknown error" : info.probe_error.c_str());
+        return false;
+    }
+
+    if (!is_touch_candidate(info))
+    {
+        log_touch_caps("face_netd_ui: skip non-touch input", info);
+        close_touch_device_info(&info);
+        return false;
+    }
+
+    apply_touch_device_info(info);
+    log_touch_caps("face_netd_ui: touch ok", info);
+    return true;
+}
 
 size_t align_up(size_t value, size_t alignment)
 {
@@ -168,22 +381,43 @@ void map_touch_point(int *x, int *y)
 
     int mx = *x;
     int my = *y;
+
+    const int raw_min_x = g_port.have_abs_x_range ? g_port.raw_min_x : 0;
+    const int raw_max_x = g_port.have_abs_x_range ? g_port.raw_max_x : (g_port.cfg.screen_width - 1);
+    const int raw_min_y = g_port.have_abs_y_range ? g_port.raw_min_y : 0;
+    const int raw_max_y = g_port.have_abs_y_range ? g_port.raw_max_y : (g_port.cfg.screen_height - 1);
+    const int raw_span_x = std::max(1, raw_max_x - raw_min_x);
+    const int raw_span_y = std::max(1, raw_max_y - raw_min_y);
+
     if (g_port.cfg.flip_x)
-        mx = g_port.cfg.screen_width - mx;
+        mx = raw_max_x - (mx - raw_min_x);
     if (g_port.cfg.flip_y)
-        my = g_port.cfg.screen_height - my;
+        my = raw_max_y - (my - raw_min_y);
 
-    mx = std::max(0, std::min(mx, g_port.cfg.screen_width - 1));
-    my = std::max(0, std::min(my, g_port.cfg.screen_height - 1));
+    mx = std::max(raw_min_x, std::min(mx, raw_max_x));
+    my = std::max(raw_min_y, std::min(my, raw_max_y));
 
-    mx = static_cast<int>((static_cast<int64_t>(mx) * g_port.cfg.logical_width) / std::max(1, g_port.cfg.screen_width));
-    my =
-        static_cast<int>((static_cast<int64_t>(my) * g_port.cfg.logical_height) / std::max(1, g_port.cfg.screen_height));
+    mx = static_cast<int>((static_cast<int64_t>(mx - raw_min_x) * (g_port.cfg.logical_width - 1)) / raw_span_x);
+    my = static_cast<int>((static_cast<int64_t>(my - raw_min_y) * (g_port.cfg.logical_height - 1)) / raw_span_y);
 
     mx = std::max(0, std::min(mx, g_port.cfg.logical_width - 1));
     my = std::max(0, std::min(my, g_port.cfg.logical_height - 1));
     *x = mx;
     *y = my;
+}
+
+void apply_touch_key_state(int code, int value)
+{
+    if (code == BTN_TOUCH)
+    {
+        g_port.have_btn_touch = true;
+        g_port.touch_state = value ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+    }
+    else if (code == BTN_TOOL_FINGER)
+    {
+        g_port.have_btn_tool_finger = true;
+        g_port.touch_state = value ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+    }
 }
 
 void touchpad_read(lv_indev_drv_t *, lv_indev_data_t *data)
@@ -202,10 +436,19 @@ void touchpad_read(lv_indev_drv_t *, lv_indev_data_t *data)
                     g_port.raw_touch_x = ev.value;
                 else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y)
                     g_port.raw_touch_y = ev.value;
+                else if (ev.code == ABS_MT_TRACKING_ID)
+                {
+                    g_port.have_mt_tracking = true;
+                    g_port.touch_state = (ev.value < 0) ? LV_INDEV_STATE_REL : LV_INDEV_STATE_PR;
+                }
+                else if (ev.code == ABS_PRESSURE && !g_port.have_btn_touch && !g_port.have_btn_tool_finger)
+                {
+                    g_port.touch_state = (ev.value > 0) ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+                }
             }
-            else if (ev.type == EV_KEY && ev.code == BTN_TOUCH)
+            else if (ev.type == EV_KEY)
             {
-                g_port.touch_state = ev.value ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+                apply_touch_key_state(ev.code, ev.value);
             }
         }
     }
@@ -216,17 +459,48 @@ void touchpad_read(lv_indev_drv_t *, lv_indev_data_t *data)
     data->state = static_cast<lv_indev_state_t>(g_port.touch_state);
     data->point.x = mapped_x;
     data->point.y = mapped_y;
+
+    if (g_port.touch_state == LV_INDEV_STATE_PR)
+    {
+        if (!g_port.touch_down_logged)
+        {
+            std::fprintf(stderr, "face_netd_ui: touch press raw=(%d,%d) mapped=(%d,%d)\n", g_port.raw_touch_x,
+                         g_port.raw_touch_y, mapped_x, mapped_y);
+            g_port.touch_down_logged = true;
+        }
+    }
+    else
+    {
+        g_port.touch_down_logged = false;
+    }
 }
 
 bool init_touch()
 {
-    g_port.touch_fd = open(g_port.cfg.touch_device, O_RDONLY | O_NOCTTY | O_NONBLOCK);
-    if (g_port.touch_fd < 0)
-        std::fprintf(stderr, "face_netd_ui: open touch failed dev=%s errno=%d (%s)\n", g_port.cfg.touch_device, errno,
-                     std::strerror(errno));
+    const std::string configured = g_port.cfg.touch_device ? g_port.cfg.touch_device : "";
+    if (!configured.empty() && configured != "auto")
+    {
+        if (try_open_touch_device(configured, true))
+            return true;
+        std::fprintf(stderr, "face_netd_ui: configured touch dev=%s unavailable, probing /dev/input/event*\n",
+                     configured.c_str());
+    }
+
+    const std::vector<std::string> candidates = enumerate_input_event_nodes();
+    if (candidates.empty())
+        std::fprintf(stderr, "face_netd_ui: /dev/input has no event* nodes\n");
     else
-        std::fprintf(stderr, "face_netd_ui: touch ok dev=%s fd=%d\n", g_port.cfg.touch_device, g_port.touch_fd);
-    return g_port.touch_fd >= 0;
+        std::fprintf(stderr, "face_netd_ui: probing %zu input event nodes\n", candidates.size());
+    for (const auto &path : candidates)
+    {
+        if (path == configured)
+            continue;
+        if (try_open_touch_device(path, false))
+            return true;
+    }
+
+    std::fprintf(stderr, "face_netd_ui: no touch-capable /dev/input/event* device found\n");
+    return false;
 }
 
 void cleanup_touch()
