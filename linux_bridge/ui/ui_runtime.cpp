@@ -23,6 +23,9 @@ extern "C" {
 
 namespace {
 
+constexpr uint16_t k_action_icon_scale = (LV_IMG_ZOOM_NONE * 3) / 4;
+constexpr lv_coord_t k_keyboard_height = 320;
+
 enum class UiSessionState {
     idle = 0,
     preview_requested,
@@ -258,6 +261,7 @@ lv_obj_t *create_icon_action(lv_obj_t *parent, const char *image_name, const cha
     {
         obj = lv_img_create(parent);
         lv_img_set_src(obj, asset_path.c_str());
+        lv_img_set_zoom(obj, k_action_icon_scale);
     }
     else
     {
@@ -343,7 +347,7 @@ void create_edit_screen()
     lv_obj_set_style_text_font(g_keyboard, &lv_font_montserrat_40, LV_PART_MAIN);
     lv_keyboard_set_mode(g_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_keyboard_set_textarea(g_keyboard, g_name_ta);
-    lv_obj_set_size(g_keyboard, lv_pct(100), 580);
+    lv_obj_set_size(g_keyboard, lv_pct(100), k_keyboard_height);
     lv_obj_align(g_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(g_keyboard, on_keyboard_event, LV_EVENT_ALL, nullptr);
     lv_obj_align_to(g_name_ta, g_keyboard, LV_ALIGN_OUT_TOP_MID, 0, -10);
