@@ -349,7 +349,7 @@ bool resolve_profile(const std::string &profile, k230_ui_port_config *cfg)
     cfg->drm_device = "/dev/dri/card0";
     cfg->touch_device = g_ui.cfg.touch_device.empty() ? "/dev/input/event0" : g_ui.cfg.touch_device.c_str();
     cfg->overlay_width = 1080;
-    cfg->overlay_height = 720;
+    cfg->overlay_height = 960;
     cfg->offset_x = 0;
     cfg->offset_y = 0;
     cfg->align_bottom = true;

@@ -26,7 +26,7 @@ extern "C" {
 
 namespace {
 
-constexpr int kUiPlaneIndex = 2;
+constexpr int kDefaultUiPlaneIndex = 2;
 constexpr int kUiBufferCount = 2;
 
 struct PortRuntime {
@@ -42,6 +42,7 @@ struct PortRuntime {
     int raw_touch_x = 0;
     int raw_touch_y = 0;
     int touch_state = LV_INDEV_STATE_REL;
+    int plane_index = -1;
     bool inited = false;
     bool stop = false;
     bool pflip_thread_started = false;
@@ -127,9 +128,13 @@ void drm_wait_vsync(drm_dev *dev)
         drmHandleEvent(dev->fd, &ctx);
         dev->pflip_pending = false;
     }
+    else if (ret < 0)
+    {
+        std::fprintf(stderr, "face_netd_ui: drm_wait_vsync select failed errno=%d (%s)\n", errno, std::strerror(errno));
+    }
 }
 
-int plane_config(drm_dev *dev, drm_buffer *buf)
+int plane_config(drm_dev *dev, drm_buffer *buf, int plane_index)
 {
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     if (!req)
@@ -145,16 +150,16 @@ int plane_config(drm_dev *dev, drm_buffer *buf)
     if ((ret = drm_set_object_property(req, &dev->conn, "CRTC_ID", dev->crtc_id)) < 0 ||
         (ret = drm_set_object_property(req, &dev->crtc, "MODE_ID", dev->mode_blob_id)) < 0 ||
         (ret = drm_set_object_property(req, &dev->crtc, "ACTIVE", 1)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "FB_ID", buf->fb)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_ID", dev->crtc_id)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "SRC_X", 0)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "SRC_Y", 0)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "SRC_W", buf->width << 16)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "SRC_H", buf->height << 16)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_X", buf->offset_x)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_Y", buf->offset_y)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_W", buf->width)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_H", buf->height)) < 0)
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "FB_ID", buf->fb)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_ID", dev->crtc_id)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "SRC_X", 0)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "SRC_Y", 0)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "SRC_W", buf->width << 16)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "SRC_H", buf->height << 16)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_X", buf->offset_x)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_Y", buf->offset_y)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_W", buf->width)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_H", buf->height)) < 0)
     {
         drmModeAtomicFree(req);
         return ret;
@@ -165,19 +170,24 @@ int plane_config(drm_dev *dev, drm_buffer *buf)
         ret = drmModeAtomicCommit(dev->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT, nullptr);
     if (ret == 0)
         dev->pflip_pending = true;
+    else
+        std::fprintf(stderr,
+                     "face_netd_ui: plane_config failed ret=%d plane=%d fb=%u pos=%d,%d size=%ux%u\n",
+                     ret, plane_index, buf ? buf->fb : 0, buf ? buf->offset_x : 0, buf ? buf->offset_y : 0,
+                     buf ? buf->width : 0, buf ? buf->height : 0);
     drmModeAtomicFree(req);
     return ret;
 }
 
-int plane_update(drm_dev *dev, drm_buffer *buf)
+int plane_update(drm_dev *dev, drm_buffer *buf, int plane_index)
 {
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     if (!req)
         return -1;
     const uint32_t fb = buf ? buf->fb : 0;
     int ret = 0;
-    if ((ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "FB_ID", fb)) < 0 ||
-        (ret = drm_set_object_property(req, &dev->planes[kUiPlaneIndex], "CRTC_ID", fb ? dev->crtc_id : 0)) < 0)
+    if ((ret = drm_set_object_property(req, &dev->planes[plane_index], "FB_ID", fb)) < 0 ||
+        (ret = drm_set_object_property(req, &dev->planes[plane_index], "CRTC_ID", fb ? dev->crtc_id : 0)) < 0)
     {
         drmModeAtomicFree(req);
         return ret;
@@ -185,8 +195,40 @@ int plane_update(drm_dev *dev, drm_buffer *buf)
     ret = drmModeAtomicCommit(dev->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT, nullptr);
     if (ret == 0)
         dev->pflip_pending = true;
+    else
+        std::fprintf(stderr, "face_netd_ui: plane_update failed ret=%d plane=%d fb=%u\n", ret, plane_index, fb);
     drmModeAtomicFree(req);
     return ret;
+}
+
+bool select_plane(drm_dev *dev, drm_buffer *buf)
+{
+    if (!dev || !buf || dev->plane_count == 0)
+        return false;
+
+    auto try_plane = [&](int idx) -> bool {
+        if (idx < 0 || static_cast<uint32_t>(idx) >= dev->plane_count)
+            return false;
+        if (plane_config(dev, buf, idx) == 0)
+        {
+            g_port.plane_index = idx;
+            std::fprintf(stderr, "face_netd_ui: selected plane=%d plane_id=%u\n", idx, dev->planes[idx].id);
+            return true;
+        }
+        return false;
+    };
+
+    if (try_plane(kDefaultUiPlaneIndex))
+        return true;
+
+    for (uint32_t i = 0; i < dev->plane_count; ++i)
+    {
+        if (static_cast<int>(i) == kDefaultUiPlaneIndex)
+            continue;
+        if (try_plane(static_cast<int>(i)))
+            return true;
+    }
+    return false;
 }
 
 void pflip_thread_body()
@@ -210,7 +252,8 @@ void pflip_thread_body()
         const int stat = buf_mgt_reader_get(&g_port.buf_mgt, reinterpret_cast<void **>(&idx), 1);
         if (stat < 0 || idx >= kUiBufferCount)
             idx = 0;
-        plane_update(&g_port.drm, &g_port.bufs[idx]);
+        if (g_port.plane_index >= 0)
+            plane_update(&g_port.drm, &g_port.bufs[idx], g_port.plane_index);
     }
 }
 
@@ -245,7 +288,8 @@ void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *colo
         if (first_frame)
         {
             first_frame = false;
-            plane_config(&g_port.drm, &g_port.bufs[idx]);
+            if (!select_plane(&g_port.drm, &g_port.bufs[idx]))
+                std::fprintf(stderr, "face_netd_ui: no usable DRM plane found for overlay\n");
         }
         break;
     }
@@ -254,13 +298,23 @@ void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *colo
 bool init_drm()
 {
     if (drm_dev_setup(&g_port.drm, g_port.cfg.drm_device) != 0)
+    {
+        std::fprintf(stderr, "face_netd_ui: drm_dev_setup failed for %s\n", g_port.cfg.drm_device);
         return false;
+    }
 
     drm_get_resolution(&g_port.drm, &g_port.screen_width, &g_port.screen_height);
     g_port.resolved_offset_x = std::max(0, g_port.cfg.offset_x);
     g_port.resolved_offset_y = g_port.cfg.align_bottom
                                    ? std::max(0, static_cast<int>(g_port.screen_height) - g_port.cfg.overlay_height)
                                    : std::max(0, g_port.cfg.offset_y);
+    std::fprintf(stderr,
+                 "face_netd_ui: drm ok dev=%s screen=%ux%u overlay=%dx%d offset=%d,%d plane_count=%u preferred_plane=%d\n",
+                 g_port.cfg.drm_device, g_port.screen_width, g_port.screen_height, g_port.cfg.overlay_width,
+                 g_port.cfg.overlay_height, g_port.resolved_offset_x, g_port.resolved_offset_y, g_port.drm.plane_count,
+                 kDefaultUiPlaneIndex);
+    for (uint32_t i = 0; i < g_port.drm.plane_count; ++i)
+        std::fprintf(stderr, "face_netd_ui: plane[%u] id=%u\n", i, g_port.drm.planes[i].id);
 
     for (int i = 0; i < kUiBufferCount; ++i)
     {
@@ -272,7 +326,11 @@ bool init_drm()
         g_port.bufs[i].bpp = 16;
         buf_mgt_reader_put(&g_port.buf_mgt, reinterpret_cast<void *>(static_cast<uint64_t>(i)));
         if (drm_create_fb(g_port.drm.fd, &g_port.bufs[i]) != 0)
+        {
+            std::fprintf(stderr, "face_netd_ui: drm_create_fb failed idx=%d size=%ux%u\n", i, g_port.bufs[i].width,
+                         g_port.bufs[i].height);
             return false;
+        }
         std::memset(g_port.bufs[i].map, 0,
                     static_cast<size_t>(g_port.cfg.overlay_width) * g_port.cfg.overlay_height * sizeof(uint16_t));
     }
@@ -309,6 +367,11 @@ void cleanup_drm()
 bool init_touch()
 {
     g_port.touch_fd = open(g_port.cfg.touch_device, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (g_port.touch_fd < 0)
+        std::fprintf(stderr, "face_netd_ui: open touch failed dev=%s errno=%d (%s)\n", g_port.cfg.touch_device, errno,
+                     std::strerror(errno));
+    else
+        std::fprintf(stderr, "face_netd_ui: touch ok dev=%s fd=%d\n", g_port.cfg.touch_device, g_port.touch_fd);
     return g_port.touch_fd >= 0;
 }
 
@@ -324,9 +387,13 @@ void cleanup_touch()
 bool k230_ui_port_init(const struct k230_ui_port_config *cfg)
 {
     if (!cfg || !cfg->drm_device || !cfg->touch_device || cfg->overlay_width <= 0 || cfg->overlay_height <= 0)
+    {
+        std::fprintf(stderr, "face_netd_ui: invalid port config\n");
         return false;
+    }
 
     g_port.cfg = *cfg;
+    g_port.plane_index = -1;
     g_port.composed_argb4444.assign(static_cast<size_t>(cfg->overlay_width) * cfg->overlay_height, 0);
     if (!init_drm() || !init_touch())
     {
@@ -358,6 +425,7 @@ bool k230_ui_port_init(const struct k230_ui_port_config *cfg)
     lv_indev_drv_register(&g_port.indev_drv);
 
     g_port.inited = true;
+    std::fprintf(stderr, "face_netd_ui: port init complete\n");
     return true;
 }
 

@@ -24,9 +24,9 @@
 [K230 SDK 官方文档](https://www.kendryte.com/k230/zh/main/index.html)
 [K230核间通讯API参考](https://www.kendryte.com/k230/zh/main/01_software/board/cdk/K230_%E6%A0%B8%E9%97%B4%E9%80%9A%E8%AE%AF_API%E5%8F%82%E8%80%83.html)
 
-# 项目构建流程
+## 项目构建流程
 
-## Linux 小核项目
+### Linux 小核项目
 
 直接执行脚本
 ```sh
@@ -37,11 +37,10 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_br
 > 编译完成后，可在 `out/` 目录下看到可执行程序与配套测试文件
 > 另外，face_netd.ini 也需要传到板子上
 
-## RT-Smart 大核项目
+### RT-Smart 大核项目
 
 RT-Smart 大核项目支持在宿主机中直接执行脚本编译，具体方法如下
 
-### 准备工具链
 ```sh
 cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 ./build_app.sh
@@ -50,3 +49,10 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 > 注：项目 `my_face_recognition` 必须放在 k230_sdk/src/reference/ai_poc/ 目录下
 > `build_app.sh` 会优先使用 `k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin`
 > 编译完成后，可在 `k230_bin/` 目录下看到可执行程序与配套测试文件
+
+## 调试流程
+
+小核通过 ssh 建立连接，大核目前只能通过串口建立连接
+```sh
+ssh root@192.168.230.8  # 连接 linux 小核
+```
