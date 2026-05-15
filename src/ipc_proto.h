@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 
+#include "ui_overlay_shared.h"
+
 #define IPC_MAGIC 0xFACECAFEu
 
 #define IPC_FACE_AI_CHANNEL "face_ai_req"
@@ -15,6 +17,7 @@
 #define IPC_FACE_BRIDGE_SERVICE "face_bridge"
 #define IPC_FACE_BRIDGE_PORT 301u
 #define IPC_FACE_BRIDGE_MODULE 1u
+#define IPC_IMPORT_STAGE_DIR "/sharefs/face_bridge/import_staging"
 
 #define IPC_MAX_FACES 8
 #define IPC_NAME_MAX 64
@@ -27,6 +30,7 @@ typedef enum {
     IPC_CMD_DB_RESET = 2,
     IPC_CMD_REGISTER_COMMIT = 3,
     IPC_CMD_SHUTDOWN = 4,
+    IPC_CMD_IMPORT_IMAGE = 5,
 } ipc_cmd_t;
 
 /* ipc_ai_reply_t.status：成功为 IPC_STATUS_OK；错误应答若仍通过 reply shmid 返回则填非 0 */
@@ -125,17 +129,21 @@ typedef enum {
     IPC_BRIDGE_CMD_REGISTER_COMMIT = 6,
     /** 放弃注册并关闭预览小窗(对应 video state 6) */
     IPC_BRIDGE_CMD_REGISTER_CANCEL = 7,
+    /** Linux 小核扫描 TF 卡 staged 图片并逐张下发给 RT 导入 */
+    IPC_BRIDGE_CMD_IMPORT_FACES = 8,
 } ipc_bridge_cmd_t;
 
 typedef enum {
     IPC_BRIDGE_MSG_CMD_REQ = 1,
     IPC_BRIDGE_MSG_EVENT = 2,
     IPC_BRIDGE_MSG_CMD_RESULT = 3,
+    IPC_BRIDGE_MSG_UI_SHARED_INFO = 4,
 } ipc_bridge_msg_kind_t;
 
 typedef enum {
     IPC_VIDEO_CTRL_OP_SET = 0,
     IPC_VIDEO_CTRL_OP_QUIT = 1,
+    IPC_VIDEO_CTRL_OP_UI_ATTACH = 2,
 } ipc_video_ctrl_op_t;
 
 typedef struct {
@@ -146,6 +154,12 @@ typedef struct {
     int32_t bridge_cmd; /* ipc_bridge_cmd_t */
     char request_id[IPC_REQUEST_ID_MAX];
     char register_name[IPC_NAME_MAX];
+    uint64_t ui_phys_addr;
+    uint32_t ui_bytes;
+    uint32_t ui_width;
+    uint32_t ui_height;
+    uint32_t ui_stride;
+    uint32_t ui_generation;
 } ipc_video_ctrl_t;
 
 typedef struct {
@@ -181,6 +195,16 @@ typedef struct {
     uint64_t ts_ms; /* realtime ms */
     char name[IPC_NAME_MAX];
 } bridge_event_t;
+
+typedef struct {
+    uint32_t magic;
+    uint64_t ui_phys_addr;
+    uint32_t ui_bytes;
+    uint32_t ui_width;
+    uint32_t ui_height;
+    uint32_t ui_stride;
+    uint32_t ui_generation;
+} bridge_ui_shared_info_t;
 
 typedef struct {
     uint32_t magic;

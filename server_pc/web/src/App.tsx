@@ -4,11 +4,12 @@ import SlDialog from "@shoelace-style/shoelace/dist/react/dialog/index.js";
 import type { SlRequestCloseEvent } from "@shoelace-style/shoelace/dist/react/dialog/index.js";
 import SlIcon from "@shoelace-style/shoelace/dist/react/icon/index.js";
 import * as api from "./api";
-import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry, WsMessage } from "./types";
 import type { SdAttendanceLogResponse } from "./api";
+import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry, WsMessage } from "./types";
 
 /** 设备未校时时 ts_ms 接近 1970；优先信任服务端时间 */
 const MIN_SANE_DEVICE_TS_MS = 1_000_000_000_000;
+const PAGE_SIZE = 20;
 
 /** 解析服务端 ISO8601 created_at（兼容 Safari 对高位小数秒的挑剔） */
 function parseIsoToMs(iso: string): number | null {
@@ -69,14 +70,60 @@ function todayLocalYmd(): string {
   return `${y}-${m}-${day}`;
 }
 
+function totalPages(total: number): number {
+  return Math.max(1, Math.ceil(total / PAGE_SIZE));
+}
+
+function PaginationControls({
+  page,
+  total,
+  onPageChange,
+}: {
+  page: number;
+  total: number;
+  onPageChange: (page: number) => void;
+}) {
+  const pages = totalPages(total);
+  if (total <= PAGE_SIZE) {
+    return null;
+  }
+  return (
+    <div className="list-pagination" aria-label="分页">
+      <span className="list-pagination__summary">
+        第 {page} / {pages} 页 · 共 {total} 条
+      </span>
+      <div className="list-pagination__actions">
+        <button type="button" className="list-pagination__btn" disabled={page <= 1} onClick={() => onPageChange(page - 1)}>
+          上一页
+        </button>
+        <button
+          type="button"
+          className="list-pagination__btn"
+          disabled={page >= pages}
+          onClick={() => onPageChange(page + 1)}
+        >
+          下一页
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [loginPassword, setLoginPassword] = useState("");
   const [devices, setDevices] = useState<DeviceRow[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
-  const [deviceState, setDeviceState] = useState<{
-    device: DeviceRow;
-    recent_commands: CommandRow[];
-  } | null>(null);
-  const [events, setEvents] = useState<EventRow[]>([]);
+  const [deviceState, setDeviceState] = useState<{ device: DeviceRow } | null>(null);
+  const [commandRows, setCommandRows] = useState<CommandRow[]>([]);
+  const [commandTotal, setCommandTotal] = useState(0);
+  const [commandPage, setCommandPage] = useState(1);
+  const [eventRows, setEventRows] = useState<EventRow[]>([]);
+  const [eventTotal, setEventTotal] = useState(0);
+  const [eventPage, setEventPage] = useState(1);
   const [wsStatus, setWsStatus] = useState<"ok" | "bad">("bad");
   const [registerOpen, setRegisterOpen] = useState(false);
   const [regName, setRegName] = useState("");
@@ -92,8 +139,12 @@ export function App() {
   const dismissProgrammatic = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const sessionRef = useRef(false);
+  const commandPageRef = useRef(1);
+  const eventPageRef = useRef(1);
   const wsRef = useRef<WebSocket | null>(null);
   const connectWsRef = useRef<() => void>(() => {});
+  const wsReconnectTimerRef = useRef<number | null>(null);
+  const authRef = useRef(false);
 
   useEffect(() => {
     selectedRef.current = selectedDevice;
@@ -102,6 +153,92 @@ export function App() {
   useEffect(() => {
     sessionRef.current = registerSessionOpen;
   }, [registerSessionOpen]);
+
+  useEffect(() => {
+    commandPageRef.current = commandPage;
+  }, [commandPage]);
+
+  useEffect(() => {
+    eventPageRef.current = eventPage;
+  }, [eventPage]);
+
+  useEffect(() => {
+    authRef.current = authenticated;
+  }, [authenticated]);
+
+  const clearWsReconnectTimer = useCallback(() => {
+    if (wsReconnectTimerRef.current !== null) {
+      window.clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const closeWs = useCallback(() => {
+    clearWsReconnectTimer();
+    const ws = wsRef.current;
+    wsRef.current = null;
+    if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+      ws.close();
+    }
+  }, [clearWsReconnectTimer]);
+
+  const resetDashboardState = useCallback(() => {
+    dismissProgrammatic.current = false;
+    selectedRef.current = null;
+    sessionRef.current = false;
+    commandPageRef.current = 1;
+    eventPageRef.current = 1;
+    setDevices([]);
+    setSelectedDevice(null);
+    setDeviceState(null);
+    setCommandRows([]);
+    setCommandTotal(0);
+    setCommandPage(1);
+    setEventRows([]);
+    setEventTotal(0);
+    setEventPage(1);
+    setWsStatus("bad");
+    setRegisterOpen(false);
+    setRegName("");
+    setRegisterSessionOpen(false);
+    setRegisterPreviewLoading(false);
+    setGalleryEntries([]);
+    setGalleryErr(null);
+    setFaceBoardBusy(false);
+    setSdLogData(null);
+    setSdLogErr(null);
+    setSdLogLoading(false);
+    setSdLogDate(todayLocalYmd());
+  }, []);
+
+  const enterLoggedOutState = useCallback(
+    (message: string | null) => {
+      authRef.current = false;
+      closeWs();
+      resetDashboardState();
+      setAuthenticated(false);
+      setAuthChecking(false);
+      setAuthSubmitting(false);
+      setAuthError(message);
+    },
+    [closeWs, resetDashboardState],
+  );
+
+  const handleUnauthorized = useCallback(
+    (error: unknown, message = "登录已失效，请重新输入管理员密码。") => {
+      if (!api.isUnauthorizedError(error)) {
+        return false;
+      }
+      enterLoggedOutState(message);
+      return true;
+    },
+    [enterLoggedOutState],
+  );
+
+  const showError = useCallback((error: unknown) => {
+    console.error(error);
+    alert((error as Error).message);
+  }, []);
 
   const loadDevices = useCallback(async (): Promise<string | null> => {
     const data = await api.getDevices();
@@ -119,29 +256,63 @@ export function App() {
     return nextSelect;
   }, []);
 
-  const loadSelected = useCallback(async (deviceId: string | null) => {
+  const loadDeviceState = useCallback(async (deviceId: string | null) => {
     if (!deviceId) {
       setDeviceState(null);
-      setEvents([]);
       return;
     }
-    const [st, ev] = await Promise.all([api.getDeviceState(deviceId), api.getDeviceEvents(deviceId, 100)]);
-    setDeviceState({ device: st.device, recent_commands: st.recent_commands });
-    setEvents(ev.events);
+    const st = await api.getDeviceState(deviceId);
+    setDeviceState({ device: st.device });
   }, []);
 
-  useEffect(() => {
-    void loadDevices();
-  }, [loadDevices]);
-
-  useEffect(() => {
-    if (selectedDevice) {
-      void loadSelected(selectedDevice);
-    } else {
-      setDeviceState(null);
-      setEvents([]);
+  const loadCommandPage = useCallback(async (deviceId: string, page: number) => {
+    const requestedPage = Math.max(1, page);
+    let data = await api.getDeviceCommands(deviceId, PAGE_SIZE, (requestedPage - 1) * PAGE_SIZE);
+    const safePage = Math.min(requestedPage, totalPages(data.total));
+    if (safePage !== requestedPage) {
+      data = await api.getDeviceCommands(deviceId, PAGE_SIZE, (safePage - 1) * PAGE_SIZE);
+      setCommandPage(safePage);
     }
-  }, [selectedDevice, loadSelected]);
+    setCommandRows(data.items);
+    setCommandTotal(data.total);
+  }, []);
+
+  const loadEventPage = useCallback(async (deviceId: string, page: number) => {
+    const requestedPage = Math.max(1, page);
+    let data = await api.getDeviceEvents(deviceId, PAGE_SIZE, (requestedPage - 1) * PAGE_SIZE);
+    const safePage = Math.min(requestedPage, totalPages(data.total));
+    if (safePage !== requestedPage) {
+      data = await api.getDeviceEvents(deviceId, PAGE_SIZE, (safePage - 1) * PAGE_SIZE);
+      setEventPage(safePage);
+    }
+    setEventRows(data.items);
+    setEventTotal(data.total);
+  }, []);
+
+  const loadSelected = useCallback(
+    async (
+      deviceId: string | null,
+      pages?: {
+        commandPage?: number;
+        eventPage?: number;
+      },
+    ) => {
+      if (!deviceId) {
+        setDeviceState(null);
+        setCommandRows([]);
+        setCommandTotal(0);
+        setEventRows([]);
+        setEventTotal(0);
+        return;
+      }
+      await Promise.all([
+        loadDeviceState(deviceId),
+        loadCommandPage(deviceId, pages?.commandPage ?? commandPageRef.current),
+        loadEventPage(deviceId, pages?.eventPage ?? eventPageRef.current),
+      ]);
+    },
+    [loadCommandPage, loadDeviceState, loadEventPage],
+  );
 
   const applyGalleryDerivedDbCount = useCallback((deviceId: string, count: number) => {
     setDevices((prev) => prev.map((d) => (d.device_id === deviceId ? { ...d, db_count: count } : d)));
@@ -161,19 +332,31 @@ export function App() {
           const ent = Array.isArray(gal.entries) ? gal.entries : [];
           setGalleryEntries(ent);
           applyGalleryDerivedDbCount(deviceId, ent.length);
-        } catch (ge) {
-          setGalleryErr((ge as Error).message);
+        } catch (error) {
+          if (handleUnauthorized(error)) {
+            return;
+          }
+          setGalleryErr((error as Error).message);
           setGalleryEntries([]);
         }
         await loadSelected(deviceId);
-      } catch (e) {
-        setGalleryErr((e as Error).message);
-        await loadSelected(deviceId);
+      } catch (error) {
+        if (handleUnauthorized(error)) {
+          return;
+        }
+        setGalleryErr((error as Error).message);
+        try {
+          await loadSelected(deviceId);
+        } catch (loadError) {
+          if (!handleUnauthorized(loadError)) {
+            throw loadError;
+          }
+        }
       } finally {
         setFaceBoardBusy(false);
       }
     },
-    [applyGalleryDerivedDbCount, loadSelected],
+    [applyGalleryDerivedDbCount, handleUnauthorized, loadSelected],
   );
 
   const loadSdAttendanceLog = useCallback(async () => {
@@ -191,35 +374,56 @@ export function App() {
         maxBytes: 262144,
       });
       setSdLogData(data);
-    } catch (e) {
-      setSdLogErr((e as Error).message);
+    } catch (error) {
+      if (handleUnauthorized(error)) {
+        return;
+      }
+      setSdLogErr((error as Error).message);
       setSdLogData(null);
     } finally {
       setSdLogLoading(false);
     }
-  }, [selectedDevice, sdLogDate]);
-
-  useEffect(() => {
-    if (!selectedDevice) {
-      setGalleryEntries([]);
-      setGalleryErr(null);
-      return;
-    }
-    void syncBoardFaceForDevice(selectedDevice);
-  }, [selectedDevice, syncBoardFaceForDevice]);
-
-  useEffect(() => {
-    setSdLogData(null);
-    setSdLogErr(null);
-    setSdLogDate(todayLocalYmd());
-  }, [selectedDevice]);
+  }, [handleUnauthorized, sdLogDate, selectedDevice]);
 
   const refreshAll = useCallback(async () => {
     const dev = await loadDevices();
-    if (dev) await syncBoardFaceForDevice(dev);
+    if (dev) {
+      await syncBoardFaceForDevice(dev);
+    }
   }, [loadDevices, syncBoardFaceForDevice]);
 
+  const scheduleWsReconnect = useCallback(() => {
+    clearWsReconnectTimer();
+    if (!authRef.current) {
+      return;
+    }
+    wsReconnectTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        if (!authRef.current) {
+          return;
+        }
+        try {
+          await api.getSession();
+          connectWsRef.current();
+        } catch (error) {
+          if (handleUnauthorized(error)) {
+            return;
+          }
+          scheduleWsReconnect();
+        }
+      })();
+    }, 1000);
+  }, [clearWsReconnectTimer, handleUnauthorized]);
+
   const connectWs = useCallback(() => {
+    if (!authRef.current) {
+      return;
+    }
+    const current = wsRef.current;
+    if (current && (current.readyState === WebSocket.CONNECTING || current.readyState === WebSocket.OPEN)) {
+      return;
+    }
+    clearWsReconnectTimer();
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${protocol}://${location.host}/ws`);
     wsRef.current = ws;
@@ -227,77 +431,191 @@ export function App() {
       setWsStatus("ok");
     };
     ws.onclose = () => {
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       setWsStatus("bad");
-      setTimeout(() => connectWsRef.current(), 1000);
+      if (!authRef.current) {
+        return;
+      }
+      scheduleWsReconnect();
     };
-    ws.onmessage = async (event) => {
-      const msg = JSON.parse(event.data) as WsMessage;
-      if (msg.type === "snapshot") {
-        setDevices(msg.devices);
-        if (msg.devices.length === 0) {
-          setSelectedDevice(null);
-        } else {
-          setSelectedDevice((prev) => {
-            const ids = msg.devices.map((d) => d.device_id);
-            if (prev && ids.includes(prev)) {
-              return prev;
+    ws.onmessage = (event) => {
+      void (async () => {
+        try {
+          const msg = JSON.parse(event.data) as WsMessage;
+          if (msg.type === "snapshot") {
+            setDevices(msg.devices);
+            if (msg.devices.length === 0) {
+              setSelectedDevice(null);
+            } else {
+              setSelectedDevice((prev) => {
+                const ids = msg.devices.map((d) => d.device_id);
+                if (prev && ids.includes(prev)) {
+                  return prev;
+                }
+                return msg.devices[0].device_id;
+              });
             }
-            return msg.devices[0].device_id;
-          });
-        }
-        if (selectedRef.current) {
-          await syncBoardFaceForDevice(selectedRef.current);
-        }
-        return;
-      }
-      if (msg.device_id !== selectedRef.current) {
-        await loadDevices();
-        return;
-      }
-      if (msg.type === "event") {
-        setEvents((prev) => {
-          const next = [msg.payload, ...prev];
-          return next.slice(0, 100);
-        });
-      } else if (msg.type === "status" && msg.device) {
-        setDevices((prev) => prev.map((d) => (d.device_id === msg.device_id ? msg.device! : d)));
-        setDeviceState((prev) =>
-          prev && prev.device.device_id === msg.device_id ? { ...prev, device: msg.device! } : prev,
-        );
-      } else if (msg.type === "reply" || msg.type === "status") {
-        if (msg.type === "reply") {
-          const p = msg.payload as Record<string, unknown>;
-          const cmd = typeof p.cmd === "string" ? p.cmd : "";
-          if (cmd === "db_reset") {
-            await syncBoardFaceForDevice(msg.device_id);
+            if (selectedRef.current) {
+              await syncBoardFaceForDevice(selectedRef.current);
+            }
             return;
           }
+          if (msg.device_id !== selectedRef.current) {
+            await loadDevices();
+            return;
+          }
+          if (msg.type === "event") {
+            await loadEventPage(msg.device_id, eventPageRef.current);
+          } else if (msg.type === "status" && msg.device) {
+            setDevices((prev) => prev.map((d) => (d.device_id === msg.device_id ? msg.device! : d)));
+            setDeviceState((prev) =>
+              prev && prev.device.device_id === msg.device_id ? { ...prev, device: msg.device! } : prev,
+            );
+          } else if (msg.type === "reply" || msg.type === "status") {
+            if (msg.type === "reply") {
+              const p = msg.payload as Record<string, unknown>;
+              const cmd = typeof p.cmd === "string" ? p.cmd : "";
+              if (cmd === "db_reset" || cmd === "import_faces") {
+                await syncBoardFaceForDevice(msg.device_id);
+                return;
+              }
+            }
+            await loadSelected(msg.device_id);
+          }
+        } catch (error) {
+          if (!handleUnauthorized(error)) {
+            console.error(error);
+          }
         }
-        await loadSelected(msg.device_id);
-      }
+      })();
     };
-  }, [loadDevices, loadSelected, syncBoardFaceForDevice]);
+  }, [clearWsReconnectTimer, handleUnauthorized, loadDevices, loadEventPage, loadSelected, scheduleWsReconnect, syncBoardFaceForDevice]);
 
   useEffect(() => {
     connectWsRef.current = connectWs;
   }, [connectWs]);
 
   useEffect(() => {
-    void refreshAll().catch((e) => {
-      console.error(e);
-      alert((e as Error).message);
+    let cancelled = false;
+    void (async () => {
+      setAuthChecking(true);
+      try {
+        await api.getSession();
+        if (cancelled) {
+          return;
+        }
+        authRef.current = true;
+        setAuthenticated(true);
+        setAuthError(null);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        if (api.isUnauthorizedError(error)) {
+          enterLoggedOutState(null);
+        } else {
+          enterLoggedOutState((error as Error).message);
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthChecking(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      authRef.current = false;
+      closeWs();
+    };
+  }, [closeWs, enterLoggedOutState]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+    void refreshAll().catch((error) => {
+      if (!handleUnauthorized(error)) {
+        showError(error);
+      }
     });
     connectWs();
     return () => {
-      wsRef.current?.close();
+      closeWs();
     };
-  }, [connectWs, refreshAll]);
+  }, [authenticated, closeWs, connectWs, handleUnauthorized, refreshAll, showError]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+    if (selectedDevice) {
+      setCommandPage(1);
+      setEventPage(1);
+      void loadSelected(selectedDevice, { commandPage: 1, eventPage: 1 }).catch((error) => {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
+      });
+    } else {
+      void loadSelected(null);
+    }
+  }, [authenticated, handleUnauthorized, loadSelected, selectedDevice, showError]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+    if (!selectedDevice) {
+      setGalleryEntries([]);
+      setGalleryErr(null);
+      return;
+    }
+    void syncBoardFaceForDevice(selectedDevice).catch((error) => {
+      if (!handleUnauthorized(error)) {
+        showError(error);
+      }
+    });
+  }, [authenticated, handleUnauthorized, selectedDevice, showError, syncBoardFaceForDevice]);
+
+  useEffect(() => {
+    setSdLogData(null);
+    setSdLogErr(null);
+    setSdLogDate(todayLocalYmd());
+  }, [selectedDevice]);
 
   const onDeviceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     setSelectedDevice(e.target.value || null);
   };
 
-  const onClearWeb = async () => {
+  const onCommandPageChange = useCallback(
+    (page: number) => {
+      if (!selectedDevice) return;
+      setCommandPage(page);
+      void loadCommandPage(selectedDevice, page).catch((error) => {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
+      });
+    },
+    [handleUnauthorized, loadCommandPage, selectedDevice, showError],
+  );
+
+  const onEventPageChange = useCallback(
+    (page: number) => {
+      if (!selectedDevice) return;
+      setEventPage(page);
+      void loadEventPage(selectedDevice, page).catch((error) => {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
+      });
+    },
+    [handleUnauthorized, loadEventPage, selectedDevice, showError],
+  );
+
+  const onClearWeb = useCallback(async () => {
     if (!confirm("确定要清空当前网页保存的本地设备、命令和事件记录吗？这不会清空开发板的人脸库。")) {
       return;
     }
@@ -308,24 +626,35 @@ export function App() {
         `已清空：设备 ${cleared.devices ?? 0} 条、命令 ${cleared.commands ?? 0} 条、事件 ${cleared.events ?? 0} 条`,
       );
       await refreshAll();
-    } catch (e) {
-      console.error(e);
-      alert((e as Error).message);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        showError(error);
+      }
     }
-  };
+  }, [handleUnauthorized, refreshAll, showError]);
 
-  const postCmd = async (path: string, body: Record<string, string> | null = null) => {
-    if (!selectedDevice) {
-      alert("请先在顶栏选择设备");
-      return;
-    }
-    await api.postCommand(selectedDevice, path, body);
-    if (path === "db-reset") {
-      await syncBoardFaceForDevice(selectedDevice);
-    } else {
-      await loadSelected(selectedDevice);
-    }
-  };
+  const postCmd = useCallback(
+    async (path: string, body: Record<string, string> | null = null) => {
+      if (!selectedDevice) {
+        alert("请先在顶栏选择设备");
+        return;
+      }
+      try {
+        await api.postCommand(selectedDevice, path, body);
+        if (path === "db-reset") {
+          await syncBoardFaceForDevice(selectedDevice);
+        } else {
+          await loadSelected(selectedDevice);
+        }
+      } catch (error) {
+        if (handleUnauthorized(error)) {
+          return;
+        }
+        throw error;
+      }
+    },
+    [handleUnauthorized, loadSelected, selectedDevice, syncBoardFaceForDevice],
+  );
 
   const doCloseRegisterMqtt = useCallback(async () => {
     if (!selectedRef.current) {
@@ -345,7 +674,7 @@ export function App() {
     setRegisterSessionOpen(false);
   }, []);
 
-  const startRegister = async () => {
+  const startRegister = useCallback(async () => {
     if (registerSessionOpen || !selectedDevice) {
       if (!selectedDevice) {
         alert("请先在顶栏选择设备");
@@ -358,13 +687,14 @@ export function App() {
       setRegisterSessionOpen(true);
       setRegName("");
       setRegisterOpen(true);
-    } catch (e) {
-      console.error(e);
-      alert((e as Error).message);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        showError(error);
+      }
     } finally {
       setRegisterPreviewLoading(false);
     }
-  };
+  }, [handleUnauthorized, registerSessionOpen, selectedDevice, showError]);
 
   const onDialogRequestClose = useCallback(
     async (e: SlRequestCloseEvent) => {
@@ -379,12 +709,13 @@ export function App() {
         if (selectedRef.current) {
           await loadSelected(selectedRef.current);
         }
-      } catch (err) {
-        console.error(err);
-        alert((err as Error).message);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
       }
     },
-    [closeDialogUi, doCloseRegisterMqtt, loadSelected],
+    [closeDialogUi, doCloseRegisterMqtt, handleUnauthorized, loadSelected, showError],
   );
 
   const onRegisterCancel = useCallback(() => {
@@ -398,12 +729,13 @@ export function App() {
         if (selectedRef.current) {
           await loadSelected(selectedRef.current);
         }
-      } catch (err) {
-        console.error(err);
-        alert((err as Error).message);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
       }
     })();
-  }, [doCloseRegisterMqtt, loadSelected]);
+  }, [doCloseRegisterMqtt, handleUnauthorized, loadSelected, showError]);
 
   const onRegisterOk = useCallback(() => {
     const name = regName.trim();
@@ -423,14 +755,110 @@ export function App() {
         setRegName("");
         setRegisterSessionOpen(false);
         await syncBoardFaceForDevice(dev);
-      } catch (err) {
-        console.error(err);
-        alert((err as Error).message);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          showError(error);
+        }
       }
     })();
-  }, [regName, selectedDevice, syncBoardFaceForDevice]);
+  }, [handleUnauthorized, regName, selectedDevice, showError, syncBoardFaceForDevice]);
+
+  const onLoginSubmit = useCallback(
+    (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!loginPassword) {
+        setAuthError("请输入管理员密码。");
+        return;
+      }
+      setAuthSubmitting(true);
+      setAuthError(null);
+      void (async () => {
+        try {
+          await api.login(loginPassword);
+          authRef.current = true;
+          setAuthenticated(true);
+          setLoginPassword("");
+        } catch (error) {
+          if (api.isUnauthorizedError(error)) {
+            authRef.current = false;
+            setAuthenticated(false);
+            setAuthError("密码错误，请重试。");
+          } else {
+            setAuthError((error as Error).message);
+          }
+        } finally {
+          setAuthChecking(false);
+          setAuthSubmitting(false);
+        }
+      })();
+    },
+    [loginPassword],
+  );
+
+  const onLogout = useCallback(() => {
+    void (async () => {
+      try {
+        await doCloseRegisterMqtt();
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          console.error(error);
+        } else {
+          return;
+        }
+      }
+      try {
+        await api.logout();
+      } catch (error) {
+        if (!api.isUnauthorizedError(error)) {
+          console.error(error);
+        }
+      }
+      setLoginPassword("");
+      enterLoggedOutState(null);
+    })();
+  }, [doCloseRegisterMqtt, enterLoggedOutState, handleUnauthorized]);
 
   const d = deviceState?.device;
+
+  if (authChecking) {
+    return (
+      <div className="login-shell">
+        <div className="login-card login-card--loading">
+          <p className="login-eyebrow">K230 Face Console</p>
+          <h1 className="login-title">正在检查登录状态</h1>
+          <p className="login-copy">请稍候，正在与 face-web 服务确认当前会话。</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <div className="login-shell">
+        <form className="login-card" onSubmit={onLoginSubmit}>
+          <p className="login-eyebrow">K230 Face Console</p>
+          <h1 className="login-title">管理员登录</h1>
+          <p className="login-copy">输入管理员密码后，才能进入设备管理面板并执行远程控制。</p>
+          <label className="login-field">
+            <span className="login-field__label">管理员密码</span>
+            <input
+              className="login-field__input"
+              type="password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder="请输入 FACE_WEB_ADMIN_PASSWORD"
+              autoComplete="current-password"
+              disabled={authSubmitting}
+            />
+          </label>
+          {authError && <p className="login-error">{authError}</p>}
+          <button type="submit" className="login-submit" disabled={authSubmitting}>
+            {authSubmitting ? "登录中…" : "进入管理面板"}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -467,11 +895,24 @@ export function App() {
               ))}
             </select>
           </div>
-          <button type="button" className="app-header__btn" onClick={() => void refreshAll()}>
+          <button
+            type="button"
+            className="app-header__btn"
+            onClick={() => {
+              void refreshAll().catch((error) => {
+                if (!handleUnauthorized(error)) {
+                  showError(error);
+                }
+              });
+            }}
+          >
             同步数据
           </button>
           <button type="button" className="app-header__btn app-header__btn--danger" onClick={() => void onClearWeb()}>
             清空本地记录
+          </button>
+          <button type="button" className="app-header__btn" onClick={() => void onLogout()}>
+            退出登录
           </button>
         </div>
       </header>
@@ -493,7 +934,16 @@ export function App() {
                           type="button"
                           className="btn--primary"
                           disabled={!selectedDevice || faceBoardBusy}
-                          onClick={() => selectedDevice && void syncBoardFaceForDevice(selectedDevice)}
+                          onClick={() => {
+                            if (!selectedDevice) {
+                              return;
+                            }
+                            void syncBoardFaceForDevice(selectedDevice).catch((error) => {
+                              if (!handleUnauthorized(error)) {
+                                showError(error);
+                              }
+                            });
+                          }}
                         >
                           {faceBoardBusy ? "同步中…" : "同步人脸库（人数 · 快照）"}
                         </button>
@@ -502,7 +952,7 @@ export function App() {
                           className="btn--danger"
                           onClick={() => {
                             if (confirm("确定清空当前设备上的人脸库？此操作在板端执行，不可从网页撤销。")) {
-                              void postCmd("db-reset");
+                              void postCmd("db-reset").catch(showError);
                             }
                           }}
                         >
@@ -524,11 +974,23 @@ export function App() {
 
                       <button
                         type="button"
+                        className="btn--primary"
+                        style={{ width: "100%" }}
+                        disabled={!selectedDevice}
+                        onClick={() => {
+                          void postCmd("import-faces").catch(showError);
+                        }}
+                      >
+                        导入 TF 人脸
+                      </button>
+
+                      <button
+                        type="button"
                         className="btn--danger"
                         style={{ width: "100%" }}
                         onClick={() => {
                           if (confirm("将向板端发送关闭指令，确定继续？")) {
-                            void postCmd("shutdown");
+                            void postCmd("shutdown").catch(showError);
                           }
                         }}
                       >
@@ -545,8 +1007,11 @@ export function App() {
                   </div>
                   <div className="metric-card">
                     <span className="metric-card__label">RT 桥接</span>
-                    <span className={`metric-card__value ${d.rt_connected ? "ok" : "bad"}`}>
-                      {d.rt_connected ? "已连接" : "未连接"}
+                    <span
+                      className={`metric-card__value ${d.online ? (d.rt_connected ? "ok" : "bad") : "dim"}`}
+                      title={d.online ? undefined : "小核离线时不展示 RT 桥接实时状态"}
+                    >
+                      {d.online ? (d.rt_connected ? "已连接" : "未连接") : "未知"}
                     </span>
                   </div>
                   <div className="metric-card">
@@ -612,32 +1077,35 @@ export function App() {
             <div className="panel__head">
               <h2 className="panel__title">指令流水</h2>
             </div>
-            {(deviceState?.recent_commands ?? []).length === 0 ? (
+            {commandRows.length === 0 ? (
               <p className="empty-state">无记录（下发命令后在此追踪状态）</p>
             ) : (
-              <div className="data-table">
-                <div className="data-table__thead">
-                  <span>命令 / 说明</span>
-                  <span>状态</span>
-                </div>
-                {(deviceState?.recent_commands ?? []).map((row) => (
-                  <div className="data-table__row" key={row.request_id}>
-                    <div>
-                      <div className="data-table__primary">{escapeHtml(row.cmd)}</div>
-                      <p className="data-table__secondary">{escapeHtml(row.message || "—")}</p>
-                    </div>
-                    <div className="data-table__meta">
-                      <span
-                        className={`badge ${row.ok === 1 ? "ok" : row.ok === 0 ? "bad" : ""}`}
-                        title="服务端记录的状态"
-                      >
-                        {escapeHtml(row.status)}
-                      </span>
-                      <span className="data-table__rid">{escapeHtml(row.request_id)}</span>
-                    </div>
+              <>
+                <div className="data-table">
+                  <div className="data-table__thead">
+                    <span>命令 / 说明</span>
+                    <span>状态</span>
                   </div>
-                ))}
-              </div>
+                  {commandRows.map((row) => (
+                    <div className="data-table__row" key={row.request_id}>
+                      <div>
+                        <div className="data-table__primary">{escapeHtml(row.cmd)}</div>
+                        <p className="data-table__secondary">{escapeHtml(row.message || "—")}</p>
+                      </div>
+                      <div className="data-table__meta">
+                        <span
+                          className={`badge ${row.ok === 1 ? "ok" : row.ok === 0 ? "bad" : ""}`}
+                          title="服务端记录的状态"
+                        >
+                          {escapeHtml(row.status)}
+                        </span>
+                        <span className="data-table__rid">{escapeHtml(row.request_id)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <PaginationControls page={commandPage} total={commandTotal} onPageChange={onCommandPageChange} />
+              </>
             )}
           </section>
 
@@ -645,32 +1113,33 @@ export function App() {
             <div className="panel__head">
               <h2 className="panel__title">识别事件</h2>
             </div>
-            {events.length === 0 ? (
+            {eventRows.length === 0 ? (
               <p className="empty-state">无最近事件</p>
             ) : (
-              <div className="data-table data-table--events">
-                <div className="data-table__thead">
-                  <span>类型 / 人员</span>
-                  <span>分数</span>
-                  <span>时间</span>
-                </div>
-                {events.map((ev, idx) => (
-                  <div className="data-table__row" key={`${ev.ts_ms}-${idx}`}>
-                    <div>
-                      <div className="data-table__primary" style={{ fontFamily: "inherit" }}>
-                        {escapeHtml(ev.evt_kind)}
-                      </div>
-                      <p className="data-table__secondary">
-                        {escapeHtml(ev.name || "unknown")} / id {escapeHtml(ev.face_id)}
-                      </p>
-                    </div>
-                    <div className="data-table__secondary">{Number(ev.score).toFixed(3)}</div>
-                    <div className="data-table__meta">
-                      {escapeHtml(fmtTs(eventDisplayMs_ms(ev)))}
-                    </div>
+              <>
+                <div className="data-table data-table--events">
+                  <div className="data-table__thead">
+                    <span>类型 / 人员</span>
+                    <span>分数</span>
+                    <span>时间</span>
                   </div>
-                ))}
-              </div>
+                  {eventRows.map((ev, idx) => (
+                    <div className="data-table__row" key={`${ev.ts_ms}-${idx}`}>
+                      <div>
+                        <div className="data-table__primary" style={{ fontFamily: "inherit" }}>
+                          {escapeHtml(ev.evt_kind)}
+                        </div>
+                        <p className="data-table__secondary">
+                          {escapeHtml(ev.name || "unknown")} / id {escapeHtml(ev.face_id)}
+                        </p>
+                      </div>
+                      <div className="data-table__secondary">{Number(ev.score).toFixed(3)}</div>
+                      <div className="data-table__meta">{escapeHtml(fmtTs(eventDisplayMs_ms(ev)))}</div>
+                    </div>
+                  ))}
+                </div>
+                <PaginationControls page={eventPage} total={eventTotal} onPageChange={onEventPageChange} />
+              </>
             )}
           </section>
         </div>
@@ -704,9 +1173,8 @@ export function App() {
           {!sdLogErr && !sdLogData && (
             <p className="empty-state attendance-sd-panel__hint">
               考勤 JSONL 路径为 <code>&lt;attendance_log_base&gt;/&lt;YYYY-MM-DD&gt;.jsonl</code>
-              （例如 TF 上 <code>/mnt/tf/face_logs/2026-05-06.jsonl</code>）。挂载{" "}
-              <code>/dev/mmcblk1p1</code> 后，将 <code>face_netd.ini</code> 中{" "}
-              <code>attendance_log_base</code> 指到根目录（如 <code>/mnt/tf/face_logs</code>
+              （例如 TF 上 <code>/mnt/tf/face_logs/2026-05-06.jsonl</code>）。挂载 <code>/dev/mmcblk1p1</code> 后，将{" "}
+              <code>face_netd.ini</code> 中 <code>attendance_log_base</code> 指到根目录（如 <code>/mnt/tf/face_logs</code>
               ）。以下为 MQTT <code>attendance_log_fetch</code> 拉取的当日结构化日志。
             </p>
           )}

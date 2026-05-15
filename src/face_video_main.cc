@@ -5,22 +5,28 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "ipc_osd_draw.h"
 #include "ipc_proto.h"
 #include "ipc_shm.h"
+#include "perf_stats.h"
 #include "scoped_timing.h"
 #include "video_pipeline.h"
 #include "setting.h"
 
 namespace {
+
+namespace fs = std::filesystem;
 
 /* 与 main.cc 的单进程分支保持一致：OSD 消费 ARGB8888 字节序，
  * 且当前视频管线的三通道语义是 RGB 而非 BGR，故逐像素手工重排。 */
@@ -71,6 +77,65 @@ void render_register_preview(cv::Mat &draw_frame, const cv::Mat &dump_img)
     resized_preview_argb.copyTo(draw_frame(roi));
 }
 
+std::string import_stage_file_path(const char *request_id)
+{
+    if (!request_id || request_id[0] == '\0')
+        return {};
+    return std::string(IPC_IMPORT_STAGE_DIR) + "/" + request_id + ".img";
+}
+
+bool read_binary_file_all(const std::string &path, std::vector<uint8_t> *out)
+{
+    if (!out)
+        return false;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (buf.empty())
+        return false;
+    *out = std::move(buf);
+    return true;
+}
+
+cv::Mat letterbox_bgr_to_ai_frame(const cv::Mat &src_bgr)
+{
+    cv::Mat canvas(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC3, cv::Scalar(114, 114, 114));
+    if (src_bgr.empty() || src_bgr.cols <= 0 || src_bgr.rows <= 0)
+        return canvas;
+
+    const double scale_x = static_cast<double>(AI_FRAME_WIDTH) / static_cast<double>(src_bgr.cols);
+    const double scale_y = static_cast<double>(AI_FRAME_HEIGHT) / static_cast<double>(src_bgr.rows);
+    const double scale = std::min(scale_x, scale_y);
+    const int resized_w = std::max(1, static_cast<int>(src_bgr.cols * scale));
+    const int resized_h = std::max(1, static_cast<int>(src_bgr.rows * scale));
+
+    cv::Mat resized;
+    cv::resize(src_bgr, resized, cv::Size(resized_w, resized_h));
+    const int ofs_x = (AI_FRAME_WIDTH - resized_w) / 2;
+    const int ofs_y = (AI_FRAME_HEIGHT - resized_h) / 2;
+    resized.copyTo(canvas(cv::Rect(ofs_x, ofs_y, resized_w, resized_h)));
+    return canvas;
+}
+
+std::vector<uint8_t> bgr_mat_to_chw_rgb(const cv::Mat &bgr)
+{
+    std::vector<uint8_t> chw_vec;
+    if (bgr.empty())
+        return chw_vec;
+
+    const size_t plane_bytes = static_cast<size_t>(bgr.rows) * static_cast<size_t>(bgr.cols);
+    chw_vec.reserve(plane_bytes * 3u);
+    std::vector<cv::Mat> bgr_channels(3);
+    cv::split(bgr, bgr_channels);
+    for (int i = 2; i >= 0; --i)
+    {
+        const std::vector<uint8_t> data = std::vector<uint8_t>(bgr_channels[i].reshape(1, 1));
+        chw_vec.insert(chw_vec.end(), data.begin(), data.end());
+    }
+    return chw_vec;
+}
+
 }  // namespace
 
 static std::atomic<bool> isp_stop(false);
@@ -84,6 +149,23 @@ static ipc_video_ctrl_t g_last_ctrl{};
 static ipc_video_ctrl_t g_shutdown_ctrl{};
 static bool g_shutdown_ctrl_valid = false;
 
+struct UiOverlayRtMapping
+{
+    bool attached = false;
+    uint64_t phys_addr = 0;
+    uint32_t bytes = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    uint32_t generation = 0;
+    void *map_base = nullptr;
+    ui_overlay_shared_header_t *header = nullptr;
+    uint8_t *slots[UI_OVERLAY_SHARED_SLOT_COUNT]{};
+};
+
+static std::mutex g_ui_overlay_mu;
+static UiOverlayRtMapping g_ui_overlay{};
+
 /* 异步推理（仅 state==0）：采集线程只提交最新帧；独立线程 rpc，避免阻塞 GetFrame/VO。 */
 static constexpr size_t k_ai_frame_bytes = (size_t)AI_FRAME_CHANNEL * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
 static std::mutex g_ai_ch_mutex; /* 所有对 face_ai 的 rpc_ai 必须经此互斥（单通道 + 对端单线程） */
@@ -92,21 +174,34 @@ static std::condition_variable g_infer_cv;
 static std::vector<uint8_t> g_infer_pending;
 static std::atomic<uint64_t> g_infer_capture_seq{0};
 static std::atomic<uint64_t> g_infer_last_displayed_seq{0};
+static int g_infer_latest_slot = -1;
+static int g_infer_inflight_slot = -1;
 static std::mutex g_infer_reply_mu;
 static ipc_ai_reply_t g_last_infer_reply{};
 static std::atomic<bool> g_infer_has_reply{false};
 
-/* 固定推理请求槽：整段 IPC_CMD_INFER 复用同一 shmid，避免每帧 shm 分配 */
-static int g_fixed_infer_shmid = -1;
-static void *g_fixed_infer_ptr = nullptr;
-static size_t g_fixed_infer_cap = 0;
-static bool g_fixed_infer_ready = false;
+struct FixedInferSlot
+{
+    int shmid = -1;
+    void *ptr = nullptr;
+    size_t cap = 0;
+    uint64_t seq = 0;
+};
+
+static constexpr size_t k_fixed_infer_slot_count = 2;
+static FixedInferSlot g_fixed_infer_slots[k_fixed_infer_slot_count];
+static bool g_fixed_infer_slots_ready = false;
 
 static std::atomic<uint64_t> g_metric_capture_frames{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_ok{0};
 static std::atomic<uint64_t> g_metric_infer_rpc_fail{0};
 static std::atomic<uint64_t> g_metric_infer_stale{0};
 static std::atomic<uint64_t> g_metric_infer_applied{0};
+static PerfStageStats g_perf_capture_to_pending("face_video.capture_to_pending");
+static PerfStageStats g_perf_pending_to_ipc_slot("face_video.pending_to_ipc_slot");
+static PerfStageStats g_perf_send_recv_wait("face_video.send_recv_wait");
+static PerfStageStats g_perf_reply_copy("face_video.reply_copy");
+static PerfStageStats g_perf_total_time("face_video.total_time");
 /* 与 face_event 终端输入「i」一致：OSD 小窗只短时显示；dump_img 会保留到下一步输入姓名或取消 */
 static constexpr int k_register_preview_hold_ms = 2000;
 
@@ -129,6 +224,15 @@ static const char *register_commit_reply_message(const ipc_ai_reply_t &r, bool r
     if (r.op_message[0] != '\0')
         return r.op_message;
     return rpc_ok ? "register rejected" : "register rpc failed";
+}
+
+static const char *import_image_reply_message(const ipc_ai_reply_t &r, bool rpc_ok)
+{
+    if (rpc_ok && r.op_result == IPC_OP_RESULT_OK)
+        return default_op_message(r, "import processed");
+    if (r.op_message[0] != '\0')
+        return r.op_message;
+    return rpc_ok ? "import rejected" : "import rpc failed";
 }
 
 static bool is_remote_ctrl(const ipc_video_ctrl_t &ctrl)
@@ -202,6 +306,144 @@ static bool send_video_reply(const ipc_video_ctrl_t &ctrl, bool ok, int32_t coun
     return false;
 }
 
+static void clear_ui_overlay_mapping_locked()
+{
+    if (g_ui_overlay.map_base && g_ui_overlay.bytes > 0)
+        kd_mpi_sys_munmap(g_ui_overlay.map_base, g_ui_overlay.bytes);
+    g_ui_overlay = UiOverlayRtMapping{};
+}
+
+static bool attach_ui_overlay_locked(const ipc_video_ctrl_t &ctrl)
+{
+    if (ctrl.ui_phys_addr == 0 || ctrl.ui_bytes < ui_overlay_shared_total_bytes_unaligned())
+    {
+        std::cerr << "face_video: invalid UI_ATTACH payload phys=0x" << std::hex
+                  << static_cast<unsigned long long>(ctrl.ui_phys_addr) << std::dec << " bytes=" << ctrl.ui_bytes
+                  << std::endl;
+        return false;
+    }
+
+    if (g_ui_overlay.attached && g_ui_overlay.phys_addr == ctrl.ui_phys_addr &&
+        g_ui_overlay.generation == ctrl.ui_generation && g_ui_overlay.bytes == ctrl.ui_bytes)
+        return true;
+
+    clear_ui_overlay_mapping_locked();
+
+    void *mapped = kd_mpi_sys_mmap(ctrl.ui_phys_addr, ctrl.ui_bytes);
+    if (!mapped)
+    {
+        std::cerr << "face_video: kd_mpi_sys_mmap UI overlay failed phys=0x" << std::hex
+                  << static_cast<unsigned long long>(ctrl.ui_phys_addr) << std::dec << " bytes=" << ctrl.ui_bytes
+                  << std::endl;
+        return false;
+    }
+
+    auto *header = static_cast<ui_overlay_shared_header_t *>(mapped);
+    if (header->magic != UI_OVERLAY_SHARED_MAGIC || header->version != UI_OVERLAY_SHARED_VERSION)
+    {
+        std::cerr << "face_video: invalid UI shared header magic=0x" << std::hex << header->magic << std::dec
+                  << " version=" << header->version << std::endl;
+        kd_mpi_sys_munmap(mapped, ctrl.ui_bytes);
+        return false;
+    }
+
+    if (header->width != ctrl.ui_width || header->height != ctrl.ui_height || header->stride != ctrl.ui_stride ||
+        header->slot_count != UI_OVERLAY_SHARED_SLOT_COUNT || header->generation != ctrl.ui_generation)
+    {
+        std::cerr << "face_video: UI shared header mismatch hdr=" << header->width << "x" << header->height
+                  << " stride=" << header->stride << " slots=" << header->slot_count
+                  << " generation=" << header->generation << " ctrl=" << ctrl.ui_width << "x" << ctrl.ui_height
+                  << " stride=" << ctrl.ui_stride << " generation=" << ctrl.ui_generation << std::endl;
+        kd_mpi_sys_munmap(mapped, ctrl.ui_bytes);
+        return false;
+    }
+
+    g_ui_overlay.attached = true;
+    g_ui_overlay.phys_addr = ctrl.ui_phys_addr;
+    g_ui_overlay.bytes = ctrl.ui_bytes;
+    g_ui_overlay.width = ctrl.ui_width;
+    g_ui_overlay.height = ctrl.ui_height;
+    g_ui_overlay.stride = ctrl.ui_stride;
+    g_ui_overlay.generation = ctrl.ui_generation;
+    g_ui_overlay.map_base = mapped;
+    g_ui_overlay.header = header;
+    uint8_t *slot_base = static_cast<uint8_t *>(mapped) + sizeof(ui_overlay_shared_header_t);
+    const size_t slot_bytes = ui_overlay_shared_slot_bytes();
+    for (size_t i = 0; i < UI_OVERLAY_SHARED_SLOT_COUNT; ++i)
+        g_ui_overlay.slots[i] = slot_base + i * slot_bytes;
+
+    std::cout << "face_video: UI overlay attached phys=0x" << std::hex
+              << static_cast<unsigned long long>(g_ui_overlay.phys_addr) << std::dec << " bytes=" << g_ui_overlay.bytes
+              << " generation=" << g_ui_overlay.generation << " geometry=" << g_ui_overlay.width << "x"
+              << g_ui_overlay.height << " stride=" << g_ui_overlay.stride << std::endl;
+    return true;
+}
+
+static inline uint8_t alpha_blend_channel(uint8_t src, uint8_t src_a, uint8_t dst, uint8_t dst_a, uint8_t out_a)
+{
+    if (out_a == 0)
+        return 0;
+    const uint32_t src_p = static_cast<uint32_t>(src) * src_a;
+    const uint32_t dst_p = (static_cast<uint32_t>(dst) * dst_a * (255u - src_a) + 127u) / 255u;
+    return static_cast<uint8_t>((src_p + dst_p + out_a / 2u) / out_a);
+}
+
+static void blend_ui_overlay(cv::Mat &draw_frame)
+{
+    std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+    if (!g_ui_overlay.attached || !g_ui_overlay.header)
+        return;
+
+    const ui_overlay_shared_header_t &hdr = *g_ui_overlay.header;
+    if (hdr.magic != UI_OVERLAY_SHARED_MAGIC || hdr.version != UI_OVERLAY_SHARED_VERSION ||
+        hdr.width != g_ui_overlay.width || hdr.height != g_ui_overlay.height || hdr.stride != g_ui_overlay.stride ||
+        hdr.slot_count != UI_OVERLAY_SHARED_SLOT_COUNT || hdr.generation != g_ui_overlay.generation)
+        return;
+
+    uint32_t front = hdr.front_index;
+    if (front >= UI_OVERLAY_SHARED_SLOT_COUNT)
+        front = 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint8_t *src_base = g_ui_overlay.slots[front];
+    if (!src_base)
+        return;
+
+    for (int y = 0; y < draw_frame.rows; ++y)
+    {
+        cv::Vec4b *dst_row = draw_frame.ptr<cv::Vec4b>(y);
+        const uint8_t *src_row = src_base + static_cast<size_t>(g_ui_overlay.stride) * y;
+        for (int x = 0; x < draw_frame.cols; ++x)
+        {
+            const uint8_t src_a = src_row[0];
+            if (src_a == 0)
+            {
+                src_row += 4;
+                continue;
+            }
+
+            cv::Vec4b &dst = dst_row[x];
+            if (src_a == 255)
+            {
+                dst[0] = src_row[0];
+                dst[1] = src_row[1];
+                dst[2] = src_row[2];
+                dst[3] = src_row[3];
+                src_row += 4;
+                continue;
+            }
+
+            const uint8_t dst_a = dst[0];
+            const uint8_t out_a = static_cast<uint8_t>(
+                src_a + (static_cast<uint32_t>(dst_a) * (255u - src_a) + 127u) / 255u);
+            dst[1] = alpha_blend_channel(src_row[1], src_a, dst[1], dst_a, out_a);
+            dst[2] = alpha_blend_channel(src_row[2], src_a, dst[2], dst_a, out_a);
+            dst[3] = alpha_blend_channel(src_row[3], src_a, dst[3], dst_a, out_a);
+            dst[0] = out_a;
+            src_row += 4;
+        }
+    }
+}
+
 static void ctrl_recv_loop()
 {
     int ch = rt_channel_open(IPC_FACE_VIDEO_CTRL, O_CREAT);
@@ -241,6 +483,17 @@ static void ctrl_recv_loop()
         ipc_video_ctrl_t *c = (ipc_video_ctrl_t *)p;
         if (c->magic != IPC_MAGIC)
         {
+            lwp_shmdt(p);
+            ipc_shm_free(shmid);
+            continue;
+        }
+
+        if ((ipc_video_ctrl_op_t)c->op == IPC_VIDEO_CTRL_OP_UI_ATTACH)
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+                attach_ui_overlay_locked(*c);
+            }
             lwp_shmdt(p);
             ipc_shm_free(shmid);
             continue;
@@ -286,29 +539,64 @@ static int open_ai_channel_retry()
     return -1;
 }
 
-/* 不持锁；调用方通过 rpc_ai_sync 或 ai_infer_worker_thread 内已持 g_ai_ch_mutex */
-static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
-                        uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply, bool use_fixed_infer_req)
+static void release_fixed_infer_slots()
 {
-    static std::atomic<uint32_t> seq{0};
-    int shmid = -1;
-    bool free_req_shm = true;
+    for (size_t i = 0; i < k_fixed_infer_slot_count; ++i)
+    {
+        if (g_fixed_infer_slots[i].ptr)
+        {
+            lwp_shmdt(g_fixed_infer_slots[i].ptr);
+            g_fixed_infer_slots[i].ptr = nullptr;
+        }
+        if (g_fixed_infer_slots[i].shmid >= 0)
+        {
+            ipc_shm_free(g_fixed_infer_slots[i].shmid);
+            g_fixed_infer_slots[i].shmid = -1;
+        }
+        g_fixed_infer_slots[i].cap = 0;
+        g_fixed_infer_slots[i].seq = 0;
+    }
+    g_fixed_infer_slots_ready = false;
+    g_infer_latest_slot = -1;
+    g_infer_inflight_slot = -1;
+}
 
-    if (use_fixed_infer_req && g_fixed_infer_ready && g_fixed_infer_ptr && g_fixed_infer_shmid >= 0 &&
-        cmd == IPC_CMD_INFER &&
-        sizeof(ipc_req_hdr_t) + frame_len <= g_fixed_infer_cap)
+static bool init_fixed_infer_slots()
+{
+    const size_t cap = sizeof(ipc_req_hdr_t) + k_ai_frame_bytes;
+    release_fixed_infer_slots();
+    for (size_t i = 0; i < k_fixed_infer_slot_count; ++i)
     {
-        if (ipc_request_encode_buffer(g_fixed_infer_ptr, g_fixed_infer_cap, cmd, frame, frame_len, tc, th, tw, reg_name,
-                                      seq.fetch_add(1)) != 0)
+        void *ptr = nullptr;
+        int shmid = ipc_shm_alloc(cap, &ptr);
+        if (shmid < 0 || !ptr)
+        {
+            release_fixed_infer_slots();
             return false;
-        shmid = g_fixed_infer_shmid;
-        free_req_shm = false;
+        }
+        g_fixed_infer_slots[i].shmid = shmid;
+        g_fixed_infer_slots[i].ptr = ptr;
+        g_fixed_infer_slots[i].cap = cap;
     }
-    else
-    {
-        if (ipc_pack_request(cmd, frame, frame_len, tc, th, tw, reg_name, seq.fetch_add(1), &shmid) != 0)
-            return false;
-    }
+    g_fixed_infer_slots_ready = true;
+    return true;
+}
+
+static int select_writable_infer_slot_locked()
+{
+    if (!g_fixed_infer_slots_ready)
+        return -1;
+    if (g_infer_inflight_slot == 0)
+        return 1;
+    if (g_infer_inflight_slot == 1)
+        return 0;
+    return (g_infer_latest_slot == 0) ? 1 : 0;
+}
+
+static bool rpc_ai_send_shmid(int ai_ch, int shmid, ipc_ai_reply_t *out_reply, bool free_req_shm, bool perf_enabled)
+{
+    if (shmid < 0)
+        return false;
 
     struct rt_channel_msg req, reply;
     memset(&req, 0, sizeof(req));
@@ -316,10 +604,12 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     req.type = RT_CHANNEL_RAW;
     req.u.d = (void *)(intptr_t)shmid;
 
+    const auto wait_start = std::chrono::steady_clock::now();
     rt_err_t ch_err = rt_channel_send_recv(ai_ch, &req, &reply);
+    g_perf_send_recv_wait.track_since(wait_start, perf_enabled);
     if (ch_err != 0)
     {
-        if (free_req_shm)
+        if (free_req_shm && shmid >= 0)
             ipc_shm_free(shmid);
         return false;
     }
@@ -330,6 +620,7 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     if (rshmid < 0)
         return false;
 
+    const auto copy_start = std::chrono::steady_clock::now();
     void *rp = lwp_shmat(rshmid, NULL);
     if (!rp)
     {
@@ -339,32 +630,49 @@ static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t f
     memcpy(out_reply, rp, sizeof(ipc_ai_reply_t));
     lwp_shmdt(rp);
     ipc_shm_free(rshmid);
+    g_perf_reply_copy.track_since(copy_start, perf_enabled);
 
     if (out_reply->magic != IPC_MAGIC || out_reply->status != IPC_STATUS_OK)
         return false;
     return true;
 }
 
+/* 不持锁；调用方通过 rpc_ai_sync 持有 g_ai_ch_mutex。 */
+static bool rpc_ai_impl(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
+                        uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply)
+{
+    static std::atomic<uint32_t> seq{0};
+    int shmid = -1;
+    if (ipc_pack_request(cmd, frame, frame_len, tc, th, tw, reg_name, seq.fetch_add(1), &shmid) != 0)
+        return false;
+    return rpc_ai_send_shmid(ai_ch, shmid, out_reply, true, false);
+}
+
 static bool rpc_ai_sync(int ai_ch, ipc_cmd_t cmd, const uint8_t *frame, size_t frame_len, uint32_t tc, uint32_t th,
                         uint32_t tw, const char *reg_name, ipc_ai_reply_t *out_reply)
 {
     std::lock_guard<std::mutex> lk(g_ai_ch_mutex);
-    return rpc_ai_impl(ai_ch, cmd, frame, frame_len, tc, th, tw, reg_name, out_reply, false);
+    return rpc_ai_impl(ai_ch, cmd, frame, frame_len, tc, th, tw, reg_name, out_reply);
 }
 
 /* 资源：ai_ch 生命周期由 video_ipc_loop 持有；isp_stop 置位后退出。线程安全：仅本线程调用 rpc_ai_impl。 */
-static void ai_infer_worker_thread(int ai_ch)
+static void ai_infer_worker_thread(int ai_ch, int debug_mode)
 {
     std::vector<uint8_t> work(k_ai_frame_bytes);
+    const bool perf_enabled = metrics_log_enabled(debug_mode);
 
     while (!isp_stop.load())
     {
         uint64_t snap = 0;
+        int slot_idx = -1;
         {
             std::unique_lock<std::mutex> lk(g_infer_pending_mu);
             g_infer_cv.wait(lk, [&] {
-                return isp_stop.load() ||
-                       (cur_state.load() == 0 && g_infer_capture_seq.load() > g_infer_last_displayed_seq.load());
+                if (isp_stop.load() || cur_state.load() != 0)
+                    return true;
+                if (g_fixed_infer_slots_ready && g_infer_latest_slot >= 0)
+                    return g_fixed_infer_slots[g_infer_latest_slot].seq > g_infer_last_displayed_seq.load();
+                return g_infer_capture_seq.load() > g_infer_last_displayed_seq.load();
             });
             if (isp_stop.load())
                 break;
@@ -373,12 +681,21 @@ static void ai_infer_worker_thread(int ai_ch)
                 /* 非识别态：不取帧推理，重新挂起 */
                 continue;
             }
-            /* 稳定快照：若 memcpy 期间又有新帧，重拷直到 seq 不变，等价于只保留最新帧 */
-            do
+            if (g_fixed_infer_slots_ready && g_infer_latest_slot >= 0)
             {
-                snap = g_infer_capture_seq.load();
-                memcpy(work.data(), g_infer_pending.data(), k_ai_frame_bytes);
-            } while (snap != g_infer_capture_seq.load());
+                slot_idx = g_infer_latest_slot;
+                snap = g_fixed_infer_slots[slot_idx].seq;
+                g_infer_inflight_slot = slot_idx;
+            }
+            else
+            {
+                /* fallback：固定槽不可用时维持旧行为 */
+                do
+                {
+                    snap = g_infer_capture_seq.load();
+                    memcpy(work.data(), g_infer_pending.data(), k_ai_frame_bytes);
+                } while (snap != g_infer_capture_seq.load());
+            }
         }
 
         ipc_ai_reply_t reply{};
@@ -387,8 +704,21 @@ static void ai_infer_worker_thread(int ai_ch)
             std::lock_guard<std::mutex> lk(g_ai_ch_mutex);
             if (isp_stop.load())
                 break;
-            ok = rpc_ai_impl(ai_ch, IPC_CMD_INFER, work.data(), k_ai_frame_bytes, AI_FRAME_CHANNEL, AI_FRAME_HEIGHT,
-                             AI_FRAME_WIDTH, nullptr, &reply, g_fixed_infer_ready);
+            if (slot_idx >= 0)
+            {
+                ok = rpc_ai_send_shmid(ai_ch, g_fixed_infer_slots[slot_idx].shmid, &reply, false, perf_enabled);
+            }
+            else
+            {
+                ok = rpc_ai_impl(ai_ch, IPC_CMD_INFER, work.data(), k_ai_frame_bytes, AI_FRAME_CHANNEL,
+                                 AI_FRAME_HEIGHT, AI_FRAME_WIDTH, nullptr, &reply);
+            }
+        }
+        if (slot_idx >= 0)
+        {
+            std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+            if (g_infer_inflight_slot == slot_idx)
+                g_infer_inflight_slot = -1;
         }
         if (isp_stop.load())
             break;
@@ -426,7 +756,9 @@ static void video_ipc_loop(int debug_mode)
      * 副本保证旋转/缩放每帧从同一源重做，避免与 main.cc 单进程分支行为偏差。 */
     int display_state = 0;
     cv::Mat register_preview_src;
+    cv::Mat register_commit_src;
     auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
+    bool register_preview_persistent = false;
 
     PipeLine pl(debug_mode);
     if (pl.Create() != 0)
@@ -451,24 +783,23 @@ static void video_ipc_loop(int debug_mode)
     g_infer_pending.assign(k_ai_frame_bytes, 0);
     g_infer_capture_seq.store(0);
     g_infer_last_displayed_seq.store(0);
+    g_infer_latest_slot = -1;
+    g_infer_inflight_slot = -1;
     g_infer_has_reply.store(false);
     memset(&g_last_infer_reply, 0, sizeof(g_last_infer_reply));
 
-    g_fixed_infer_cap = sizeof(ipc_req_hdr_t) + k_ai_frame_bytes;
-    g_fixed_infer_shmid = ipc_shm_alloc(g_fixed_infer_cap, &g_fixed_infer_ptr);
-    g_fixed_infer_ready = (g_fixed_infer_shmid >= 0 && g_fixed_infer_ptr != nullptr);
-    if (g_fixed_infer_ready)
-        std::cout << "face_video: fixed infer request shm shmid=" << g_fixed_infer_shmid << " cap=" << g_fixed_infer_cap
-                  << std::endl;
+    if (init_fixed_infer_slots())
+        std::cout << "face_video: fixed infer request slots ready count=" << k_fixed_infer_slot_count
+                  << " cap=" << g_fixed_infer_slots[0].cap << std::endl;
     else
-        std::cout << "face_video: warn: fixed infer shm failed, fallback to per-request alloc\n";
+        std::cout << "face_video: warn: fixed infer shm slots failed, fallback to staged per-request alloc\n";
 
-    std::thread th_infer(ai_infer_worker_thread, ai_ch);
+    std::thread th_infer(ai_infer_worker_thread, ai_ch, debug_mode);
 
     uint64_t loop_tick = 0;
     while (!isp_stop)
     {
-        ScopedTiming st("total time", debug_mode);
+        ScopedPerfStage perf_stage(g_perf_total_time, metrics_log_enabled(debug_mode));
         if (pl.GetFrame(dump_res) != 0)
         {
             isp_stop = true;
@@ -494,11 +825,51 @@ static void video_ipc_loop(int debug_mode)
         else if (state == 0)
         {
             draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
+            const bool perf_enabled = metrics_log_enabled(debug_mode);
+            const auto stage_start = std::chrono::steady_clock::now();
+            if (g_fixed_infer_slots_ready)
             {
-                std::lock_guard<std::mutex> lk(g_infer_pending_mu);
-                memcpy(g_infer_pending.data(), frame_ptr, frame_len);
-                g_infer_capture_seq.fetch_add(1);
-                g_metric_capture_frames.fetch_add(1);
+                uint64_t seq = 0;
+                int slot_idx = -1;
+                {
+                    std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                    seq = g_infer_capture_seq.load() + 1;
+                    slot_idx = select_writable_infer_slot_locked();
+                }
+                g_perf_capture_to_pending.track_since(stage_start, perf_enabled);
+
+                if (slot_idx >= 0)
+                {
+                    const auto slot_copy_start = std::chrono::steady_clock::now();
+                    FixedInferSlot &slot = g_fixed_infer_slots[slot_idx];
+                    if (ipc_request_encode_buffer(slot.ptr, slot.cap, IPC_CMD_INFER, frame_ptr, frame_len,
+                                                  AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH, nullptr,
+                                                  static_cast<uint32_t>(seq)) == 0)
+                    {
+                        g_perf_pending_to_ipc_slot.track_since(slot_copy_start, perf_enabled);
+                        {
+                            std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                            slot.seq = seq;
+                            g_infer_latest_slot = slot_idx;
+                            g_infer_capture_seq.store(seq);
+                            g_metric_capture_frames.fetch_add(1);
+                        }
+                    }
+                    else
+                    {
+                        g_perf_pending_to_ipc_slot.track_since(slot_copy_start, perf_enabled);
+                    }
+                }
+            }
+            else
+            {
+                {
+                    std::lock_guard<std::mutex> lk(g_infer_pending_mu);
+                    memcpy(g_infer_pending.data(), frame_ptr, frame_len);
+                    g_infer_capture_seq.fetch_add(1);
+                    g_metric_capture_frames.fetch_add(1);
+                }
+                g_perf_capture_to_pending.track_since(stage_start, perf_enabled);
             }
             g_infer_cv.notify_one();
             memset(&ai_reply, 0, sizeof(ai_reply));
@@ -519,6 +890,11 @@ static void video_ipc_loop(int debug_mode)
                              ok ? default_op_message(r, "database count ready") : "database count rpc failed");
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
+            if (!register_preview_src.empty())
+                register_preview_src.release();
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
         }
         else if (state == 2)
         {
@@ -533,6 +909,8 @@ static void video_ipc_loop(int debug_mode)
             sensor_bgr.push_back(ori_img_G);
             sensor_bgr.push_back(ori_img_R);
             cv::merge(sensor_bgr, dump_img);
+            register_commit_src = dump_img.clone();
+            register_preview_persistent = true;
             cur_state = 0;
             display_state = 2;
             send_video_reply(ctrl_snapshot, true, 0, "register preview ready");
@@ -544,16 +922,17 @@ static void video_ipc_loop(int debug_mode)
                 std::lock_guard<std::mutex> lk(g_ui);
                 name_copy = register_name;
             }
+            const cv::Mat &register_src = !register_commit_src.empty() ? register_commit_src : dump_img;
             std::vector<uint8_t> chw_vec;
             std::vector<cv::Mat> bgrChannels(3);
-            cv::split(dump_img, bgrChannels);
+            cv::split(register_src, bgrChannels);
             for (auto i = 2; i > -1; i--)
             {
                 std::vector<uint8_t> data = std::vector<uint8_t>(bgrChannels[i].reshape(1, 1));
                 chw_vec.insert(chw_vec.end(), data.begin(), data.end());
             }
-            uint32_t th = (uint32_t)dump_img.rows;
-            uint32_t tw = (uint32_t)dump_img.cols;
+            uint32_t th = (uint32_t)register_src.rows;
+            uint32_t tw = (uint32_t)register_src.cols;
             uint32_t tc = 3u;
 
             ipc_ai_reply_t r{};
@@ -564,6 +943,8 @@ static void video_ipc_loop(int debug_mode)
                              register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
             if (!register_preview_src.empty())
             {
                 register_preview_src.release();
@@ -610,9 +991,13 @@ static void video_ipc_loop(int debug_mode)
                              register_commit_reply_message(r, ok));
             cur_state = 0;
             display_state = 2;
+            register_preview_persistent = false;
+            register_commit_src.release();
         }
         else if (state == 6)
         {
+            register_preview_persistent = false;
+            register_commit_src.release();
             if (!register_preview_src.empty())
             {
                 register_preview_src.release();
@@ -632,18 +1017,73 @@ static void video_ipc_loop(int debug_mode)
                              ok ? default_op_message(r, "database reset") : "database reset rpc failed");
             cur_state = 0;
             display_state = 0;
+            register_preview_persistent = false;
+            register_commit_src.release();
+            if (!register_preview_src.empty())
+                register_preview_src.release();
+            register_preview_deadline = std::chrono::steady_clock::time_point::min();
+        }
+        else if (state == 7)
+        {
+            const std::string stage_path = import_stage_file_path(ctrl_snapshot.request_id);
+            if (stage_path.empty())
+            {
+                send_video_reply(ctrl_snapshot, false, -1, "import staging request id missing");
+                cur_state = 0;
+                display_state = 0;
+            }
+            else
+            {
+                std::vector<uint8_t> raw;
+                if (!read_binary_file_all(stage_path, &raw))
+                {
+                    send_video_reply(ctrl_snapshot, false, -1, "import staged image missing or empty");
+                    cur_state = 0;
+                    display_state = 0;
+                }
+                else
+                {
+                    cv::Mat decoded = cv::imdecode(raw, cv::IMREAD_COLOR);
+                    if (decoded.empty())
+                    {
+                        send_video_reply(ctrl_snapshot, false, -1, "import staged image decode failed");
+                        cur_state = 0;
+                        display_state = 0;
+                    }
+                    else
+                    {
+                        const cv::Mat ai_input_bgr = letterbox_bgr_to_ai_frame(decoded);
+                        const std::vector<uint8_t> chw_vec = bgr_mat_to_chw_rgb(ai_input_bgr);
+                        ipc_ai_reply_t r{};
+                        const char *import_name =
+                            ctrl_snapshot.register_name[0] ? ctrl_snapshot.register_name : register_name.c_str();
+                        const bool ok =
+                            rpc_ai_sync(ai_ch, IPC_CMD_IMPORT_IMAGE, chw_vec.data(), chw_vec.size(), AI_FRAME_CHANNEL,
+                                        AI_FRAME_HEIGHT, AI_FRAME_WIDTH, import_name, &r);
+                        send_video_reply(ctrl_snapshot, ok && r.op_result == IPC_OP_RESULT_OK, ok ? r.count : -1,
+                                         import_image_reply_message(r, ok));
+                        cur_state = 0;
+                        display_state = 0;
+                    }
+                }
+                std::error_code rm_ec;
+                fs::remove(stage_path, rm_ec);
+            }
         }
 
         /* 须在 state 1–6 可能 release 了 register_preview_src 之后计算，避免同一帧仍用已失效的 preview_active 去 resize 空图 */
         const auto now_after_ctrl = std::chrono::steady_clock::now();
         const bool preview_still =
-            !register_preview_src.empty() && now_after_ctrl < register_preview_deadline;
+            !register_preview_src.empty() &&
+            (register_preview_persistent || now_after_ctrl < register_preview_deadline);
 
         if (display_state == 2)
         {
             /* 首次进入注册预览：缓存 dump_img 副本，设定过期时刻；旋转/缩放每帧按源重做。 */
             register_preview_src = dump_img.clone();
-            register_preview_deadline = now_after_ctrl + std::chrono::milliseconds(k_register_preview_hold_ms);
+            register_preview_deadline = register_preview_persistent
+                                            ? std::chrono::steady_clock::time_point::max()
+                                            : now_after_ctrl + std::chrono::milliseconds(k_register_preview_hold_ms);
             render_register_preview(draw_frame, register_preview_src);
         }
         else if (preview_still)
@@ -659,6 +1099,7 @@ static void video_ipc_loop(int debug_mode)
             ipc_draw_faces_osd(draw_frame, &ai_reply);
         }
 
+        blend_ui_overlay(draw_frame);
         pl.InsertFrame(draw_frame.data);
         pl.ReleaseFrame(dump_res);
 
@@ -669,7 +1110,7 @@ static void video_ipc_loop(int debug_mode)
                       << " infer_rpc_fail=" << g_metric_infer_rpc_fail.load()
                       << " infer_stale=" << g_metric_infer_stale.load()
                       << " infer_applied=" << g_metric_infer_applied.load()
-                      << " fixed_infer_shm=" << (g_fixed_infer_ready ? "on" : "off") << std::endl;
+                      << " fixed_infer_shm=" << (g_fixed_infer_slots_ready ? "on" : "off") << std::endl;
         }
     }
 
@@ -704,23 +1145,17 @@ static void video_ipc_loop(int debug_mode)
         }
     }
 
-    if (g_fixed_infer_ptr)
-    {
-        lwp_shmdt(g_fixed_infer_ptr);
-        g_fixed_infer_ptr = nullptr;
-    }
-    if (g_fixed_infer_shmid >= 0)
-    {
-        ipc_shm_free(g_fixed_infer_shmid);
-        g_fixed_infer_shmid = -1;
-    }
-    g_fixed_infer_ready = false;
+    release_fixed_infer_slots();
 
     rt_channel_close(ai_ch);
     int reply_ch = g_video_reply_ch.load();
     if (reply_ch >= 0)
         rt_channel_close(reply_ch);
     g_video_reply_ch.store(-1);
+    {
+        std::lock_guard<std::mutex> lk(g_ui_overlay_mu);
+        clear_ui_overlay_mapping_locked();
+    }
     pl.Destroy();
 }
 

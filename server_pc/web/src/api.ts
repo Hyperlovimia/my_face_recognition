@@ -1,13 +1,43 @@
-import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry } from "./types";
+import type { CommandRow, DeviceRow, EventRow, FaceGalleryEntry, PagedRows } from "./types";
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(url, options);
   const data = (await resp.json()) as T & { detail?: string };
   if (!resp.ok) {
     const msg = (data as { detail?: string }).detail ?? `HTTP ${resp.status}`;
-    throw new Error(msg);
+    throw new ApiError(resp.status, msg);
   }
   return data as T;
+}
+
+export function isUnauthorizedError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 401;
+}
+
+export function login(password: string) {
+  return fetchJson<{ ok: true }>("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+}
+
+export function logout() {
+  return fetchJson<{ ok: true }>("/api/auth/logout", { method: "POST" });
+}
+
+export function getSession() {
+  return fetchJson<{ authenticated: true }>("/api/auth/session");
 }
 
 export function getDevices() {
@@ -21,8 +51,26 @@ export function getDeviceState(deviceId: string) {
   }>(`/api/devices/${encodeURIComponent(deviceId)}/state`);
 }
 
-export function getDeviceEvents(deviceId: string, limit = 100) {
-  return fetchJson<{ events: EventRow[] }>(`/api/devices/${encodeURIComponent(deviceId)}/events?limit=${limit}`);
+export function getDeviceCommands(deviceId: string, limit = 20, offset = 0) {
+  return fetchJson<{ commands: CommandRow[]; total: number; limit: number; offset: number }>(
+    `/api/devices/${encodeURIComponent(deviceId)}/commands?limit=${limit}&offset=${offset}`,
+  ).then((data) => ({
+    total: data.total,
+    limit: data.limit,
+    offset: data.offset,
+    items: data.commands,
+  } satisfies PagedRows<CommandRow>));
+}
+
+export function getDeviceEvents(deviceId: string, limit = 20, offset = 0) {
+  return fetchJson<{ events: EventRow[]; total: number; limit: number; offset: number }>(
+    `/api/devices/${encodeURIComponent(deviceId)}/events?limit=${limit}&offset=${offset}`,
+  ).then((data) => ({
+    total: data.total,
+    limit: data.limit,
+    offset: data.offset,
+    items: data.events,
+  } satisfies PagedRows<EventRow>));
 }
 
 export function postWebDataClear() {

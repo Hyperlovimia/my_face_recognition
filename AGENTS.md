@@ -23,10 +23,11 @@
 
 [K230 SDK 官方文档](https://www.kendryte.com/k230/zh/main/index.html)
 [K230核间通讯API参考](https://www.kendryte.com/k230/zh/main/01_software/board/cdk/K230_%E6%A0%B8%E9%97%B4%E9%80%9A%E8%AE%AF_API%E5%8F%82%E8%80%83.html)
+[K230 GUI实战 - LVGL移植教程](https://www.kendryte.com/k230/zh/main/02_applications/tutorials/K230_GUI%E5%AE%9E%E6%88%98_LVGL%E7%A7%BB%E6%A4%8D%E6%95%99%E7%A8%8B.html)
 
-# 项目构建流程
+## 项目构建流程
 
-## Linux 小核项目
+### Linux 小核项目
 
 直接执行脚本
 ```sh
@@ -37,44 +38,22 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_br
 > 编译完成后，可在 `out/` 目录下看到可执行程序与配套测试文件
 > 另外，face_netd.ini 也需要传到板子上
 
-如果电脑端 `server_pc` 运行在 WSL / Docker 中，还需要额外注意：
+### RT-Smart 大核项目
 
-- `face_netd.ini` 中 `mqtt_url` 必须填写 Windows 主机真实局域网 IPv4
-- 不要填写 `vEthernet (WSL)` 的 `172.23.x.x`
-- Windows 管理员 PowerShell 中需要额外配置：
-
-```powershell
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=127.0.0.1 connectport=1883
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=127.0.0.1 connectport=8000
-New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
-New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
-```
-
-## RT-Smart 大核项目
-
-RT-Smart 大核项目需要使用 Docker 环境编译项目，具体方法如下
-
-### 进入 Kmodel 模型转换环境
-```sh
-# 进入k230 SDK目录
-cd /home/hyperlovimia/k230_sdk
-```
+RT-Smart 大核项目支持在宿主机中直接执行脚本编译，具体方法如下
 
 ```sh
-# 激活 docker
-docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
-```
-
-### 进入kmodel推理程序源码目录
-```sh
-cd src/reference/ai_poc/my_face_recognition
-```
-
-> 注：项目 `my_face_recognition` 必须放在 k230_sdk/src/reference/ai_poc/ 目录下
-
-###  执行编译脚本
-```sh
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 ./build_app.sh
 ```
 
+> 注：项目 `my_face_recognition` 必须放在 k230_sdk/src/reference/ai_poc/ 目录下
+> `build_app.sh` 会优先使用 `k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin`
 > 编译完成后，可在 `k230_bin/` 目录下看到可执行程序与配套测试文件
+
+### Web 前端
+
+```sh
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+docker compose up --build
+```

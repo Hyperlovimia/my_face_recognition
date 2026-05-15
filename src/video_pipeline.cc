@@ -1,10 +1,24 @@
 #include "video_pipeline.h"
+#include "perf_stats.h"
 
 #include <opencv2/imgproc.hpp>
 
 namespace {
 
 constexpr k_u32 kOsdInsertChnOffset = 3;
+PerfStageStats g_perf_dump_frame("video_pipeline.dump_frame");
+PerfStageStats g_perf_mmap_cached("video_pipeline.mmap_cached");
+PerfStageStats g_perf_copy_convert("video_pipeline.copy_convert");
+PerfStageStats g_perf_munmap("video_pipeline.munmap");
+PerfStageStats g_perf_get_frame("video_pipeline.get_frame");
+PerfStageStats g_perf_insert_frame("video_pipeline.insert_frame");
+PerfStageStats g_perf_release_frame("video_pipeline.release_frame");
+
+bool metrics_log_enabled(int debug_mode)
+{
+    const char *e = std::getenv("FACE_METRICS");
+    return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
+}
 
 bool FindCompatibleVbPool(const k_vb_config &vb_config, k_u64 required_size, int *matched_index,
                           k_u64 *matched_size, k_u32 *matched_count)
@@ -542,13 +556,16 @@ int PipeLine::Create()
 }
 
 int PipeLine::GetFrame(DumpRes &dump_res){
-    ScopedTiming st("PipeLine::GetFrame", debug_mode_);
+    const bool perf_enabled = metrics_log_enabled(debug_mode_);
+    ScopedPerfStage perf_stage(g_perf_get_frame, perf_enabled);
     int ret = 0;
     memset(&dump_res, 0, sizeof(dump_res));
     memset(&dump_info, 0, sizeof(k_video_frame_info));
 
     // 从 VICAP dump 一帧（阻塞最多 1000ms）
+    const auto dump_start = std::chrono::steady_clock::now();
     ret = kd_mpi_vicap_dump_frame(vicap_dev, VICAP_CHN_ID_1, VICAP_DUMP_YUV, &dump_info, 1000);
+    g_perf_dump_frame.track_since(dump_start, perf_enabled);
     if (ret)
     {
         printf("kd_mpi_vicap_dump_frame failed.\n");
@@ -604,7 +621,9 @@ int PipeLine::GetFrame(DumpRes &dump_res){
     }
 
     // 把 dump 帧映射成 CPU-cached 虚拟地址（参考 ai_poc/face_detection/main.cc:93）
+    const auto mmap_start = std::chrono::steady_clock::now();
     void *dump_vaddr = kd_mpi_sys_mmap_cached(dump_info.v_frame.phys_addr[0], (k_u32)dump_bytes);
+    g_perf_mmap_cached.track_since(mmap_start, perf_enabled);
     if (dump_vaddr == nullptr) {
         printf("kd_mpi_sys_mmap_cached failed for dumped frame.\n");
         kd_mpi_vicap_dump_release(vicap_dev, VICAP_CHN_ID_1, &dump_info);
@@ -612,6 +631,7 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         return -1;
     }
 
+    const auto copy_start = std::chrono::steady_clock::now();
     if (pix_format == PIXEL_FORMAT_BGR_888_PLANAR) {
         // ISP 直出 BGR planar（实际为 RGB CHW 布局）—— 直接搬运到私有缓存
         memcpy(ai_buf_vaddr_, dump_vaddr, ai_buf_size_);
@@ -627,21 +647,20 @@ int PipeLine::GetFrame(DumpRes &dump_res){
         // main.cc 的注册路径和 AI tensor shape {3, H, W} 都基于这个约定。
         cv::Mat yuv420sp_view(AI_FRAME_HEIGHT * 3 / 2, AI_FRAME_WIDTH, CV_8UC1, dump_vaddr);
         cv::cvtColor(yuv420sp_view, bgr_hwc_scratch_, cv::COLOR_YUV2RGB_NV21);
-
         uint8_t *const ai_data = static_cast<uint8_t *>(ai_buf_vaddr_);
-        uint8_t *const dst_r = ai_data + 0 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
-        uint8_t *const dst_g = ai_data + 1 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
-        uint8_t *const dst_b = ai_data + 2 * AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
-        const uint8_t *src = bgr_hwc_scratch_.data;
-        const int total_pixels = AI_FRAME_HEIGHT * AI_FRAME_WIDTH;
-        for (int i = 0; i < total_pixels; ++i) {
-            dst_r[i] = src[i * 3 + 0];
-            dst_g[i] = src[i * 3 + 1];
-            dst_b[i] = src[i * 3 + 2];
-        }
+        const size_t plane_size = (size_t)AI_FRAME_HEIGHT * (size_t)AI_FRAME_WIDTH;
+        std::vector<cv::Mat> chw_planes{
+            cv::Mat(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, ai_data + 0 * plane_size),
+            cv::Mat(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, ai_data + 1 * plane_size),
+            cv::Mat(AI_FRAME_HEIGHT, AI_FRAME_WIDTH, CV_8UC1, ai_data + 2 * plane_size),
+        };
+        cv::split(bgr_hwc_scratch_, chw_planes);
     }
+    g_perf_copy_convert.track_since(copy_start, perf_enabled);
 
+    const auto munmap_start = std::chrono::steady_clock::now();
     kd_mpi_sys_munmap(dump_vaddr, (k_u32)dump_bytes);
+    g_perf_munmap.track_since(munmap_start, perf_enabled);
 
     // 注意：dump_release 现在挪到 ReleaseFrame 里调用，整体生命周期对齐
     // ai_poc/face_detection/main.cc:77-147 —— dump → mmap+memcpy → munmap
@@ -664,7 +683,7 @@ int PipeLine::GetFrame(DumpRes &dump_res){
 }
 
 int PipeLine::ReleaseFrame(DumpRes &dump_res){
-    ScopedTiming st("PipeLine::ReleaseFrame", debug_mode_);
+    ScopedPerfStage perf_stage(g_perf_release_frame, metrics_log_enabled(debug_mode_));
     int ret = 0;
 
     // 对齐 ai_poc/face_detection 的循环末尾 release 模式：
@@ -690,7 +709,7 @@ int PipeLine::ReleaseFrame(DumpRes &dump_res){
 }
 
 int PipeLine::InsertFrame(void* osd_data){
-    ScopedTiming st("PipeLine::InsertFrame", debug_mode_);
+    ScopedPerfStage perf_stage(g_perf_insert_frame, metrics_log_enabled(debug_mode_));
     int ret=0;
 
     // 将外部生成的 OSD 数据拷贝到 VB 映射的内存中

@@ -18,6 +18,7 @@
 #include "face_antispoof.h"
 #include "face_detection.h"
 #include "face_recognition.h"
+#include "perf_stats.h"
 #include "setting.h"
 
 using std::vector;
@@ -189,6 +190,59 @@ static bool ai_metrics_enabled(int debug_mode)
 {
     const char *e = std::getenv("FACE_METRICS");
     return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
+}
+
+struct FixedInputTensor
+{
+    runtime_tensor tensor;
+    size_t bytes = 0;
+    bool ready = false;
+};
+
+static PerfStageStats g_perf_shmat_req("face_ai.shmat_req");
+static PerfStageStats g_perf_prepare_input_tensor("face_ai.prepare_input_tensor");
+static PerfStageStats g_perf_det_pre("face_ai.det_pre");
+static PerfStageStats g_perf_det_infer("face_ai.det_infer");
+static PerfStageStats g_perf_det_post("face_ai.det_post");
+static PerfStageStats g_perf_rec_pre("face_ai.rec_pre");
+static PerfStageStats g_perf_rec_infer("face_ai.rec_infer");
+static PerfStageStats g_perf_rec_search("face_ai.rec_search");
+static PerfStageStats g_perf_reply_send("face_ai.reply_send");
+
+static bool init_input_tensor(uint32_t tensor_c, uint32_t tensor_h, uint32_t tensor_w, runtime_tensor *out_tensor)
+{
+    if (!out_tensor)
+        return false;
+
+    dims_t in_shape{1, tensor_c, tensor_h, tensor_w};
+    auto rt_res = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared);
+    if (!rt_res.is_ok())
+        return false;
+
+    *out_tensor = std::move(rt_res.unwrap());
+    return true;
+}
+
+static bool copy_pixels_to_tensor(runtime_tensor &tensor, const uint8_t *pixels, size_t bytes)
+{
+    auto map_r = hrt::map(tensor, map_access_::map_write);
+    if (!map_r.is_ok())
+        return false;
+    auto mapped = std::move(map_r.unwrap());
+    auto ref_buf = mapped.buffer();
+    if (ref_buf.size_bytes() < bytes)
+    {
+        auto ignore_unmap_r = mapped.unmap();
+        (void)ignore_unmap_r;
+        return false;
+    }
+    memcpy(reinterpret_cast<char *>(ref_buf.data()), pixels, bytes);
+    auto unmap_r = mapped.unmap();
+    if (!unmap_r.is_ok())
+        return false;
+
+    auto sync_r = hrt::sync(tensor, sync_op_t::sync_write_back, true);
+    return sync_r.is_ok();
 }
 
 static void reset_evt_channel()
@@ -441,6 +495,14 @@ int main(int argc, char **argv)
     const float db_top2_margin = db_top2_margin_from_env();
     FaceRecognition face_recg(argv[4], static_cast<float>(atof(argv[5])), image_size, debug_mode, db_top2_margin);
     face_recg.database_init(db_dir);
+    FixedInputTensor fixed_input{};
+    fixed_input.bytes = (size_t)AI_FRAME_CHANNEL * (size_t)AI_FRAME_HEIGHT * (size_t)AI_FRAME_WIDTH;
+    fixed_input.ready = init_input_tensor(AI_FRAME_CHANNEL, AI_FRAME_HEIGHT, AI_FRAME_WIDTH, &fixed_input.tensor);
+    if (fixed_input.ready)
+        std::cout << "face_ai: fixed input tensor ready for " << AI_FRAME_CHANNEL << "x" << AI_FRAME_HEIGHT << "x"
+                  << AI_FRAME_WIDTH << " bytes=" << fixed_input.bytes << "\n";
+    else
+        std::cout << "face_ai: warn: fixed input tensor init failed, using dynamic input tensor fallback\n";
     std::cout << "face_ai: recognition db_top2_margin=" << db_top2_margin
               << " (env FACE_DB_TOP2_MARGIN overrides default)\n"
               << "face_ai: recognition hysteresis band=" << rec_hysteresis_band_from_env()
@@ -471,7 +533,10 @@ int main(int argc, char **argv)
             continue;
         }
 
+        const bool perf_enabled = ai_metrics_enabled(debug_mode);
+        const auto shmat_start = std::chrono::steady_clock::now();
         void *req_map = lwp_shmat(req_shmid, NULL);
+        g_perf_shmat_req.track_since(shmat_start, perf_enabled);
         if (!req_map)
         {
             send_error_reply(ch_ai, &msg);
@@ -513,7 +578,7 @@ int main(int argc, char **argv)
             reply.num_faces = 0;
             set_reply_op(&reply, IPC_OP_RESULT_OK, "database reset");
         }
-        else if (hdr->cmd == IPC_CMD_INFER || hdr->cmd == IPC_CMD_REGISTER_COMMIT)
+        else if (hdr->cmd == IPC_CMD_INFER || hdr->cmd == IPC_CMD_REGISTER_COMMIT || hdr->cmd == IPC_CMD_IMPORT_IMAGE)
         {
             size_t expect = (size_t)hdr->tensor_c * hdr->tensor_h * hdr->tensor_w;
             if (hdr->frame_bytes != expect || hdr->frame_bytes == 0)
@@ -524,62 +589,38 @@ int main(int argc, char **argv)
             }
 
             uint8_t *pixels = (uint8_t *)req_map + sizeof(ipc_req_hdr_t);
-            dims_t in_shape{1, hdr->tensor_c, hdr->tensor_h, hdr->tensor_w};
             FrameCHWSize fs = {static_cast<size_t>(hdr->tensor_c), static_cast<size_t>(hdr->tensor_h),
                                static_cast<size_t>(hdr->tensor_w)};
-
-            auto rt_res = host_runtime_tensor::create(typecode_t::dt_uint8, in_shape, hrt::pool_shared);
-            if (!rt_res.is_ok())
+            runtime_tensor input_tensor;
+            const bool use_fixed_input = fixed_input.ready && hdr->tensor_c == AI_FRAME_CHANNEL &&
+                                         hdr->tensor_h == AI_FRAME_HEIGHT && hdr->tensor_w == AI_FRAME_WIDTH &&
+                                         hdr->frame_bytes == fixed_input.bytes;
+            const auto prep_start = std::chrono::steady_clock::now();
+            if (use_fixed_input)
+            {
+                input_tensor = fixed_input.tensor;
+            }
+            else if (!init_input_tensor(hdr->tensor_c, hdr->tensor_h, hdr->tensor_w, &input_tensor))
             {
                 lwp_shmdt(req_map);
                 reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
                 std::cerr << "face_ai: create input tensor failed\n";
                 continue;
             }
-            runtime_tensor input_tensor = std::move(rt_res.unwrap());
 
-            auto th_r = input_tensor.impl()->to_host();
-            if (!th_r.is_ok())
+            if (!copy_pixels_to_tensor(input_tensor, pixels, hdr->frame_bytes))
             {
                 lwp_shmdt(req_map);
                 reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
-                std::cerr << "face_ai: to_host failed\n";
+                std::cerr << "face_ai: prepare input tensor failed\n";
                 continue;
             }
-            nncase::tensor host_tensor = std::move(th_r.unwrap());
-            auto bh_r = host_tensor->buffer().as_host();
-            if (!bh_r.is_ok())
-            {
-                lwp_shmdt(req_map);
-                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
-                std::cerr << "face_ai: buffer as_host failed\n";
-                continue;
-            }
-            auto as_host = std::move(bh_r.unwrap());
-            auto map_r = as_host.map(map_access_::map_write);
-            if (!map_r.is_ok())
-            {
-                lwp_shmdt(req_map);
-                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
-                std::cerr << "face_ai: map write failed\n";
-                continue;
-            }
-            auto mapped = std::move(map_r.unwrap());
-            auto ref_buf = mapped.buffer();
-            memcpy(reinterpret_cast<char *>(ref_buf.data()), pixels, hdr->frame_bytes);
-
-            auto sync_r = hrt::sync(input_tensor, sync_op_t::sync_write_back, true);
-            if (!sync_r.is_ok())
-            {
-                lwp_shmdt(req_map);
-                reply_status_only(ch_ai, IPC_STATUS_ERR_INFER);
-                std::cerr << "face_ai: sync write_back failed\n";
-                continue;
-            }
+            g_perf_prepare_input_tensor.track_since(prep_start, perf_enabled);
 
             det_results.clear();
             rec_results.clear();
 
+            const auto det_pre_start = std::chrono::steady_clock::now();
             if (!face_det.pre_process(input_tensor))
             {
                 lwp_shmdt(req_map);
@@ -587,6 +628,8 @@ int main(int argc, char **argv)
                 std::cerr << "face_ai: detection pre_process failed\n";
                 continue;
             }
+            g_perf_det_pre.track_since(det_pre_start, perf_enabled);
+            const auto det_infer_start = std::chrono::steady_clock::now();
             if (!face_det.inference())
             {
                 lwp_shmdt(req_map);
@@ -594,7 +637,10 @@ int main(int argc, char **argv)
                 std::cerr << "face_ai: detection inference failed\n";
                 continue;
             }
+            g_perf_det_infer.track_since(det_infer_start, perf_enabled);
+            const auto det_post_start = std::chrono::steady_clock::now();
             face_det.post_process(fs, det_results);
+            g_perf_det_post.track_since(det_post_start, perf_enabled);
             sort_det_results_by_quality(det_results);
             if (det_results.size() > 1u)
             {
@@ -619,7 +665,7 @@ int main(int argc, char **argv)
                 const float det_thresh_cfg = face_det.det_conf_thresh();
                 const float det_weak_floor = (std::max)(0.24f, det_thresh_cfg * 0.68f);
                 const bool det_weak =
-                    (hdr->cmd != IPC_CMD_REGISTER_COMMIT) && (det_results[i].score < det_weak_floor);
+                    (hdr->cmd == IPC_CMD_INFER) && (det_results[i].score < det_weak_floor);
                 const bool suppress_infer_evt = det_weak;
 
                 FaceRecognitionInfo recg_result;
@@ -635,12 +681,14 @@ int main(int argc, char **argv)
                 else
                 {
                     /* 识别 affine 与检测关键点同源；活体与识别共用同一张对齐脸，避免检测框裁剪与识别输入不一致。 */
+                    const auto rec_pre_start = std::chrono::steady_clock::now();
                     if (!face_recg.pre_process(input_tensor, det_results[i].sparse_kps.points))
                     {
                         std::cerr << "face_ai: recognition pre_process failed\n";
                         rec_ok = false;
                         break;
                     }
+                    g_perf_rec_pre.track_since(rec_pre_start, perf_enabled);
 
                     float fas_ema_alpha_up = k_fas_ema_alpha_up;
                     if (det_results[i].score >= 0.52f)
@@ -684,7 +732,7 @@ int main(int argc, char **argv)
                     }
 
                     const bool skip_recg_infer =
-                        fas && !is_live &&
+                        fas && !is_live && hdr->cmd != IPC_CMD_IMPORT_IMAGE &&
                         !(hdr->cmd == IPC_CMD_REGISTER_COMMIT &&
                           live_real >= fas_register_eff_floor(fas_real_thresh));
 
@@ -696,14 +744,17 @@ int main(int argc, char **argv)
                     }
                     else
                     {
+                        const auto rec_infer_start = std::chrono::steady_clock::now();
                         if (!face_recg.inference())
                         {
                             std::cerr << "face_ai: recognition inference failed\n";
                             rec_ok = false;
                             break;
                         }
+                        g_perf_rec_infer.track_since(rec_infer_start, perf_enabled);
                         if (hdr->cmd == IPC_CMD_INFER)
                         {
+                            const auto rec_search_start = std::chrono::steady_clock::now();
                             const int fd = face_recg.feature_dim();
                             const int nfaces = (int)det_results.size();
                             const bool multi_face = nfaces > 1;
@@ -768,9 +819,14 @@ int main(int argc, char **argv)
                                 face_recg.database_search(recg_result, nullptr, nfaces);
 
                             apply_recognition_hysteresis((int)i, nfaces, face_recg, recg_result);
+                            g_perf_rec_search.track_since(rec_search_start, perf_enabled);
                         }
                         else
+                        {
+                            const auto rec_search_start = std::chrono::steady_clock::now();
                             face_recg.database_search(recg_result, nullptr, (int)det_results.size());
+                            g_perf_rec_search.track_since(rec_search_start, perf_enabled);
+                        }
                     }
                 }
                 rec_results.push_back(recg_result);
@@ -830,20 +886,33 @@ int main(int argc, char **argv)
                                                      fas_register_eff_floor(fas_real_thresh));
                 if (det_results.size() == 1 && reply.num_faces >= 1 && reg_ok_live)
                 {
-                    std::string reg_name(hdr->register_name);
-                    cv::Mat snap_landscape;
+                    const FaceRecognitionInfo &reg_result = rec_results.front();
+                    if (reg_result.id >= 0)
                     {
-                        const int hh = static_cast<int>(hdr->tensor_h);
-                        const int ww = static_cast<int>(hdr->tensor_w);
-                        const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
-                        cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
-                        cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
-                        cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
-                        cv::merge(std::vector<cv::Mat>{mb, mg, mr}, snap_landscape);
+                        std::string reject_msg = "register rejected: face already registered";
+                        if (!reg_result.name.empty() && reg_result.name != "unknown")
+                            reject_msg += " (" + reg_result.name + ")";
+                        set_reply_op(&reply, IPC_OP_RESULT_FAIL, reject_msg.c_str());
+                        std::cout << "face_ai: register rejected (already registered): "
+                                  << (reg_result.name.empty() ? "<unnamed>" : reg_result.name) << std::endl;
                     }
-                    face_recg.database_add(reg_name, db_dir, snap_landscape);
-                    set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
-                    std::cout << "face_ai: register ok: " << reg_name << std::endl;
+                    else
+                    {
+                        std::string reg_name(hdr->register_name);
+                        cv::Mat snap_landscape;
+                        {
+                            const int hh = static_cast<int>(hdr->tensor_h);
+                            const int ww = static_cast<int>(hdr->tensor_w);
+                            const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
+                            cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
+                            cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
+                            cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
+                            cv::merge(std::vector<cv::Mat>{mb, mg, mr}, snap_landscape);
+                        }
+                        face_recg.database_add(reg_name, db_dir, snap_landscape);
+                        set_reply_op(&reply, IPC_OP_RESULT_OK, "register ok");
+                        std::cout << "face_ai: register ok: " << reg_name << std::endl;
+                    }
                 }
                 else if (det_results.size() == 1 && fas && reply.num_faces >= 1 && !reg_ok_live)
                 {
@@ -856,6 +925,39 @@ int main(int argc, char **argv)
                     std::cout << "face_ai: register failed (need exactly one face)\n";
                 }
             }
+            else if (hdr->cmd == IPC_CMD_IMPORT_IMAGE)
+            {
+                if (det_results.size() == 1 && reply.num_faces >= 1)
+                {
+                    std::string reg_name(hdr->register_name);
+                    cv::Mat import_bgr;
+                    {
+                        const int hh = static_cast<int>(hdr->tensor_h);
+                        const int ww = static_cast<int>(hdr->tensor_w);
+                        const size_t plane = static_cast<size_t>(hh) * static_cast<size_t>(ww);
+                        cv::Mat mr(hh, ww, CV_8UC1, pixels + 0);
+                        cv::Mat mg(hh, ww, CV_8UC1, pixels + plane);
+                        cv::Mat mb(hh, ww, CV_8UC1, pixels + 2 * plane);
+                        cv::merge(std::vector<cv::Mat>{mb, mg, mr}, import_bgr);
+                    }
+                    face_recg.database_add_import(reg_name, db_dir, import_bgr);
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_OK, "import ok");
+                    std::cout << "face_ai: import ok: " << reg_name << std::endl;
+                }
+                else if (det_results.empty())
+                {
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "import failed: need exactly one face");
+                    std::cout << "face_ai: import failed (no face)\n";
+                }
+                else
+                {
+                    reply.count = face_recg.database_count(db_dir);
+                    set_reply_op(&reply, IPC_OP_RESULT_FAIL, "import failed: need exactly one face");
+                    std::cout << "face_ai: import failed (multiple faces)\n";
+                }
+            }
         }
         else
         {
@@ -866,6 +968,7 @@ int main(int argc, char **argv)
 
         lwp_shmdt(req_map);
 
+        const auto reply_send_start = std::chrono::steady_clock::now();
         void *rp = nullptr;
         int rshmid = ipc_shm_alloc(sizeof(ipc_ai_reply_t), &rp);
         if (rshmid < 0 || !rp)
@@ -881,6 +984,7 @@ int main(int argc, char **argv)
         out.type = RT_CHANNEL_RAW;
         out.u.d = (void *)(intptr_t)rshmid;
         rt_channel_reply(ch_ai, &out);
+        g_perf_reply_send.track_since(reply_send_start, perf_enabled);
     }
 
     reset_evt_channel();

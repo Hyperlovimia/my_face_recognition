@@ -106,6 +106,12 @@ public:
     void database_add(std::string& name, char* db_path, const cv::Mat &full_isp_bgr_landscape);
 
     /**
+     * @brief 从静态导入图片入库：保存特征与原始导入图缩放后的 JPEG，不额外做 camera/OSD 方向旋转
+     * @param import_bgr 已解码的 BGR 图像；为空时回退到 aligned_face_to_bgr
+     */
+    void database_add_import(std::string& name, char* db_path, const cv::Mat &import_bgr);
+
+    /**
      * @brief 人脸数据库重置，清除所有数据库人脸特征
      * @param db_pth 数据库目录
      * @return None
@@ -186,7 +192,7 @@ private:
     * @param len  原始数据长度
     * @return None
     */
-    void l2_normalize(float* src, float* dst, int len) const;
+    void l2_normalize(const float* src, float* dst, int len) const;
 
     /**
     * @brief 计算两特征的余弦距离
@@ -195,7 +201,7 @@ private:
     * @param feature_len  特征长度
     * @return 余弦距离
     */
-    float cal_cosine_distance(float* feature_0, float* feature_1, int feature_len);
+    float cal_cosine_distance(const float* feature_0, const float* feature_1, int feature_len);
     
     std::unique_ptr<ai2d_builder> ai2d_builder_; // ai2d构建器
     runtime_tensor ai2d_out_tensor_;             // ai2d输出tensor

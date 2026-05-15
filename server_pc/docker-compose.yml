@@ -20,6 +20,8 @@ services:
       FACE_MQTT_HOST: mosquitto
       FACE_MQTT_PORT: "1883"
       FACE_WEB_DB_PATH: /app/data/face_web.db
+      # 必填：Web 管理端单管理员密码。不要把真实密码写进仓库或 compose 文件。
+      FACE_WEB_ADMIN_PASSWORD: ${FACE_WEB_ADMIN_PASSWORD:?FACE_WEB_ADMIN_PASSWORD must be set before docker compose up}
     ports:
       - "8000:8000"
     volumes:

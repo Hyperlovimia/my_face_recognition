@@ -368,6 +368,7 @@ void FaceRecognition::database_init(char *db_pth)
 			          << std::endl;
 			break;
 		}
+        l2_normalize(db_vec.data(), db_vec.data(), feature_num_);
 		features_.push_back(std::move(db_vec));
 		fname = face_db_join_path(db_pth, std::to_string(i) + ".name");
 		vector<char> name_vec = Utils::read_binary_file<char>(fname.c_str());
@@ -395,6 +396,54 @@ static void orient_isp_snapshot_like_register_preview(const cv::Mat &landscape_b
 #else
     landscape_bgr.copyTo(dst);
 #endif
+}
+
+static bool write_face_db_slot(const std::string &feature_file, const std::string &name_file, const std::string &name,
+                               const float *feature, int feature_num)
+{
+    if (!feature || feature_num <= 0)
+        return false;
+
+    FILE *f_db = fopen(feature_file.c_str(), "wb");
+    if (!f_db)
+    {
+        std::cerr << "Failed to open " << feature_file << " for writing." << std::endl;
+        return false;
+    }
+    fwrite(feature, sizeof(float), feature_num, f_db);
+    fclose(f_db);
+
+    FILE *f_name = fopen(name_file.c_str(), "wb");
+    if (!f_name)
+    {
+        std::cerr << "Failed to open " << name_file << " for writing." << std::endl;
+        return false;
+    }
+    fwrite(name.c_str(), sizeof(char), name.length(), f_name);
+    fclose(f_name);
+    return true;
+}
+
+static void save_gallery_jpeg_or_fallback(const cv::Mat &primary_bgr, const std::string &jpg_file,
+                                          const FaceRecognition *self)
+{
+    static const std::vector<int> k_jpeg_params{cv::IMWRITE_JPEG_QUALITY, 88};
+    if (!primary_bgr.empty())
+    {
+        if (!cv::imwrite(jpg_file, primary_bgr, k_jpeg_params))
+            std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
+        return;
+    }
+
+    cv::Mat aligned_bgr;
+    if (self && self->aligned_face_to_bgr(aligned_bgr) && !aligned_bgr.empty())
+    {
+        if (!cv::imwrite(jpg_file, aligned_bgr, k_jpeg_params))
+            std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
+    }
+    else
+        std::cerr << "database_add: skip gallery snapshot (no source frame + aligned_face_to_bgr failed)"
+                  << std::endl;
 }
 
 }  // namespace
@@ -433,24 +482,8 @@ void FaceRecognition::database_add(std::string& name, char* db_path, const cv::M
     // 生成文件路径
     std::string feature_file = face_db_join_path(db_path, std::to_string(save_index) + ".db");
     std::string name_file = face_db_join_path(db_path, std::to_string(save_index) + ".name");
-
-    // 写入 feature 到 .db 文件
-    FILE* f_db = fopen(feature_file.c_str(), "wb");
-    if (!f_db) {
-        std::cerr << "Failed to open " << feature_file << " for writing." << std::endl;
+    if (!write_face_db_slot(feature_file, name_file, name, feature, feature_num_))
         return;
-    }
-    fwrite(feature, sizeof(float), feature_num_, f_db);
-    fclose(f_db);
-
-    // 写入名字到 .name 文件
-    FILE* f_name = fopen(name_file.c_str(), "wb");
-    if (!f_name) {
-        std::cerr << "Failed to open " << name_file << " for writing." << std::endl;
-        return;
-    }
-    fwrite(name.c_str(), sizeof(char), name.length(), f_name);
-    fclose(f_name);
 
     std::string jpg_file = face_db_join_path(db_path, std::to_string(save_index) + ".jpg");
     cv::Mat snapshot_oriented;
@@ -462,29 +495,41 @@ void FaceRecognition::database_add(std::string& name, char* db_path, const cv::M
          * cv::imwrite 则按 BGR 编码 JPEG，若不交换则在浏览器里会偏蓝/偏青。 */
         cv::Mat jpeg_bgr;
         cv::cvtColor(snapshot_oriented, jpeg_bgr, cv::COLOR_RGB2BGR);
-        static const std::vector<int> k_jpeg_params{cv::IMWRITE_JPEG_QUALITY, 88};
-        if (!cv::imwrite(jpg_file, jpeg_bgr, k_jpeg_params))
-            std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
+        save_gallery_jpeg_or_fallback(jpeg_bgr, jpg_file, this);
     }
     else
-    {
-        cv::Mat aligned_bgr;
-        if (aligned_face_to_bgr(aligned_bgr) && !aligned_bgr.empty())
-        {
-            if (!cv::imwrite(jpg_file, aligned_bgr, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 88}))
-                std::cerr << "database_add: imwrite failed " << jpg_file << std::endl;
-        }
-        else
-            std::cerr << "database_add: skip gallery snapshot (no full frame + aligned_face_to_bgr failed)"
-                      << std::endl;
-    }
+        save_gallery_jpeg_or_fallback(cv::Mat(), jpg_file, this);
 
     std::vector<float> feature_vec(feature, feature + feature_num_);
+    l2_normalize(feature_vec.data(), feature_vec.data(), feature_num_);
     features_.push_back(std::move(feature_vec));  // 避免拷贝
     names_.push_back(name);
     valid_register_face_ += 1;
 
     std::cout << "Saved feature and name to database successfully!" << std::endl;
+}
+
+void FaceRecognition::database_add_import(std::string &name, char *db_path, const cv::Mat &import_bgr)
+{
+    ScopedTiming st(model_name_ + " database_add_import", debug_mode_);
+    float *feature = p_outputs_[0];
+    const int save_index = valid_register_face_ + 1;
+
+    std::string feature_file = face_db_join_path(db_path, std::to_string(save_index) + ".db");
+    std::string name_file = face_db_join_path(db_path, std::to_string(save_index) + ".name");
+    if (!write_face_db_slot(feature_file, name_file, name, feature, feature_num_))
+        return;
+
+    std::string jpg_file = face_db_join_path(db_path, std::to_string(save_index) + ".jpg");
+    save_gallery_jpeg_or_fallback(import_bgr, jpg_file, this);
+
+    std::vector<float> feature_vec(feature, feature + feature_num_);
+    l2_normalize(feature_vec.data(), feature_vec.data(), feature_num_);
+    features_.push_back(std::move(feature_vec));
+    names_.push_back(name);
+    valid_register_face_ += 1;
+
+    std::cout << "Imported feature and name to database successfully!" << std::endl;
 }
 
 int FaceRecognition::database_count(char* db_pth)
@@ -522,16 +567,15 @@ void FaceRecognition::database_search(FaceRecognitionInfo &result, const float *
 	float v_score;
 	float v_score_top1 = -1.f;
 	float v_score_top2 = -1.f;
-	float basef[feature_num_], testf[feature_num_];
+	float testf[feature_num_];
 	if (query_l2norm)
 		std::memcpy(testf, query_l2norm, sizeof(float) * (size_t)feature_num_);
 	else
 		l2_normalize(p_outputs_[0], testf, feature_num_);
 	for (i = 0; i < valid_register_face_; i++)
 	{
-        float* cur_feature=features_[i].data();
-        l2_normalize(cur_feature, basef, feature_num_);
-		v_score = cal_cosine_distance(testf, basef, feature_num_);
+        const float* cur_feature = features_[i].data();
+		v_score = cal_cosine_distance(testf, cur_feature, feature_num_);
         if (v_score > v_score_top1)
         {
             v_score_top2 = v_score_top1;
@@ -730,7 +774,7 @@ void FaceRecognition::get_affine_matrix(float *sparse_points)
 	image_umeyama_112(&matrix_src[0][0], &matrix_dst_[0]);
 }
 
-void FaceRecognition::l2_normalize(float *src, float *dst, int len) const
+void FaceRecognition::l2_normalize(const float *src, float *dst, int len) const
 {
 	float sum = 0;
 	for (int i = 0; i < len; ++i)
@@ -738,13 +782,15 @@ void FaceRecognition::l2_normalize(float *src, float *dst, int len) const
 		sum += src[i] * src[i];
 	}
 	sum = sqrtf(sum);
+    if (sum < 1e-6f)
+        sum = 1.0f;
 	for (int i = 0; i < len; ++i)
 	{
 		dst[i] = src[i] / sum;
 	}
 }
 
-float FaceRecognition::cal_cosine_distance(float *feature_0, float *feature_1, int feature_len)
+float FaceRecognition::cal_cosine_distance(const float *feature_0, const float *feature_1, int feature_len)
 {
 	float cosine_distance = 0;
 	// calculate the sum square

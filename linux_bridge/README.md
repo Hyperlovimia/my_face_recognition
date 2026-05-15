@@ -12,13 +12,19 @@ cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_br
 ```
 
 产物位于 `out/face_netd`。
+收集后的部署目录位于 `../k230_bin/face_bridge/`。
+脚本收集完成后会自动删除 `.o` 中间产物，因此部署目录最终只保留可运行文件和配置。
 
 ## 部署
 
-将以下文件复制到板端 `/sharefs/face_bridge/`：
+将 `../k230_bin/face_bridge/` 目录同步到板端 `/sharefs/face_bridge/`。
 
-- `out/face_netd`
+其中板端实际运行必需的是：
+
+- `face_netd`
 - `face_netd.ini`
+
+`.o` 文件属于宿主机交叉编译产生的中间目标文件，不会在板端单独运行，脚本会在构建完成后自动清理。
 
 启动：
 
@@ -29,6 +35,16 @@ chmod +x ./face_netd
 ```
 
 `face_netd.ini` 中的 `mqtt_url` 必须填写电脑主机在局域网中的真实 IPv4。
+若启用了板端触摸 UI，还需要预先配置 `ui_admin_pin_hash`，否则屏幕只会提示“管理密码未配置”。
+
+宿主机可用以下脚本生成哈希：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_bridge
+python3 ./scripts/gen_ui_admin_pin_hash.py
+```
+
+脚本输出一行 `ui_admin_pin_hash=...`，写入板端实际使用的 `face_netd.ini` 即可。建议板端配置文件权限设为 `0600`。
 
 如果 `server_pc` 运行在 WSL / Docker 中：
 

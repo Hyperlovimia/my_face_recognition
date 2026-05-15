@@ -27,12 +27,14 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <poll.h>
 #include <thread>
 #include <unistd.h>
+#include "perf_stats.h"
 #include "video_pipeline.h"
 #include "ai_utils.h"
 #include "face_detection.h"
@@ -99,6 +101,8 @@ int cur_state = 0;
 
 namespace {
 
+PerfStageStats g_perf_total_time("main.total_time");
+
 volatile sig_atomic_t g_signal_exit_requested = 0;
 
 void handle_exit_signal(int signo)
@@ -110,6 +114,12 @@ void handle_exit_signal(int signo)
 bool exit_requested()
 {
     return isp_stop.load() || g_signal_exit_requested != 0;
+}
+
+bool metrics_log_enabled(int debug_mode)
+{
+    const char *e = std::getenv("FACE_METRICS");
+    return (debug_mode > 0) || (e && e[0] == '1' && e[1] == '\0');
 }
 
 bool install_exit_signal_handlers()
@@ -225,8 +235,7 @@ try {
     auto register_preview_deadline = std::chrono::steady_clock::time_point::min();
 
     while(!exit_requested()){
-        // 创建一个ScopedTiming对象，用于计算总时间
-        ScopedTiming st("total time", debug_mode);
+        ScopedPerfStage perf_stage(g_perf_total_time, metrics_log_enabled(debug_mode));
         // 从PipeLine中获取一帧数据，并创建tensor
         ret = pl.GetFrame(dump_res);
         if (ret != 0) {

@@ -31,11 +31,11 @@ RT-Smart 大核三进程
 
 ## 编译
 
-在开发机 SDK 环境中执行：
+在开发机宿主机环境中执行：
 
 ```bash
 cd /home/hyperlovimia/k230_sdk
-docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
+make prepare_toolchain
 ```
 
 ```bash
@@ -44,6 +44,7 @@ cd src/reference/ai_poc/my_face_recognition
 ```
 
 项目必须位于 `k230_sdk/src/reference/ai_poc/my_face_recognition`。
+`build_app.sh` 会优先使用 `k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin`。
 
 生成的编译产物在 `k230_bin` 目录中。将以下文件按需同步到板端 `/data`：
 
@@ -61,7 +62,7 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 启用活体检测时，先后台启动 `face_ai.elf`，最后一个参数传入活体模型：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel 0.18 real0 &
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 /sharefs/face_antispoof.kmodel 0.18 real0 &
 ```
 
 > 说明：`0.18` 为 REAL 概率阈值（真人分数常在 0.15～0.30 间波动时可从偏低试起，翻拍易过再提到 0.22～0.25）；`real0` 表示该 kmodel 约定 **out[0]=REAL**（与常见训练导出一致）。若你的模型确认为 **out[0]=SPOOF**，则不要加 `real0`，只要 9 个参数或仅「模型路径 + 阈值」共 10 个参数即可，详见下文「参数说明」表。
@@ -69,22 +70,34 @@ RT-Smart 的 `msh` 不能按常规 Linux shell 使用，不要依赖 `export`、
 暂不启用活体检测时，使用 8 参数启动 `face_ai.elf`：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 &
 ```
 
 然后后台启动视频进程：
 
 ```sh
-/data/face_video.elf 0 &
+/sharefs/face_video.elf 0 &
 ```
 
 最后以前台方式启动交互入口：
 
 ```sh
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
-启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/data/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
+启动后，所有交互命令都在 `face_event.elf` 所在串口输入。`/sharefs/face_db` 不存在时，`face_ai.elf` 会尝试自动创建。
+
+当前版本默认在 `face_event.elf` 内启用“门状态指示”控制：
+
+- 门打开状态映射到板载 `LED1`
+- `LED1` 使用 `BANK0_GPIO6`
+- 低电平点亮
+- 开门保持：`3s`
+- 默认不驱动第二路蜂鸣器/继电器 GPIO
+- 默认关闭写后 `GPIO_READ_VALUE` 自校验，避免板载 LED 场景因输出脚读回不可靠误判 `FAULT`
+- 默认在 `face_event` 初始化时强制把 `IO6` pinmux 切到 GPIO 功能，避免板级默认复用不是 GPIO 时“日志成功但 LED 不亮”
+
+这些值由 [src/door_control_config.h](/home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/src/door_control_config.h) 的编译期宏控制。若目标板接线、极性或时长不同，请修改该头文件后重新执行 `./build_app.sh`。
 
 程序支持两种退出方式：
 
@@ -110,7 +123,7 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 | kmodel_recg | 人脸识别kmodel路径               | kmodel 路径         |
 | recg_thres  | 人脸识别分数下限（`cal_cosine_distance` 的 0~100 标尺）。**库内人多或易互认时推荐 `65`～`72`** | 0~100    |
 | （库内≥2 人） | `FaceRecognition::database_search` | 除超过 `recg_thres` 外，还要求 **第一名与第二名分差 ≥ 8.5**（默认 `db_top2_margin_`），否则陌生人。帧间对特征做 **短时 EMA**（仅流式 `INFER`）减轻单帧误判 |
-| db_dir      | 数据库目录，推荐 `/data/face_db` | 数据库目录路径         |
+| db_dir      | 数据库目录，推荐 `/sharefs/face_db` | 数据库目录路径         |
 | debug_mode  | 是否需要调试，0、1、2分别表示不调试、简单调试、详细调试 | 0、1、2 |
 | face_antispoof.kmodel | 可选活体模型路径，存在且加载成功时启用活体 | kmodel 路径 |
 | real_prob_threshold（第 10 个参数） | 启用活体时：REAL 概率 ≥ 该值判为真人；越高越严。默认 **0.32**（未传第 10 个时，代码内建） | 现场常试 **0.15**～`0.28`，按误拒/放过翻拍折中 |
@@ -130,6 +143,18 @@ face_ai <kmodel_det> <det_thres> <nms_thres> <kmodel_recg> <recg_thres> <db_dir>
 > 注：
 > 注册截图时请确保画面中仅有一张清晰可见的人脸。
 > 姓名应使用可识别英文字符，避免特殊符号。
+
+## 门锁联动
+
+`face_event.elf` 现在会直接消费 `face_ai -> face_event` 的识别事件并驱动门状态指示 GPIO：
+
+- 仅 `recognized` 事件会触发开门
+- `stranger` 与 `liveness_fail` 只保留日志/告警，不驱动 GPIO
+- 授权用户开门后，板载 `LED1(GPIO6)` 点亮，`3s` 后自动熄灭
+- 开门窗口内重复识别不会续期开门，避免人脸常驻导致门常开
+- 若 `/dev/gpio` 初始化失败、写失败或读回校验不一致，门锁控制会进入 `FAULT`，后续仅保留识别与日志功能，不再继续驱动 GPIO
+
+门锁动作和故障会额外写入考勤 JSONL 的 `meta` 记录，例如 `door_unlock`、`door_relock`、`door_fault`。
 
 ## 远程桥接能力
 
@@ -179,12 +204,13 @@ chmod +x ./face_netd
 ```
 
 如果启动后看到 `[IPCMSG]:ioctl connect fail`，通常表示 Linux 小核正在等待 RT-Smart 侧 `face_event.elf` 提供 `face_bridge` 服务。
-此时请先确认 RT 控制台已经出现 `face_event: bridge service face_bridge port=301 ready for little-core face_netd`，并确认板端 `/data/face_event.elf` 是本项目当前版本的新二进制。
+此时请先确认 RT 控制台已经出现 `face_event: bridge service face_bridge port=301 ready for little-core face_netd`，并确认板端 `/sharefs/face_event.elf` 是本项目当前版本的新二进制。
 
 `face_netd.ini` 里至少需要修改：
 
 - `device_id`
 - `mqtt_url`
+- `ui_admin_pin_hash`，板端触摸“管理”入口需要预先写入 PIN 哈希
 
 MQTT topic 约定：
 
@@ -193,6 +219,15 @@ MQTT topic 约定：
 - `k230/<device_id>/up/status`
 - `k230/<device_id>/down/cmd`
 
+板端 UI 管理 PIN 建议在宿主机上生成后写入 `face_netd.ini`：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_bridge
+python3 ./scripts/gen_ui_admin_pin_hash.py
+```
+
+脚本会输出一行 `ui_admin_pin_hash=...`，直接写入板端实际部署的 `face_netd.ini` 即可。仓库内样例配置不保存真实 PIN 哈希。
+
 ## 电脑端 server_pc
 
 电脑端服务位于 `server_pc/`，使用：
@@ -200,10 +235,17 @@ MQTT topic 约定：
 - `Mosquitto` 作为 MQTT Broker
 - `FastAPI + Paho MQTT + SQLite`
 - 网页为 **React + Vite + TypeScript**（源码在 `server_pc/web/`，构建生成到 `server_pc/static/`），WebSocket 实时更新
+- Web 管理端现在带单管理员登录：首次进入先显示登录页，输入 `FACE_WEB_ADMIN_PASSWORD` 后才能进入面板；点击右上角“退出登录”可回到登录页
 
-启动：在 `server_pc` 下执行 `docker compose up --build` 即可。`Dockerfile` 为**多阶段**：构建阶段在镜像内 `npm install` / `npm run build`（需能拉取 `node:20-bookworm-slim`；可先 `docker pull node:20-bookworm-slim` 缓存在本机）。若**无法**访问 Docker Hub，可改为在宿主机用本机 Node 在 `server_pc/web` 里打好 `static/`，并改用本仓库的 `Dockerfile.prebuilt`（只复制 `static/`，不装 Node 镜像，见同目录下文件说明）或等价的单阶段 `COPY static`。
+启动前必须先设置管理员密码环境变量，例如：
 
-若**不用 Docker**、直接本机起 `uvicorn`，需先在 `server_pc/web` 执行 `npm install && npm run build`，或开发时用 Vite 代理（见 `server_pc/web/README.md`）。
+```bash
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
+```
+
+然后在 `server_pc` 下执行 `docker compose up --build` 即可。`Dockerfile` 为**多阶段**：构建阶段在镜像内 `npm install` / `npm run build`（需能拉取 `node:20-bookworm-slim`；可先 `docker pull node:20-bookworm-slim` 缓存在本机）。若**无法**访问 Docker Hub，可改为在宿主机用本机 Node 在 `server_pc/web` 里打好 `static/`，并改用本仓库的 `Dockerfile.prebuilt`（只复制 `static/`，不装 Node 镜像，见同目录下文件说明）或等价的单阶段 `COPY static`。
+
+若**不用 Docker**、直接本机起 `uvicorn`，同样必须先设置 `FACE_WEB_ADMIN_PASSWORD`，并先在 `server_pc/web` 执行 `npm install && npm run build`，或开发时用 Vite 代理（见 `server_pc/web/README.md`）。`face-web` 进程重启后，内存中的登录会话会失效，浏览器需要重新登录。
 
 ### 如果 `server_pc` 运行在 WSL / Docker 中
 
@@ -284,9 +326,7 @@ http://<电脑IP>:8000
 ### 1. 开发机编译 RT-Smart 三进程
 
 ```bash
-cd /home/hyperlovimia/k230_sdk
-docker run -u root -it -v $(pwd):$(pwd) -v $(pwd)/toolchain:/opt/toolchain -w $(pwd) ghcr.io/kendryte/k230_sdk /bin/bash
-cd src/reference/ai_poc/my_face_recognition
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition
 ./build_app.sh
 ```
 
@@ -317,14 +357,15 @@ Linux 小核侧至少需要同步到 `/sharefs/face_bridge`：
 
 ```bash
 cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/server_pc
+export FACE_WEB_ADMIN_PASSWORD='change-this-password'
 docker compose up --build
 ```
 
 如果电脑端运行在 WSL / Docker 中，还必须在 Windows 管理员 PowerShell 中额外执行：
 
 ```powershell
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=127.0.0.1 connectport=1883
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=127.0.0.1 connectport=8000
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=1883 connectaddress=<WSL地址> connectport=1883
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=<WSL地址> connectport=8000
 New-NetFirewallRule -DisplayName "face-mqtt-1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
 New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000
 ```
@@ -332,13 +373,13 @@ New-NetFirewallRule -DisplayName "face-web-8000" -Direction Inbound -Action Allo
 重启电脑后，建议马上补做：
 
 ```powershell
-Test-NetConnection 127.0.0.1 -Port 1883
-Test-NetConnection 127.0.0.1 -Port 8000
+Test-NetConnection <WSL地址> -Port 1883
+Test-NetConnection <WSL地址> -Port 8000
 ```
 
-若不通，说明 `portproxy` 规则虽然还在，但它背后的 `127.0.0.1 -> WSL/Docker` 这一跳没有恢复；此时可用 `wsl hostname -I` 取当前 WSL IP，并把 `connectaddress` 改成该 IP 重新写入 `portproxy`。
+若不通，说明 `portproxy` 规则虽然还在，但它背后的 `<WSL地址> -> WSL/Docker` 这一跳没有恢复；此时可用 `wsl hostname -I` 取当前 WSL IP，并把 `connectaddress` 改成该 IP 重新写入 `portproxy`。
 
-若 `127.0.0.1:1883` 看起来是通的，但板端仍然卡在“已发送 MQTT `CONNECT`、始终收不到 `CONNACK`”，也建议直接改为当前 WSL IP 作为 `connectaddress`。这是因为某些环境下 `localhost` 探活成功并不等于真实 MQTT 流量已经正确转发到 Broker。
+若 此前填的WSL地址是 `127.0.0.1:1883`，而它看起来是通的，但板端仍然卡在“已发送 MQTT `CONNECT`、始终收不到 `CONNACK`”，也建议直接改为当前 WSL IP 作为 `connectaddress`。这是因为某些环境下 `localhost` 探活成功并不等于真实 MQTT 流量已经正确转发到 Broker。
 
 ### 5. 设置 `face_netd.ini`
 
@@ -360,17 +401,17 @@ Test-NetConnection 127.0.0.1 -Port 8000
 启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 /data/face_antispoof.kmodel &
-/data/face_video.elf 0 &
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 /sharefs/face_antispoof.kmodel &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 不启用活体检测时：
 
 ```sh
-/data/face_ai.elf /data/face_detection_320.kmodel 0.38 0.30 /data/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /data/face_db 0 &
-/data/face_video.elf 0 &
-/data/face_event.elf /tmp/attendance.log
+/sharefs/face_ai.elf /sharefs/face_detection_320.kmodel 0.38 0.30 /sharefs/GhostFaceNet_W1.3_S1_ArcFace_k230.kmodel 68 /sharefs/face_db 0 &
+/sharefs/face_video.elf 0 &
+/sharefs/face_event.elf /tmp/attendance.log
 ```
 
 正常情况下，`face_event.elf` 会打印：

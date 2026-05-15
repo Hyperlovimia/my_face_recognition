@@ -34,14 +34,14 @@ target_link_libraries(face_recognition_scrfd.elf ${nncase_link} ${mpp_link} ${op
 
 # 三进程：视频采集与显示
 add_executable(face_video.elf face_video_main.cc ipc_shm.cc ipc_lwp_syscall.c ipc_osd_draw.cc video_pipeline.cc)
-target_link_libraries(face_video.elf ${mpp_link} ${opencv_link})
+target_link_libraries(face_video.elf ${nncase_link} ${mpp_link} ${opencv_link})
 
 # 三进程：AI 推理（含可选活体 FaceAntiSpoof）
 add_executable(face_ai.elf ${face_ai_src})
 target_link_libraries(face_ai.elf ${nncase_link} ${opencv_link})
 
 # 三进程：事件 / 考勤日志
-add_executable(face_event.elf face_event_main.cc attendance_log.cc ipc_shm.cc ipc_lwp_syscall.c)
+add_executable(face_event.elf face_event_main.cc attendance_log.cc door_control.cc ipc_shm.cc ipc_lwp_syscall.c)
 target_link_libraries(face_event.elf sys atomic ipcmsg)
 
 install(TARGETS face_recognition.elf face_recognition_scrfd.elf face_video.elf face_ai.elf face_event.elf DESTINATION bin)
