@@ -98,7 +98,6 @@ build_project() {
 collect_outputs() {
     local elves=(
         "${BUILD_DIR}/bin/face_recognition.elf"
-        "${BUILD_DIR}/bin/face_recognition_scrfd.elf"
         "${BUILD_DIR}/bin/face_video.elf"
         "${BUILD_DIR}/bin/face_ai.elf"
         "${BUILD_DIR}/bin/face_event.elf"
