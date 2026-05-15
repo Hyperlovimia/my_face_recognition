@@ -100,6 +100,10 @@ public:
     /** @brief 第 i 路输入是否为 uint8（部分量化部署） */
     bool model_input_is_uint8(size_t i = 0) const;
 
+    const vector<float*>& output_buffers() const { return p_outputs_; }
+    const vector<vector<int>>& output_shapes() const { return output_shapes_; }
+    const vector<vector<int>>& input_shapes() const { return input_shapes_; }
+
 
 protected:
     string model_name_;                    // 模型名字
