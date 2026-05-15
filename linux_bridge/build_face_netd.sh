@@ -9,6 +9,7 @@ OUT_DIR="${SCRIPT_DIR}/out"
 K230_BIN_DIR="${PROJECT_ROOT}/k230_bin"
 FACE_BRIDGE_DIR="${K230_BIN_DIR}/face_bridge"
 TARGET_INI="${SCRIPT_DIR}/face_netd.ini"
+UI_DATA_DIR="${SCRIPT_DIR}/ui/data"
 
 export PATH="${TOOLCHAIN_DIR}:$PATH"
 
@@ -62,6 +63,14 @@ collect_outputs() {
         cp -u "${TARGET_INI}" "${FACE_BRIDGE_DIR}/"
     else
         echo "[WARN] ${TARGET_INI} not found, skip copying config."
+    fi
+
+    if [ -d "${UI_DATA_DIR}" ]; then
+        mkdir -p "${OUT_DIR}/data" "${FACE_BRIDGE_DIR}/data"
+        cp -ru "${UI_DATA_DIR}/." "${OUT_DIR}/data/"
+        cp -ru "${UI_DATA_DIR}/." "${FACE_BRIDGE_DIR}/data/"
+    else
+        echo "[WARN] ${UI_DATA_DIR} not found, skip copying UI assets."
     fi
 }
 

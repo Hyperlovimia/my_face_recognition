@@ -5,11 +5,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include <limits.h>
+#include <unistd.h>
 
 extern "C" {
 #include "lvgl.h"
@@ -37,7 +41,7 @@ struct UiSharedState {
     bool have_shared_info = false;
     bool logged_waiting_for_surface = false;
     UiSessionState session = UiSessionState::idle;
-    std::string status_text = "Tap Register to add face";
+    std::string status_text = "Tap signup to add face";
     std::string active_request_id;
     uint64_t last_activity_ms = 0;
     uint64_t request_seq = 0;
@@ -52,13 +56,17 @@ lv_obj_t *g_main_screen = nullptr;
 lv_obj_t *g_edit_screen = nullptr;
 lv_obj_t *g_main_status = nullptr;
 lv_obj_t *g_edit_status = nullptr;
-lv_obj_t *g_register_btn = nullptr;
+lv_obj_t *g_signup_btn = nullptr;
+lv_obj_t *g_import_btn = nullptr;
+lv_obj_t *g_delete_btn = nullptr;
+lv_obj_t *g_cancel_btn = nullptr;
 lv_obj_t *g_name_ta = nullptr;
 lv_obj_t *g_keyboard = nullptr;
-lv_obj_t *g_cancel_btn = nullptr;
 
 std::string g_last_bound_request_id;
 UiSessionState g_last_session = UiSessionState::idle;
+
+namespace fs = std::filesystem;
 
 uint64_t monotonic_ms()
 {
@@ -70,6 +78,30 @@ void ui_log(const std::string &msg)
 {
     if (g_ui.cfg.log_message)
         g_ui.cfg.log_message(msg);
+}
+
+std::string executable_dir()
+{
+    char exe_path[PATH_MAX] = {0};
+    const ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n <= 0)
+        return ".";
+    exe_path[n] = '\0';
+    return fs::path(exe_path).parent_path().string();
+}
+
+std::string ui_asset_path(const char *file_name)
+{
+    const fs::path exe_dir = executable_dir();
+    const fs::path local_data = exe_dir / "data" / "img" / file_name;
+    if (fs::exists(local_data))
+        return local_data.string();
+
+    const fs::path source_data = exe_dir.parent_path() / "ui" / "data" / "img" / file_name;
+    if (fs::exists(source_data))
+        return source_data.string();
+
+    return local_data.string();
 }
 
 std::string next_ui_request_id_locked()
@@ -123,6 +155,33 @@ void on_register_click(lv_event_t *)
     }
     if (can_submit)
         submit_local_command(IPC_BRIDGE_CMD_REGISTER_PREVIEW, "");
+}
+
+void on_delete_click(lv_event_t *)
+{
+    bool can_submit = false;
+    {
+        std::lock_guard<std::mutex> lk(g_ui.mu);
+        if (g_ui.session == UiSessionState::idle && g_ui.cfg.submit_command)
+        {
+            g_ui.status_text = "Clearing database...";
+            g_ui.last_activity_ms = monotonic_ms();
+            g_ui.dirty = true;
+            can_submit = true;
+        }
+    }
+    if (can_submit)
+        submit_local_command(IPC_BRIDGE_CMD_DB_RESET, "");
+}
+
+void on_import_click(lv_event_t *)
+{
+    std::lock_guard<std::mutex> lk(g_ui.mu);
+    if (g_ui.session != UiSessionState::idle)
+        return;
+    g_ui.status_text = "Import is not available in this project";
+    g_ui.last_activity_ms = monotonic_ms();
+    g_ui.dirty = true;
 }
 
 void on_cancel_click(lv_event_t *)
@@ -190,42 +249,55 @@ void on_keyboard_event(lv_event_t *e)
         submit_local_command(IPC_BRIDGE_CMD_REGISTER_COMMIT, trimmed);
 }
 
+lv_obj_t *create_icon_action(lv_obj_t *parent, const char *image_name, const char *fallback_text, lv_coord_t x_ofs,
+                             lv_event_cb_t cb)
+{
+    const std::string asset_path = ui_asset_path(image_name);
+    lv_obj_t *obj = nullptr;
+    if (fs::exists(asset_path))
+    {
+        obj = lv_img_create(parent);
+        lv_img_set_src(obj, asset_path.c_str());
+    }
+    else
+    {
+        obj = lv_btn_create(parent);
+        lv_obj_set_size(obj, 148, 84);
+        lv_obj_set_style_radius(obj, 22, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(obj, lv_color_hex(0x1d2d3f), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_90, LV_PART_MAIN);
+        lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+        lv_obj_t *label = lv_label_create(obj);
+        lv_label_set_text(label, fallback_text);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_center(label);
+    }
+
+    lv_obj_set_align(obj, LV_ALIGN_BOTTOM_MID);
+    lv_obj_set_pos(obj, x_ofs, -90);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(obj, cb, LV_EVENT_CLICKED, nullptr);
+    return obj;
+}
+
 void create_main_screen()
 {
     g_main_screen = lv_obj_create(nullptr);
     lv_obj_remove_style_all(g_main_screen);
     lv_obj_set_style_bg_opa(g_main_screen, LV_OPA_TRANSP, LV_PART_MAIN);
 
-    lv_obj_t *panel = lv_obj_create(g_main_screen);
-    lv_obj_set_size(panel, lv_pct(96), 220);
-    lv_obj_align(panel, LV_ALIGN_BOTTOM_MID, 0, -24);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x162231), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_80, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(panel, 18, LV_PART_MAIN);
-
-    lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "Board Registration");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_40, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-
-    g_main_status = lv_label_create(panel);
-    lv_label_set_text(g_main_status, "Tap Register to add face");
+    g_main_status = lv_label_create(g_main_screen);
+    lv_label_set_text(g_main_status, "Tap signup to add face");
     lv_label_set_long_mode(g_main_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(g_main_status, lv_pct(86));
+    lv_obj_set_width(g_main_status, lv_pct(88));
     lv_obj_set_style_text_align(g_main_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_main_status, lv_color_hex(0xf5f7fa), LV_PART_MAIN);
     lv_obj_set_style_text_font(g_main_status, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(g_main_status, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_align(g_main_status, LV_ALIGN_TOP_MID, 0, 72);
 
-    g_register_btn = lv_btn_create(panel);
-    lv_obj_set_size(g_register_btn, 280, 72);
-    lv_obj_align(g_register_btn, LV_ALIGN_BOTTOM_MID, 0, -22);
-    lv_obj_add_event_cb(g_register_btn, on_register_click, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t *btn_label = lv_label_create(g_register_btn);
-    lv_label_set_text(btn_label, "Register");
-    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_40, LV_PART_MAIN);
-    lv_obj_center(btn_label);
+    g_import_btn = create_icon_action(g_main_screen, "import.png", "Import", -160, on_import_click);
+    g_signup_btn = create_icon_action(g_main_screen, "signup.png", "Signup", 0, on_register_click);
+    g_delete_btn = create_icon_action(g_main_screen, "delete.png", "Delete", 160, on_delete_click);
 }
 
 void create_edit_screen()
@@ -234,48 +306,47 @@ void create_edit_screen()
     lv_obj_remove_style_all(g_edit_screen);
     lv_obj_set_style_bg_opa(g_edit_screen, LV_OPA_TRANSP, LV_PART_MAIN);
 
-    lv_obj_t *panel = lv_obj_create(g_edit_screen);
-    lv_obj_set_size(panel, lv_pct(98), lv_pct(98));
-    lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x101820), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_80, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(panel, 18, LV_PART_MAIN);
-
-    g_cancel_btn = lv_btn_create(panel);
-    lv_obj_set_size(g_cancel_btn, 150, 54);
-    lv_obj_align(g_cancel_btn, LV_ALIGN_TOP_LEFT, 18, 18);
-    lv_obj_add_event_cb(g_cancel_btn, on_cancel_click, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *cancel_label = lv_label_create(g_cancel_btn);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_center(cancel_label);
-
-    lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "Enter Name");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_40, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
-
-    g_edit_status = lv_label_create(panel);
+    g_edit_status = lv_label_create(g_edit_screen);
     lv_label_set_text(g_edit_status, "Preview ready. Type a name.");
     lv_label_set_long_mode(g_edit_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(g_edit_status, lv_pct(86));
     lv_obj_set_style_text_align(g_edit_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_edit_status, lv_color_hex(0xf5f7fa), LV_PART_MAIN);
     lv_obj_set_style_text_font(g_edit_status, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(g_edit_status, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_align(g_edit_status, LV_ALIGN_TOP_MID, 0, 72);
 
-    g_name_ta = lv_textarea_create(panel);
-    lv_obj_set_size(g_name_ta, lv_pct(90), LV_SIZE_CONTENT);
+    g_cancel_btn = lv_btn_create(g_edit_screen);
+    lv_obj_set_size(g_cancel_btn, 130, 52);
+    lv_obj_align(g_cancel_btn, LV_ALIGN_TOP_LEFT, 12, 12);
+    lv_obj_set_style_radius(g_cancel_btn, 18, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_cancel_btn, lv_color_hex(0x1d2d3f), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_cancel_btn, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_cancel_btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(g_cancel_btn, on_cancel_click, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *cancel_label = lv_label_create(g_cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_center(cancel_label);
+
+    g_name_ta = lv_textarea_create(g_edit_screen);
+    lv_obj_set_size(g_name_ta, lv_pct(100), LV_SIZE_CONTENT);
+    lv_textarea_set_text(g_name_ta, "");
     lv_textarea_set_one_line(g_name_ta, true);
     lv_textarea_set_max_length(g_name_ta, 32);
+    lv_textarea_set_align(g_name_ta, LV_TEXT_ALIGN_CENTER);
     lv_obj_set_style_text_font(g_name_ta, &lv_font_montserrat_48, LV_PART_MAIN);
-    lv_obj_align(g_name_ta, LV_ALIGN_TOP_MID, 0, 138);
+    lv_obj_set_style_radius(g_name_ta, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_name_ta, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_name_ta, LV_OPA_TRANSP, LV_PART_MAIN);
 
-    g_keyboard = lv_keyboard_create(panel);
+    g_keyboard = lv_keyboard_create(g_edit_screen);
+    lv_obj_set_style_text_font(g_keyboard, &lv_font_montserrat_40, LV_PART_MAIN);
     lv_keyboard_set_mode(g_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_keyboard_set_textarea(g_keyboard, g_name_ta);
-    lv_obj_set_size(g_keyboard, lv_pct(96), 430);
-    lv_obj_align(g_keyboard, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_size(g_keyboard, lv_pct(100), 580);
+    lv_obj_align(g_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(g_keyboard, on_keyboard_event, LV_EVENT_ALL, nullptr);
+    lv_obj_align_to(g_name_ta, g_keyboard, LV_ALIGN_OUT_TOP_MID, 0, -10);
 }
 
 void apply_snapshot_to_ui(UiSessionState session, const std::string &status, const std::string &request_id)
@@ -285,7 +356,9 @@ void apply_snapshot_to_ui(UiSessionState session, const std::string &status, con
         if (lv_scr_act() != g_main_screen)
             lv_scr_load(g_main_screen);
         lv_label_set_text(g_main_status, status.c_str());
-        lv_obj_clear_state(g_register_btn, LV_STATE_DISABLED);
+        lv_obj_clear_state(g_signup_btn, LV_STATE_DISABLED);
+        lv_obj_clear_state(g_import_btn, LV_STATE_DISABLED);
+        lv_obj_clear_state(g_delete_btn, LV_STATE_DISABLED);
         return;
     }
 
@@ -467,7 +540,7 @@ bool ui_runtime_start(const runtime_config &cfg)
         std::lock_guard<std::mutex> lk(g_ui.mu);
         g_ui.cfg = cfg;
         g_ui.preview_timeout_ms = cfg.preview_timeout_ms;
-        g_ui.status_text = "Tap Register to add face";
+        g_ui.status_text = "Tap signup to add face";
         g_ui.dirty = true;
         g_ui.stop.store(false);
         g_ui.running.store(true);
@@ -519,10 +592,10 @@ void ui_on_bridge_result(const bridge_cmd_result_t &result)
     {
         set_idle_status_locked(result.message[0] ? result.message : "Registration cancelled");
     }
-    else if (cmd == IPC_BRIDGE_CMD_DB_RESET && !result.ok)
+    else if (cmd == IPC_BRIDGE_CMD_DB_RESET)
     {
-        g_ui.status_text = result.message;
-        g_ui.dirty = true;
+        set_idle_status_locked(result.message[0] ? result.message
+                                                 : (result.ok ? "Database cleared" : "Database clear failed"));
     }
 }
 
@@ -532,11 +605,11 @@ void ui_on_bridge_event(const bridge_event_t &ev)
     if (g_ui.session != UiSessionState::idle)
         return;
     if (ev.evt_kind == IPC_EVT_KIND_STRANGER)
-        g_ui.status_text = "Stranger detected. Tap Register.";
+        g_ui.status_text = "Stranger detected. Tap signup.";
     else if (ev.evt_kind == IPC_EVT_KIND_LIVENESS_FAIL)
         g_ui.status_text = "Liveness failed. Align face and retry.";
     else
-        g_ui.status_text = "Tap Register to add face";
+        g_ui.status_text = "Tap signup to add face";
     g_ui.dirty = true;
 }
 
