@@ -35,6 +35,16 @@ chmod +x ./face_netd
 ```
 
 `face_netd.ini` 中的 `mqtt_url` 必须填写电脑主机在局域网中的真实 IPv4。
+若启用了板端触摸 UI，还需要预先配置 `ui_admin_pin_hash`，否则屏幕只会提示“管理密码未配置”。
+
+宿主机可用以下脚本生成哈希：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_bridge
+python3 ./scripts/gen_ui_admin_pin_hash.py
+```
+
+脚本输出一行 `ui_admin_pin_hash=...`，写入板端实际使用的 `face_netd.ini` 即可。建议板端配置文件权限设为 `0600`。
 
 如果 `server_pc` 运行在 WSL / Docker 中：
 

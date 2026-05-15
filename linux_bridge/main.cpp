@@ -83,6 +83,14 @@ struct Config {
     std::string ui_touch_device = "/dev/input/event0";
     int ui_preview_timeout_ms = 30000;
     std::string ui_overlay_profile = "dongshanpi_nt35516";
+    std::string ui_admin_pin_hash;
+};
+
+struct AdminPinHashSpec {
+    bool valid = false;
+    int iterations = 0;
+    std::vector<uint8_t> salt;
+    std::vector<uint8_t> digest;
 };
 
 struct PublishItem {
@@ -262,6 +270,160 @@ bool parse_bool(const std::string &s, bool *out)
     return false;
 }
 
+bool is_six_digit_pin(const std::string &pin)
+{
+    if (pin.size() != 6)
+        return false;
+    for (unsigned char ch : pin)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+    }
+    return true;
+}
+
+bool decode_hex_nibble(char ch, uint8_t *out)
+{
+    if (!out)
+        return false;
+    if (ch >= '0' && ch <= '9')
+    {
+        *out = static_cast<uint8_t>(ch - '0');
+        return true;
+    }
+    if (ch >= 'a' && ch <= 'f')
+    {
+        *out = static_cast<uint8_t>(10 + (ch - 'a'));
+        return true;
+    }
+    if (ch >= 'A' && ch <= 'F')
+    {
+        *out = static_cast<uint8_t>(10 + (ch - 'A'));
+        return true;
+    }
+    return false;
+}
+
+bool hex_to_bytes(const std::string &hex, std::vector<uint8_t> *out)
+{
+    if (!out || (hex.size() % 2) != 0)
+        return false;
+    std::vector<uint8_t> buf;
+    buf.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2)
+    {
+        uint8_t hi = 0;
+        uint8_t lo = 0;
+        if (!decode_hex_nibble(hex[i], &hi) || !decode_hex_nibble(hex[i + 1], &lo))
+            return false;
+        buf.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    *out = std::move(buf);
+    return true;
+}
+
+bool constant_time_equal(const std::vector<uint8_t> &lhs, const std::vector<uint8_t> &rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < lhs.size(); ++i)
+        diff |= static_cast<uint8_t>(lhs[i] ^ rhs[i]);
+    return diff == 0;
+}
+
+void hmac_sha256_bytes(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t out[32])
+{
+    mg_hmac_sha256(out, const_cast<uint8_t *>(key), key_len, const_cast<uint8_t *>(data), data_len);
+}
+
+std::vector<uint8_t> pbkdf2_sha256(const std::string &pin, const std::vector<uint8_t> &salt, int iterations, size_t dk_len)
+{
+    std::vector<uint8_t> derived(dk_len, 0);
+    if (iterations <= 0 || dk_len == 0)
+        return derived;
+
+    const size_t hash_len = 32;
+    const size_t block_count = (dk_len + hash_len - 1) / hash_len;
+    std::vector<uint8_t> msg(salt.size() + 4, 0);
+    std::copy(salt.begin(), salt.end(), msg.begin());
+
+    for (size_t block = 1; block <= block_count; ++block)
+    {
+        msg[salt.size() + 0] = static_cast<uint8_t>((block >> 24) & 0xff);
+        msg[salt.size() + 1] = static_cast<uint8_t>((block >> 16) & 0xff);
+        msg[salt.size() + 2] = static_cast<uint8_t>((block >> 8) & 0xff);
+        msg[salt.size() + 3] = static_cast<uint8_t>(block & 0xff);
+
+        uint8_t u[32] = {0};
+        uint8_t t[32] = {0};
+        hmac_sha256_bytes(reinterpret_cast<const uint8_t *>(pin.data()), pin.size(), msg.data(), msg.size(), u);
+        std::memcpy(t, u, sizeof(t));
+
+        for (int iter = 1; iter < iterations; ++iter)
+        {
+            hmac_sha256_bytes(reinterpret_cast<const uint8_t *>(pin.data()), pin.size(), u, sizeof(u), u);
+            for (size_t i = 0; i < sizeof(t); ++i)
+                t[i] ^= u[i];
+        }
+
+        const size_t offset = (block - 1) * hash_len;
+        const size_t remaining = std::min(hash_len, dk_len - offset);
+        std::memcpy(derived.data() + offset, t, remaining);
+    }
+
+    return derived;
+}
+
+AdminPinHashSpec parse_admin_pin_hash(const std::string &value)
+{
+    AdminPinHashSpec spec;
+    if (value.empty())
+        return spec;
+
+    std::vector<std::string> parts;
+    size_t begin = 0;
+    while (begin <= value.size())
+    {
+        const size_t pos = value.find('$', begin);
+        if (pos == std::string::npos)
+        {
+            parts.push_back(value.substr(begin));
+            break;
+        }
+        parts.push_back(value.substr(begin, pos - begin));
+        begin = pos + 1;
+    }
+
+    if (parts.size() != 4 || parts[0] != "pbkdf2_sha256")
+        return spec;
+
+    int iterations = 0;
+    if (!parse_int(parts[1], &iterations) || iterations <= 0)
+        return spec;
+
+    std::vector<uint8_t> salt;
+    std::vector<uint8_t> digest;
+    if (!hex_to_bytes(parts[2], &salt) || !hex_to_bytes(parts[3], &digest))
+        return spec;
+    if (salt.size() != 16 || digest.size() != 32)
+        return spec;
+
+    spec.valid = true;
+    spec.iterations = iterations;
+    spec.salt = std::move(salt);
+    spec.digest = std::move(digest);
+    return spec;
+}
+
+bool verify_admin_pin_hash(const std::string &pin, const AdminPinHashSpec &spec)
+{
+    if (!spec.valid || !is_six_digit_pin(pin))
+        return false;
+    const std::vector<uint8_t> derived = pbkdf2_sha256(pin, spec.salt, spec.iterations, spec.digest.size());
+    return constant_time_equal(derived, spec.digest);
+}
+
 std::string json_escape(const std::string &input)
 {
     std::ostringstream oss;
@@ -361,6 +523,8 @@ bool load_config(const std::string &path, Config *cfg)
             parse_int(value, &cfg->ui_preview_timeout_ms);
         else if (key == "ui_overlay_profile")
             cfg->ui_overlay_profile = value;
+        else if (key == "ui_admin_pin_hash")
+            cfg->ui_admin_pin_hash = value;
         else if (key == "face_db_dir")
             cfg->face_db_dir = value;
         else if (key == "attendance_log_base")
@@ -2302,6 +2466,17 @@ int main(int argc, char **argv)
     if (!load_config(config_path, &g_rt.cfg))
         return 1;
 
+    const AdminPinHashSpec admin_pin_spec = parse_admin_pin_hash(g_rt.cfg.ui_admin_pin_hash);
+    if (g_rt.cfg.ui_enabled)
+    {
+        if (g_rt.cfg.ui_admin_pin_hash.empty())
+            std::cerr << "face_netd: board UI admin PIN hash is not configured; management UI will stay locked"
+                      << std::endl;
+        else if (!admin_pin_spec.valid)
+            std::cerr << "face_netd: board UI admin PIN hash is invalid; management UI will stay locked"
+                      << std::endl;
+    }
+
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -2321,6 +2496,8 @@ int main(int argc, char **argv)
     ui_cfg.touch_device = g_rt.cfg.ui_touch_device;
     ui_cfg.preview_timeout_ms = g_rt.cfg.ui_preview_timeout_ms;
     ui_cfg.overlay_profile = g_rt.cfg.ui_overlay_profile;
+    ui_cfg.admin_pin_configured = admin_pin_spec.valid;
+    ui_cfg.verify_admin_pin = [admin_pin_spec](const std::string &pin) { return verify_admin_pin_hash(pin, admin_pin_spec); };
     ui_cfg.submit_command = [](const std::string &request_id, int cmd, const std::string &name) {
         if (is_library_write_cmd(cmd) && (g_rt.import_active.load() || has_pending_library_write_cmd()))
         {

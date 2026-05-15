@@ -210,6 +210,7 @@ chmod +x ./face_netd
 
 - `device_id`
 - `mqtt_url`
+- `ui_admin_pin_hash`，板端触摸“管理”入口需要预先写入 PIN 哈希
 
 MQTT topic 约定：
 
@@ -217,6 +218,15 @@ MQTT topic 约定：
 - `k230/<device_id>/up/reply`
 - `k230/<device_id>/up/status`
 - `k230/<device_id>/down/cmd`
+
+板端 UI 管理 PIN 建议在宿主机上生成后写入 `face_netd.ini`：
+
+```bash
+cd /home/hyperlovimia/k230_sdk/src/reference/ai_poc/my_face_recognition/linux_bridge
+python3 ./scripts/gen_ui_admin_pin_hash.py
+```
+
+脚本会输出一行 `ui_admin_pin_hash=...`，直接写入板端实际部署的 `face_netd.ini` 即可。仓库内样例配置不保存真实 PIN 哈希。
 
 ## 电脑端 server_pc
 

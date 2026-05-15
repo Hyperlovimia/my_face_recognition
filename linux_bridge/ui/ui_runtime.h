@@ -11,6 +11,11 @@ struct runtime_config {
     std::string touch_device;
     int preview_timeout_ms = 30000;
     std::string overlay_profile;
+    bool admin_pin_configured = false;
+    int admin_unlock_timeout_ms = 60000;
+    int admin_fail_limit = 3;
+    int admin_cooldown_ms = 30000;
+    std::function<bool(const std::string &)> verify_admin_pin;
     std::function<void(const std::string &, int, const std::string &)> submit_command;
     std::function<void(const std::string &)> log_message;
 };
